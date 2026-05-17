@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LAN Clipboard</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header>
+        <h1>LAN Clipboard</h1>
+        <p>在同一局域网内同步剪贴板内容（Win / macOS）。</p>
+      </header>
+      <section class="panel">
+        <h2>连接设备</h2>
+        <div class="row-split">
+          <button id="scan-devices" type="button">手动扫描设备</button>
+          <div class="hint">扫描不到时，确认路由器未屏蔽组播。</div>
+        </div>
+        <div class="device-code">
+          <div>
+            <div class="label">本机设备码</div>
+            <div class="mono" id="self-device-code">-</div>
+          </div>
+          <div>
+            <div class="label">输入对方设备码</div>
+            <div class="row-split">
+              <input id="peer-device-code" placeholder="粘贴对方设备码" />
+              <button id="connect-by-code" type="button">连接</button>
+            </div>
+            <div class="hint">设备码来自对方同一页面。连接前先扫描一次。</div>
+          </div>
+        </div>
+        <div id="discovered-devices"></div>
+      </section>
+      <section class="panel">
+        <h2>同步配置</h2>
+        <label>
+          轮询间隔（毫秒）
+          <input id="poll-interval-ms" type="number" min="300" max="5000" />
+        </label>
+        <label class="row-inline">
+          <input id="sync-enabled" type="checkbox" />
+          启动后自动同步
+        </label>
+        <label class="row-inline">
+          <input id="encryption-enabled" type="checkbox" />
+          启用加密传输（AES-GCM-SIV）
+        </label>
+        <label class="row-inline">
+          <input id="require-pairing-code" type="checkbox" />
+          强制配对码（两端必须一致）
+        </label>
+        <label>
+          配对码（建议 8-32 位）
+          <input id="pairing-code" type="password" placeholder="例如 lan-clipboard-2026" />
+        </label>
+        <label>
+          最大可发送大小（bytes）
+          <input id="max-item-bytes" type="number" min="1024" />
+        </label>
+      </section>
+      <section class="panel actions">
+        <button id="save-settings" type="button">保存配置</button>
+        <button id="start-sync" type="button">开始同步</button>
+        <button id="stop-sync" type="button">停止同步</button>
+        <button id="refresh-status" type="button">刷新状态</button>
+      </section>
+      <section class="panel">
+        <h2>运行状态</h2>
+        <p id="status-running">状态: -</p>
+        <p id="status-device-id">设备ID: -</p>
+        <p id="status-log-count">日志条数: -</p>
+        <p id="status-error">最近错误: -</p>
+      </section>
+      <details class="panel advanced">
+        <summary>高级</summary>
+        <div class="panel-sub">
+          <h3>对端列表（手动）</h3>
+          <label>
+            peers（每行一个，支持 `ip` 或 `ip:port`）
+            <textarea id="peers" rows="4"></textarea>
+          </label>
+        </div>
+        <div class="panel-sub">
+          <h3>运行日志</h3>
+          <div class="actions">
+            <button id="refresh-logs" type="button">刷新日志</button>
+            <button id="clear-logs" type="button">清空日志</button>
+          </div>
+          <pre id="runtime-logs"></pre>
+        </div>
+      </details>
+      <section class="panel">
+        <h2>提示</h2>
+        <ol>
+          <li>先手动扫描设备，再用设备码连接。</li>
+          <li>两端配对码保持一致（建议开启强制配对码）。</li>
+          <li>点击保存配置后开始同步。</li>
+        </ol>
+      </section>
+    </main>
+  </body>
+</html>

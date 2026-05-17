@@ -1,0 +1,23 @@
+# Keep Syncthing focused on source, docs, and lightweight config.
+
+# VCS / IDE
+.git/
+.idea/
+.vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Frontend / packaging outputs
+node_modules/
+dist/
+
+# Rust / Tauri generated artifacts
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Logs and temp files
+*.log
+*.tmp
