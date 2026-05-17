@@ -9,72 +9,116 @@
   </head>
   <body>
     <main class="app-shell">
-      <header>
-        <h1>LAN Clipboard</h1>
-        <p>在同一局域网内同步剪贴板内容（Win / macOS）。</p>
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">LAN CLIPBOARD</p>
+          <h1>让两台电脑像共用一个剪贴板</h1>
+          <p class="hero-text">在同一局域网内连接 Win 和 macOS，复制一次，另一台设备就能直接粘贴。</p>
+        </div>
+        <div class="hero-card">
+          <div class="hero-card-label">本机设备码</div>
+          <div class="hero-card-code mono" id="self-device-code">-</div>
+          <div class="hero-card-tip">把这个六码告诉另一台设备，扫描后即可快速连接。</div>
+        </div>
       </header>
-      <section class="panel">
-        <h2>连接设备</h2>
-        <div class="row-split">
-          <button id="scan-devices" type="button">手动扫描设备</button>
-          <div class="hint">扫描不到时，确认路由器未屏蔽组播。</div>
-        </div>
-        <div class="device-code">
-          <div>
-            <div class="label">本机设备码</div>
-            <div class="mono" id="self-device-code">-</div>
-          </div>
-          <div>
-            <div class="label">输入对方设备码</div>
-            <div class="row-split">
-              <input id="peer-device-code" placeholder="粘贴对方设备码" />
-              <button id="connect-by-code" type="button">连接</button>
+      <section class="dashboard">
+        <section class="panel panel-connect">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">连接设备</p>
+              <h2>先扫描，再输入设备码连接</h2>
             </div>
-            <div class="hint">设备码来自对方同一页面。连接前先扫描一次。</div>
+            <button class="primary-button" id="scan-devices" type="button">手动扫描设备</button>
           </div>
-        </div>
-        <div id="discovered-devices"></div>
+          <div class="feedback-banner" id="scan-feedback">扫描不到时，确认两台设备在同一局域网，且路由器未屏蔽组播。</div>
+          <div class="connect-grid">
+            <div class="connect-box">
+              <div class="label">输入对方设备码</div>
+              <div class="inline-form">
+                <input id="peer-device-code" placeholder="输入 6 位设备码" />
+                <button id="connect-by-code" type="button">连接</button>
+              </div>
+              <p class="hint">连接前先扫描一次，让对方设备出现在局域网列表里。</p>
+            </div>
+            <div class="connect-box connect-list">
+              <div class="label">扫描结果</div>
+              <div id="discovered-devices"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-status">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">运行状态</p>
+              <h2>同步状态一眼可见</h2>
+            </div>
+            <button class="ghost-button" id="refresh-status" type="button">刷新状态</button>
+          </div>
+          <div class="status-grid">
+            <article class="status-card">
+              <span class="status-label">同步状态</span>
+              <strong id="status-running">状态: -</strong>
+            </article>
+            <article class="status-card">
+              <span class="status-label">已连接设备</span>
+              <strong id="status-peer-count">已连接设备: -</strong>
+            </article>
+            <article class="status-card">
+              <span class="status-label">日志数量</span>
+              <strong id="status-log-count">日志条数: -</strong>
+            </article>
+          </div>
+          <div class="status-detail">
+            <p id="status-device-id">设备ID: -</p>
+            <p id="status-error">最近错误: -</p>
+          </div>
+        </section>
+
+        <section class="panel panel-settings">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">同步配置</p>
+              <h2>保留必要设置，其他尽量隐藏</h2>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <label>
+              轮询间隔（毫秒）
+              <input id="poll-interval-ms" type="number" min="300" max="5000" />
+            </label>
+            <label>
+              最大可发送大小（bytes）
+              <input id="max-item-bytes" type="number" min="1024" />
+            </label>
+          </div>
+          <div class="toggle-stack">
+            <label class="toggle-row">
+              <input id="sync-enabled" type="checkbox" />
+              <span>启动后自动同步</span>
+            </label>
+            <label class="toggle-row">
+              <input id="encryption-enabled" type="checkbox" />
+              <span>启用加密传输（AES-GCM-SIV）</span>
+            </label>
+            <label class="toggle-row">
+              <input id="require-pairing-code" type="checkbox" />
+              <span>强制配对码（两端必须一致）</span>
+            </label>
+          </div>
+          <label>
+            配对码（建议 8-32 位）
+            <input id="pairing-code" type="password" placeholder="例如 lan-clipboard-2026" />
+          </label>
+        </section>
       </section>
-      <section class="panel">
-        <h2>同步配置</h2>
-        <label>
-          轮询间隔（毫秒）
-          <input id="poll-interval-ms" type="number" min="300" max="5000" />
-        </label>
-        <label class="row-inline">
-          <input id="sync-enabled" type="checkbox" />
-          启动后自动同步
-        </label>
-        <label class="row-inline">
-          <input id="encryption-enabled" type="checkbox" />
-          启用加密传输（AES-GCM-SIV）
-        </label>
-        <label class="row-inline">
-          <input id="require-pairing-code" type="checkbox" />
-          强制配对码（两端必须一致）
-        </label>
-        <label>
-          配对码（建议 8-32 位）
-          <input id="pairing-code" type="password" placeholder="例如 lan-clipboard-2026" />
-        </label>
-        <label>
-          最大可发送大小（bytes）
-          <input id="max-item-bytes" type="number" min="1024" />
-        </label>
-      </section>
-      <section class="panel actions">
-        <button id="save-settings" type="button">保存配置</button>
+
+      <section class="panel action-bar">
+        <button class="primary-button" id="save-settings" type="button">保存配置</button>
         <button id="start-sync" type="button">开始同步</button>
         <button id="stop-sync" type="button">停止同步</button>
-        <button id="refresh-status" type="button">刷新状态</button>
       </section>
-      <section class="panel">
-        <h2>运行状态</h2>
-        <p id="status-running">状态: -</p>
-        <p id="status-device-id">设备ID: -</p>
-        <p id="status-log-count">日志条数: -</p>
-        <p id="status-error">最近错误: -</p>
-      </section>
+
       <details class="panel advanced">
         <summary>高级</summary>
         <div class="panel-sub">
@@ -94,12 +138,26 @@
         </div>
       </details>
       <section class="panel">
-        <h2>提示</h2>
-        <ol>
-          <li>先手动扫描设备，再用设备码连接。</li>
-          <li>两端配对码保持一致（建议开启强制配对码）。</li>
-          <li>点击保存配置后开始同步。</li>
-        </ol>
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">使用建议</p>
+            <h2>推荐连接顺序</h2>
+          </div>
+        </div>
+        <div class="tips-grid">
+          <article class="tip-card">
+            <span>01</span>
+            <p>先打开两台设备上的应用，等待 1-2 秒让设备广播稳定。</p>
+          </article>
+          <article class="tip-card">
+            <span>02</span>
+            <p>点击“手动扫描设备”，再用设备码或扫描列表完成连接。</p>
+          </article>
+          <article class="tip-card">
+            <span>03</span>
+            <p>两端使用相同配对码后开始同步，复制内容会自动互通。</p>
+          </article>
+        </div>
       </section>
     </main>
   </body>
