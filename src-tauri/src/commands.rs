@@ -20,11 +20,19 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
 
     if let Ok(Some(mut loaded)) = Settings::load(&path) {
         loaded.ensure_sync_identifiers();
-        if loaded.sync.peers.is_empty() { loaded.sync.peers = Vec::new(); }
+        if loaded.sync.peers.is_empty() {
+            loaded.sync.peers = Vec::new();
+        }
         let _ = loaded.save(&path);
         *guard = loaded;
     }
-    Ok(guard.clone())
+    let settings = guard.clone();
+    drop(guard);
+    state
+        .presence_service
+        .ensure(settings.clone(), settings.sync_device_id())
+        .map_err(|e| e.to_string())?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -39,7 +47,12 @@ pub fn set_settings(
         .settings
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?;
-    *guard = next;
+    *guard = next.clone();
+    drop(guard);
+    state
+        .presence_service
+        .ensure(next.clone(), next.sync_device_id())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -53,7 +66,10 @@ pub fn read_clipboard_snapshot(state: State<'_, AppState>) -> Result<ClipboardPa
 }
 
 #[tauri::command]
-pub fn write_clipboard_item(state: State<'_, AppState>, payload: ClipboardPayload) -> Result<(), String> {
+pub fn write_clipboard_item(
+    state: State<'_, AppState>,
+    payload: ClipboardPayload,
+) -> Result<(), String> {
     let guard = state
         .settings
         .lock()
@@ -69,6 +85,10 @@ pub fn start_sync(state: State<'_, AppState>) -> Result<(), String> {
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
+    state
+        .presence_service
+        .ensure(guard.clone(), guard.sync_device_id())
+        .map_err(|e| e.to_string())?;
     state
         .sync_engine
         .start(guard.clone(), guard.sync_device_id())
@@ -88,7 +108,7 @@ pub fn sync_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> 
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
-    Ok(state.sync_engine.status(&settings.sync_device_id()))
+    Ok(state.sync_engine.status(&settings))
 }
 
 #[tauri::command]
@@ -107,12 +127,27 @@ pub fn discover_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevi
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
-    net::discover_devices(&settings.sync_device_id(), &settings.sync.device_code, settings.sync.listen_port, 2200)
-        .map_err(|e| e.to_string())
+    state
+        .presence_service
+        .ensure(settings.clone(), settings.sync_device_id())
+        .map_err(|e| e.to_string())?;
+    let devices =
+        net::discover_devices(&settings.sync_device_id(), &settings.sync.shared_code, 2200)
+            .map_err(|e| e.to_string())?;
+    state.sync_engine.merge_discovered_devices(devices);
+    Ok(state.sync_engine.devices())
 }
 
 #[tauri::command]
-pub fn get_runtime_logs(state: State<'_, AppState>, limit: Option<usize>) -> Result<Vec<RuntimeLog>, String> {
+pub fn cached_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevice>, String> {
+    Ok(state.sync_engine.devices())
+}
+
+#[tauri::command]
+pub fn get_runtime_logs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<RuntimeLog>, String> {
     Ok(state.sync_engine.logs(limit.unwrap_or(250)))
 }
 

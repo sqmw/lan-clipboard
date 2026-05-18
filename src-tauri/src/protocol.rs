@@ -17,4 +17,3 @@ pub struct ClipboardItem {
     pub size_bytes: u64,
     pub payload: ClipboardPayload,
 }
-

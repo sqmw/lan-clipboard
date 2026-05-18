@@ -1,7 +1,7 @@
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
-use rand::Rng;
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
@@ -20,7 +20,9 @@ pub struct SizeLimits {
 
 impl Default for SizeLimits {
     fn default() -> Self {
-        Self { max_item_bytes: 256 * 1024 }
+        Self {
+            max_item_bytes: 256 * 1024,
+        }
     }
 }
 
@@ -28,7 +30,8 @@ impl Default for SizeLimits {
 #[serde(default)]
 pub struct SyncConfig {
     pub device_id: String,
-    pub device_code: String,
+    #[serde(alias = "device_code")]
+    pub shared_code: String,
     pub enabled: bool,
     pub listen_port: u16,
     pub peers: Vec<String>,
@@ -39,8 +42,8 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             device_id: crate::net::new_device_id(),
-            device_code: generate_device_code(),
-            enabled: false,
+            shared_code: generate_shared_code(),
+            enabled: true,
             listen_port: 32910,
             peers: Vec::new(),
             poll_interval_ms: 900,
@@ -90,8 +93,8 @@ impl Settings {
             self.sync.device_id = crate::net::new_device_id();
             changed = true;
         }
-        if !is_valid_device_code(&self.sync.device_code) {
-            self.sync.device_code = generate_device_code();
+        if !is_valid_shared_code(&self.sync.shared_code) {
+            self.sync.shared_code = generate_shared_code();
             changed = true;
         }
         changed
@@ -116,11 +119,11 @@ impl Settings {
     }
 }
 
-fn is_valid_device_code(value: &str) -> bool {
+fn is_valid_shared_code(value: &str) -> bool {
     value.len() == 6 && value.chars().all(|c| c.is_ascii_digit())
 }
 
-fn generate_device_code() -> String {
+fn generate_shared_code() -> String {
     let num: u32 = rand::thread_rng().gen_range(0..1_000_000);
     format!("{:06}", num)
 }

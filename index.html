@@ -9,155 +9,90 @@
   </head>
   <body>
     <main class="app-shell">
-      <header class="hero">
-        <div class="hero-copy">
-          <p class="eyebrow">LAN CLIPBOARD</p>
-          <h1>让两台电脑像共用一个剪贴板</h1>
-          <p class="hero-text">在同一局域网内连接 Win 和 macOS，复制一次，另一台设备就能直接粘贴。</p>
-        </div>
-        <div class="hero-card">
-          <div class="hero-card-label">本机设备码</div>
-          <div class="hero-card-code mono" id="self-device-code">-</div>
-          <div class="hero-card-tip">把这个六码告诉另一台设备，扫描后即可快速连接。</div>
-        </div>
-      </header>
-      <section class="dashboard">
-        <section class="panel panel-connect">
-          <div class="section-head">
-            <div>
-              <p class="section-kicker">连接设备</p>
-              <h2>先扫描，再输入设备码连接</h2>
-            </div>
-            <button class="primary-button" id="scan-devices" type="button">手动扫描设备</button>
-          </div>
-          <div class="feedback-banner" id="scan-feedback">扫描不到时，确认两台设备在同一局域网，且路由器未屏蔽组播。</div>
-          <div class="connect-grid">
-            <div class="connect-box">
-              <div class="label">输入对方设备码</div>
-              <div class="inline-form">
-                <input id="peer-device-code" placeholder="输入 6 位设备码" />
-                <button id="connect-by-code" type="button">连接</button>
-              </div>
-              <p class="hint">连接前先扫描一次，让对方设备出现在局域网列表里。</p>
-            </div>
-            <div class="connect-box connect-list">
-              <div class="label">扫描结果</div>
-              <div id="discovered-devices"></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel panel-status">
-          <div class="section-head">
-            <div>
-              <p class="section-kicker">运行状态</p>
-              <h2>同步状态一眼可见</h2>
-            </div>
-            <button class="ghost-button" id="refresh-status" type="button">刷新状态</button>
-          </div>
-          <div class="status-grid">
-            <article class="status-card">
-              <span class="status-label">同步状态</span>
-              <strong id="status-running">状态: -</strong>
-            </article>
-            <article class="status-card">
-              <span class="status-label">已连接设备</span>
-              <strong id="status-peer-count">已连接设备: -</strong>
-            </article>
-            <article class="status-card">
-              <span class="status-label">日志数量</span>
-              <strong id="status-log-count">日志条数: -</strong>
-            </article>
-          </div>
-          <div class="status-detail">
-            <p id="status-device-id">设备ID: -</p>
-            <p id="status-error">最近错误: -</p>
-          </div>
-        </section>
-
-        <section class="panel panel-settings">
-          <div class="section-head">
-            <div>
-              <p class="section-kicker">同步配置</p>
-              <h2>保留必要设置，其他尽量隐藏</h2>
-            </div>
-          </div>
-          <div class="settings-grid">
-            <label>
-              轮询间隔（毫秒）
-              <input id="poll-interval-ms" type="number" min="300" max="5000" />
-            </label>
-            <label>
-              最大可发送大小（bytes）
-              <input id="max-item-bytes" type="number" min="1024" />
-            </label>
-          </div>
-          <div class="toggle-stack">
-            <label class="toggle-row">
-              <input id="sync-enabled" type="checkbox" />
-              <span>启动后自动同步</span>
-            </label>
-            <label class="toggle-row">
-              <input id="encryption-enabled" type="checkbox" />
-              <span>启用加密传输（AES-GCM-SIV）</span>
-            </label>
-            <label class="toggle-row">
-              <input id="require-pairing-code" type="checkbox" />
-              <span>强制配对码（两端必须一致）</span>
-            </label>
-          </div>
-          <label>
-            配对码（建议 8-32 位）
-            <input id="pairing-code" type="password" placeholder="例如 lan-clipboard-2026" />
-          </label>
-        </section>
-      </section>
-
-      <section class="panel action-bar">
-        <button class="primary-button" id="save-settings" type="button">保存配置</button>
-        <button id="start-sync" type="button">开始同步</button>
-        <button id="stop-sync" type="button">停止同步</button>
-      </section>
-
-      <details class="panel advanced">
-        <summary>高级</summary>
-        <div class="panel-sub">
-          <h3>对端列表（手动）</h3>
-          <label>
-            peers（每行一个，支持 `ip` 或 `ip:port`）
-            <textarea id="peers" rows="4"></textarea>
-          </label>
-        </div>
-        <div class="panel-sub">
-          <h3>运行日志</h3>
-          <div class="actions">
-            <button id="refresh-logs" type="button">刷新日志</button>
-            <button id="clear-logs" type="button">清空日志</button>
-          </div>
-          <pre id="runtime-logs"></pre>
-        </div>
-      </details>
-      <section class="panel">
+      <section class="panel panel-connect">
         <div class="section-head">
           <div>
-            <p class="section-kicker">使用建议</p>
-            <h2>推荐连接顺序</h2>
+            <p class="section-kicker">共享域</p>
+            <h2>查看当前共享域成员与同步状态</h2>
+          </div>
+          <button class="ghost-button" id="refresh-domain" type="button">刷新</button>
+        </div>
+        <div class="connect-box connect-list">
+          <div class="label">当前共享域成员</div>
+          <div id="discovered-devices"></div>
+          <p class="list-feedback" id="scan-feedback">当前没有发现其他共享域成员。</p>
+        </div>
+        <div class="section-head section-head-inline">
+          <div>
+            <p class="section-kicker">运行状态</p>
+            <h2>同步状态</h2>
           </div>
         </div>
-        <div class="tips-grid">
-          <article class="tip-card">
-            <span>01</span>
-            <p>先打开两台设备上的应用，等待 1-2 秒让设备广播稳定。</p>
+        <div class="status-grid">
+          <article class="status-card">
+            <span class="status-label">状态</span>
+            <strong id="status-running">-</strong>
           </article>
-          <article class="tip-card">
-            <span>02</span>
-            <p>点击“手动扫描设备”，再用设备码或扫描列表完成连接。</p>
-          </article>
-          <article class="tip-card">
-            <span>03</span>
-            <p>两端使用相同配对码后开始同步，复制内容会自动互通。</p>
+          <article class="status-card">
+            <span class="status-label">共享域成员（含本机）</span>
+            <strong id="status-peer-count">-</strong>
           </article>
         </div>
+      </section>
+
+      <section class="panel panel-settings">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">设置</p>
+            <h2>同步配置</h2>
+          </div>
+          <button class="primary-button" id="save-settings" type="button">保存配置</button>
+        </div>
+        <div class="settings-grid">
+          <label>
+            共享码
+            <input id="shared-code" placeholder="6位数字" maxlength="6" inputmode="numeric" />
+          </label>
+          <label>
+            轮询间隔（毫秒）
+            <input id="poll-interval-ms" type="number" min="300" max="5000" />
+          </label>
+          <label>
+            最大发送大小（MB）
+            <input id="max-item-mb" type="number" min="1" max="100" step="1" />
+          </label>
+        </div>
+        <p class="hint">推荐家庭或小团队共用一个 6 位码；同网段内填写相同共享码的设备都会加入同一个共享域。</p>
+        <p class="save-feedback" id="config-feedback">修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。</p>
+        <details class="advanced">
+          <summary>高级 / 日志</summary>
+          <div class="panel-sub">
+            <h3>兜底地址</h3>
+            <label>
+              手动添加共享域补充地址（每行一个 ip 或 ip:port）
+              <textarea id="peers" rows="3"></textarea>
+            </label>
+          </div>
+          <div class="panel-sub">
+            <h3>高级加密</h3>
+            <label class="compact-toggle-row">
+              <span>加密传输</span>
+              <input id="encryption-enabled" type="checkbox" />
+            </label>
+            <label>
+              自定义配对码（留空时默认使用共享码）
+              <input id="pairing-code" type="password" placeholder="可选：为共享码再叠加一层密钥" />
+            </label>
+          </div>
+          <div class="panel-sub">
+            <h3>运行日志</h3>
+            <div class="actions">
+              <button id="refresh-logs" type="button">刷新</button>
+              <button id="clear-logs" type="button">清空</button>
+            </div>
+            <pre id="runtime-logs"></pre>
+          </div>
+        </details>
       </section>
     </main>
   </body>

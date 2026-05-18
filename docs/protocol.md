@@ -34,8 +34,11 @@
 M0 线协议（当前实现）：
 - 传输：`TCP`
 - 帧格式：每条 `ClipboardItem` 一行 JSON（`\n` 分隔）
-- 节点关系：每个节点监听本地端口，并向配置的 peers 主动推送
-- 发现信道：`mDNS` 服务类型 `_lan-clipboard._tcp.local.`
+- 节点关系：每个节点监听本地端口，并向“共享域内自动发现的设备 + 手动配置的兜底地址”主动推送
+- 发现信道：
+  - `mDNS` 服务类型 `_lan-clipboard._tcp.local.`
+  - UDP 广播心跳端口 `32911`（默认每 `1000ms` 发送一次）
+- 发现筛选：仅接受 `shared_code` 相同的设备
 - 加密封装：`WireMessage`（base64 body + 可选 nonce）
 
 `WireMessage` 字段：
@@ -44,6 +47,24 @@ M0 线协议（当前实现）：
 - `source_device_id`：发送端设备 ID
 - `nonce_base64`：加密随机数（加密时必填，12 bytes）
 - `body_base64`：明文或密文主体
+
+UDP 心跳字段：
+- `v`：发现协议版本（当前 `1`）
+- `app`：固定为 `lan-clipboard`
+- `device_id`：发送端设备 ID，用于避免自发现和成员去重
+- `device_name`：展示名
+- `shared_code`：共享域筛选字段
+- `tcp_port`：该设备的剪贴板 TCP 监听端口
+
+成员缓存策略：
+- mDNS 与 UDP 心跳都会合并进同一个共享域成员缓存
+- UI 的成员列表读取缓存；“刷新”只做补充扫描，不再把一次空扫描当作远端离线
+- 远端停止发送发现信号后，成员缓存会在约 `30s` 后过期
+
+默认密钥策略：
+- 若配置了 `pairing_code`：优先使用 `pairing_code`
+- 否则：直接使用 `shared_code`
+- 因此“同网段且共享码一致即可加入共享域”的产品语义，与“默认加密仍然存在”的安全语义可以同时成立
 
 ## 大小限制
 

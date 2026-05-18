@@ -108,6 +108,8 @@ pub fn write_item(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), Clipb
                 })
                 .map_err(|e| ClipboardError::Backend(e.to_string()))
         }
-        ClipboardPayload::Html { .. } | ClipboardPayload::Rtf { .. } => Err(ClipboardError::Unsupported),
+        ClipboardPayload::Html { .. } | ClipboardPayload::Rtf { .. } => {
+            Err(ClipboardError::Unsupported)
+        }
     }
 }

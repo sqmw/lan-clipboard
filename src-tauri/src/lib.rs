@@ -24,6 +24,7 @@ pub fn run() {
             commands::sync_status,
             commands::list_devices,
             commands::discover_devices,
+            commands::cached_devices,
             commands::get_runtime_logs,
             commands::clear_runtime_logs,
         ])
