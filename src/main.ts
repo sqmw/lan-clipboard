@@ -80,6 +80,10 @@ let transferTimer: number | null = null;
 let observedMemberCount = 1;
 let networkOptions: NetworkInterfaceOption[] = [];
 let membersExpanded = false;
+const expandedTransferIds = new Set<string>();
+const transferPreviewScrollTops = new Map<string, number>();
+let isTransferPreviewInteracting = false;
+let transferPreviewIdleTimer: number | null = null;
 
 async function loadSettings(): Promise<void> {
   settings = await invoke<Settings>("get_settings");
@@ -403,22 +407,86 @@ function transferDirectionText(direction: string): string {
   return direction === "send" ? "发送到" : "接收自";
 }
 
+function isTextPreviewTransfer(transfer: TransferProgress): boolean {
+  return ["直接复制文字", "HTML 富文本", "RTF 富文本"].includes(transfer.item_label);
+}
+
+function textPreviewLabel(transfer: TransferProgress): string {
+  switch (transfer.item_label) {
+    case "HTML 富文本":
+      return "HTML 内容";
+    case "RTF 富文本":
+      return "RTF 内容";
+    default:
+      return "文字内容";
+  }
+}
+
 function renderTransferSummary(transfer: TransferProgress): string {
   const summary = transfer.item_summary || `${transfer.item_label || "内容"}`;
-  if (transfer.item_label === "直接复制文字") {
-    return `<div class="transfer-preview"><span class="transfer-preview-label">文字内容</span><p>${escapeHtml(
+  if (isTextPreviewTransfer(transfer)) {
+    const expanded = expandedTransferIds.has(transfer.id);
+    const shouldToggle = summary.length > 180 || summary.includes("\n");
+    return `<div class="transfer-preview ${expanded ? "is-expanded" : ""}">
+      <div class="transfer-preview-head">
+        <span class="transfer-preview-label">${escapeHtml(textPreviewLabel(transfer))}</span>
+        ${
+          shouldToggle
+            ? `<button class="transfer-preview-toggle" type="button" data-transfer-id="${escapeHtml(
+                transfer.id,
+              )}">${expanded ? "收起" : "展开"}</button>`
+            : ""
+        }
+      </div>
+      <div class="transfer-preview-content" data-transfer-id="${escapeHtml(transfer.id)}" tabindex="0">${escapeHtml(
       summary,
-    )}</p></div>`;
+    )}</div></div>`;
   }
   return `<p class="transfer-title">${escapeHtml(summary)}</p>`;
 }
 
+function holdTransferPreviewRefresh(): void {
+  isTransferPreviewInteracting = true;
+  if (transferPreviewIdleTimer !== null) {
+    window.clearTimeout(transferPreviewIdleTimer);
+  }
+}
+
+function releaseTransferPreviewRefresh(delayMs = 500): void {
+  if (transferPreviewIdleTimer !== null) {
+    window.clearTimeout(transferPreviewIdleTimer);
+  }
+  transferPreviewIdleTimer = window.setTimeout(() => {
+    isTransferPreviewInteracting = false;
+    transferPreviewIdleTimer = null;
+    void refreshTransferProgress();
+  }, delayMs);
+}
+
 function renderTransferProgress(transfers: TransferProgress[]): void {
   const container = getText("transfer-progress-list");
+  container.querySelectorAll<HTMLElement>(".transfer-preview-content").forEach((element) => {
+    const id = element.dataset.transferId;
+    if (id) {
+      transferPreviewScrollTops.set(id, element.scrollTop);
+    }
+  });
   if (!transfers.length) {
     container.innerHTML = `<p class="empty-members">当前没有进行中的传输任务。</p>`;
+    transferPreviewScrollTops.clear();
     return;
   }
+  const activeTransferIds = new Set(transfers.map((transfer) => transfer.id));
+  expandedTransferIds.forEach((id) => {
+    if (!activeTransferIds.has(id)) {
+      expandedTransferIds.delete(id);
+    }
+  });
+  transferPreviewScrollTops.forEach((_, id) => {
+    if (!activeTransferIds.has(id)) {
+      transferPreviewScrollTops.delete(id);
+    }
+  });
 
   container.innerHTML = transfers
     .map((transfer) => {
@@ -444,9 +512,39 @@ function renderTransferProgress(transfers: TransferProgress[]): void {
       `;
     })
     .join("");
+  container.querySelectorAll<HTMLButtonElement>(".transfer-preview-toggle").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.transferId;
+      if (!id) return;
+      if (expandedTransferIds.has(id)) {
+        expandedTransferIds.delete(id);
+      } else {
+        expandedTransferIds.add(id);
+      }
+      renderTransferProgress(transfers);
+    });
+  });
+  container.querySelectorAll<HTMLElement>(".transfer-preview-content").forEach((element) => {
+    const id = element.dataset.transferId;
+    if (!id) return;
+    element.scrollTop = transferPreviewScrollTops.get(id) ?? 0;
+    element.addEventListener("mouseenter", () => holdTransferPreviewRefresh());
+    element.addEventListener("mouseleave", () => releaseTransferPreviewRefresh());
+    element.addEventListener("focus", () => holdTransferPreviewRefresh());
+    element.addEventListener("blur", () => releaseTransferPreviewRefresh(150));
+    element.addEventListener("wheel", () => holdTransferPreviewRefresh(), { passive: true });
+    element.addEventListener("scroll", () => {
+      holdTransferPreviewRefresh();
+      transferPreviewScrollTops.set(id, element.scrollTop);
+      releaseTransferPreviewRefresh(700);
+    });
+  });
 }
 
 async function refreshTransferProgress(): Promise<void> {
+  if (isTransferPreviewInteracting) {
+    return;
+  }
   const transfers = await invoke<TransferProgress[]>("get_transfer_progress");
   renderTransferProgress(transfers);
 }

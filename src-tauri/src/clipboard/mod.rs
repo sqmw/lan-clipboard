@@ -5,7 +5,7 @@ use image::imageops::FilterType as ResizeFilterType;
 use image::ImageEncoder;
 use image::RgbaImage;
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -97,6 +97,7 @@ fn write_item_once(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), Clip
             archive_bytes,
             top_level_names,
         } => write_file_bundle(item, archive_bytes, top_level_names, limits),
+        ClipboardPayload::FileList { .. } => Err(ClipboardError::Unsupported),
         ClipboardPayload::Html { html } => write_rich_text_payload("html", html),
         ClipboardPayload::Rtf { rtf } => write_rich_text_payload("rtf", rtf),
     }
@@ -261,8 +262,7 @@ fn encode_file_bundle_payload(
         })
         .collect::<Vec<_>>();
 
-    let archive_bytes = build_file_bundle_archive(&file_paths)?;
-    let size_bytes = archive_bytes.len() as u64;
+    let size_bytes = estimate_file_bundle_archive_size(&file_paths)?;
     if size_bytes > limits.max_item_bytes {
         return Err(ClipboardError::TooLarge {
             size_bytes,
@@ -270,34 +270,32 @@ fn encode_file_bundle_payload(
         });
     }
 
-    Ok(ClipboardPayload::FileBundle {
-        archive_bytes,
+    Ok(ClipboardPayload::FileList {
+        paths: file_paths,
         top_level_names,
+        estimated_archive_bytes: size_bytes,
     })
 }
 
-fn build_file_bundle_archive(file_paths: &[PathBuf]) -> Result<Vec<u8>, ClipboardError> {
-    let mut bytes = Vec::new();
-    {
-        let mut builder = Builder::new(&mut bytes);
-        for path in file_paths {
-            let entry_name = path
-                .file_name()
-                .map(|value| value.to_string_lossy().into_owned())
-                .ok_or_else(|| {
-                    ClipboardError::Backend("clipboard file missing name".to_string())
-                })?;
-            append_path_to_archive(&mut builder, path, Path::new(&entry_name))?;
-        }
-        builder
-            .finish()
-            .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+pub(crate) fn stream_file_bundle_archive<W: Write>(
+    file_paths: &[PathBuf],
+    writer: W,
+) -> Result<(), ClipboardError> {
+    let mut builder = Builder::new(writer);
+    for path in file_paths {
+        let entry_name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .ok_or_else(|| ClipboardError::Backend("clipboard file missing name".to_string()))?;
+        append_path_to_archive(&mut builder, path, Path::new(&entry_name))?;
     }
-    Ok(bytes)
+    builder
+        .finish()
+        .map_err(|e| ClipboardError::Backend(e.to_string()))
 }
 
-fn append_path_to_archive(
-    builder: &mut Builder<&mut Vec<u8>>,
+fn append_path_to_archive<W: Write>(
+    builder: &mut Builder<W>,
     source: &Path,
     archive_path: &Path,
 ) -> Result<(), ClipboardError> {
@@ -325,6 +323,31 @@ fn append_path_to_archive(
     builder
         .append_file(archive_path, &mut file)
         .map_err(|e| ClipboardError::Backend(e.to_string()))
+}
+
+pub(crate) fn estimate_file_bundle_archive_size(
+    file_paths: &[PathBuf],
+) -> Result<u64, ClipboardError> {
+    let mut total = 1024u64;
+    for path in file_paths {
+        estimate_path_archive_size(path, &mut total)?;
+    }
+    Ok(total)
+}
+
+fn estimate_path_archive_size(path: &Path, total: &mut u64) -> Result<(), ClipboardError> {
+    let metadata = fs::metadata(path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    *total = total.saturating_add(512);
+    if metadata.is_dir() {
+        for child in fs::read_dir(path).map_err(|e| ClipboardError::Backend(e.to_string()))? {
+            let child = child.map_err(|e| ClipboardError::Backend(e.to_string()))?;
+            estimate_path_archive_size(&child.path(), total)?;
+        }
+    } else {
+        let size = metadata.len();
+        *total = total.saturating_add(size.div_ceil(512).saturating_mul(512));
+    }
+    Ok(())
 }
 
 fn write_file_bundle(

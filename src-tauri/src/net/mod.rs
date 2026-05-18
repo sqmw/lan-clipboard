@@ -40,7 +40,7 @@ const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 512;
 const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 50;
 const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
-const TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
+const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
 
@@ -102,6 +102,30 @@ struct WireMessage {
     pub source_device_id: String,
     pub nonce: Option<[u8; 12]>,
     pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum WireBody {
+    ClipboardItem(ClipboardItem),
+    FileStreamStart(FileStreamStart),
+    FileStreamChunk { item_id: String, bytes: Vec<u8> },
+    FileStreamEnd { item_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileStreamStart {
+    item_id: String,
+    content_hash: String,
+    created_at_ms: u64,
+    source_device_id: String,
+    size_bytes: u64,
+    top_level_names: Vec<String>,
+}
+
+struct IncomingFileStream {
+    meta: FileStreamStart,
+    archive_bytes: Vec<u8>,
+    peer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,14 +601,18 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
         }
 
         if last_discovery.elapsed() >= Duration::from_millis(DISCOVERY_REFRESH_MS) {
-            refresh_discovered_devices(&runtime, &settings, &device_id, DISCOVERY_TIMEOUT_MS);
+            if !has_active_transfers(&runtime) {
+                refresh_discovered_devices(&runtime, &settings, &device_id, DISCOVERY_TIMEOUT_MS);
+            }
             last_discovery = Instant::now();
         }
 
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(write_timeout_for_payload(MAX_WIRE_FRAME_BYTES as u64)));
+                let _ = stream.set_nodelay(true);
+                let _ = stream
+                    .set_read_timeout(Some(write_timeout_for_payload(MAX_WIRE_FRAME_BYTES as u64)));
                 if let Err(error) = handle_incoming(&runtime, &settings, stream, &device_id) {
                     set_error(&runtime, format!("incoming handler failed: {error}"));
                 }
@@ -722,59 +750,155 @@ fn handle_incoming(
         remember_active_local_ip(runtime, local_addr.ip());
     }
     let mut stream = stream;
+    let mut incoming_files: HashMap<String, IncomingFileStream> = HashMap::new();
     while let Some((transfer_id, frame_bytes)) = read_wire_frame(
         runtime,
         &mut stream,
         remote_addr.as_deref().unwrap_or("未知来源"),
     )? {
         let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
-        let item = decode_wire_message(&frame, settings)?;
-        let canonical_transfer_id = canonical_receive_transfer_id(&item);
-        adopt_receive_transfer(
-            runtime,
-            &transfer_id,
-            &canonical_transfer_id,
-            remote_addr.as_deref().unwrap_or("未知来源"),
-        );
-        update_transfer_metadata(
-            runtime,
-            &canonical_transfer_id,
-            item.payload.kind(),
-            &payload_label(&item.payload),
-            &payload_summary(&item.payload),
-            &item.id,
-            "received",
-        );
-
-        if item.source_device_id == device_id {
-            continue;
+        let body = decode_wire_body(&frame, settings)?;
+        match body {
+            WireBody::ClipboardItem(item) => {
+                handle_incoming_item(
+                    runtime,
+                    &transfer_id,
+                    remote_addr.as_deref().unwrap_or("未知来源"),
+                    item,
+                    device_id,
+                );
+            }
+            WireBody::FileStreamStart(meta) => {
+                let canonical_transfer_id =
+                    format!("recv:{}:{}", meta.source_device_id, meta.item_id);
+                adopt_receive_transfer(
+                    runtime,
+                    &transfer_id,
+                    &canonical_transfer_id,
+                    remote_addr.as_deref().unwrap_or("未知来源"),
+                );
+                update_transfer_metadata(
+                    runtime,
+                    &canonical_transfer_id,
+                    "file_bundle",
+                    &file_stream_label(&meta.top_level_names),
+                    &file_stream_summary(&meta.top_level_names),
+                    &meta.item_id,
+                    "receiving",
+                );
+                incoming_files.insert(
+                    meta.item_id.clone(),
+                    IncomingFileStream {
+                        meta,
+                        archive_bytes: Vec::new(),
+                        peer: remote_addr.as_deref().unwrap_or("未知来源").to_string(),
+                    },
+                );
+            }
+            WireBody::FileStreamChunk { item_id, bytes } => {
+                if let Some(file_stream) = incoming_files.get_mut(&item_id) {
+                    let canonical_transfer_id =
+                        format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
+                    adopt_receive_transfer(
+                        runtime,
+                        &transfer_id,
+                        &canonical_transfer_id,
+                        remote_addr.as_deref().unwrap_or("未知来源"),
+                    );
+                    file_stream.archive_bytes.extend_from_slice(&bytes);
+                    update_transfer_progress(
+                        runtime,
+                        &canonical_transfer_id,
+                        file_stream.archive_bytes.len() as u64,
+                        file_stream.meta.size_bytes,
+                    );
+                }
+            }
+            WireBody::FileStreamEnd { item_id } => {
+                if let Some(file_stream) = incoming_files.remove(&item_id) {
+                    let canonical_transfer_id =
+                        format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
+                    adopt_receive_transfer(
+                        runtime,
+                        &transfer_id,
+                        &canonical_transfer_id,
+                        remote_addr.as_deref().unwrap_or("未知来源"),
+                    );
+                    let item = ClipboardItem {
+                        id: file_stream.meta.item_id,
+                        content_hash: file_stream.meta.content_hash,
+                        created_at_ms: file_stream.meta.created_at_ms,
+                        source_device_id: file_stream.meta.source_device_id,
+                        size_bytes: file_stream.archive_bytes.len() as u64,
+                        payload: ClipboardPayload::FileBundle {
+                            archive_bytes: file_stream.archive_bytes,
+                            top_level_names: file_stream.meta.top_level_names,
+                        },
+                    };
+                    let canonical_transfer_id = canonical_receive_transfer_id(&item);
+                    update_transfer_metadata(
+                        runtime,
+                        &canonical_transfer_id,
+                        item.payload.kind(),
+                        &payload_label(&item.payload),
+                        &payload_summary(&item.payload),
+                        &item.id,
+                        "received",
+                    );
+                    handle_incoming_item(
+                        runtime,
+                        &canonical_transfer_id,
+                        &file_stream.peer,
+                        item,
+                        device_id,
+                    );
+                }
+            }
         }
-        mark_known_member(runtime, "device", &item.source_device_id);
-        if let Some(addr) = &remote_addr {
-            mark_known_member(runtime, "addr", addr);
-        }
-        if should_skip_remote_item(runtime, &item) {
-            continue;
-        }
-        push_log(
-            runtime,
-            "INFO",
-            &format!(
-                "received item {} kind={} size_bytes={} from {}",
-                item.id,
-                item.payload.kind(),
-                item.size_bytes,
-                item.source_device_id
-            ),
-        );
-        enqueue_inbound_item(
-            runtime,
-            item,
-            &canonical_transfer_id,
-            remote_addr.as_deref().unwrap_or("未知来源"),
-        );
     }
     Ok(())
+}
+
+fn handle_incoming_item(
+    runtime: &RuntimeInner,
+    transfer_id: &str,
+    peer: &str,
+    item: ClipboardItem,
+    device_id: &str,
+) {
+    let canonical_transfer_id = canonical_receive_transfer_id(&item);
+    if transfer_id != canonical_transfer_id {
+        adopt_receive_transfer(runtime, transfer_id, &canonical_transfer_id, peer);
+    }
+    update_transfer_metadata(
+        runtime,
+        &canonical_transfer_id,
+        item.payload.kind(),
+        &payload_label(&item.payload),
+        &payload_summary(&item.payload),
+        &item.id,
+        "received",
+    );
+
+    if item.source_device_id == device_id {
+        return;
+    }
+    mark_known_member(runtime, "device", &item.source_device_id);
+    if should_skip_remote_item(runtime, &item) {
+        return;
+    }
+    push_log(
+        runtime,
+        "INFO",
+        &format!(
+            "received item {} kind={} size_bytes={} from {}",
+            item.id,
+            item.payload.kind(),
+            item.size_bytes,
+            item.source_device_id
+        ),
+    );
+    enqueue_inbound_item(runtime, item, &canonical_transfer_id, peer);
 }
 
 fn read_wire_frame(
@@ -822,6 +946,10 @@ fn read_wire_frame(
 }
 
 fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) -> usize {
+    if matches!(item.payload, ClipboardPayload::FileList { .. }) {
+        return send_file_list_to_all_peers(runtime, settings, item);
+    }
+
     let payload = match encode_wire_message(item, settings) {
         Ok(payload) => payload,
         Err(error) => {
@@ -856,11 +984,12 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
                 continue;
             }
         };
+        let _ = stream.set_nodelay(true);
         if let Ok(local_addr) = stream.local_addr() {
             remember_active_local_ip(runtime, local_addr.ip());
         }
         let _ = stream.set_write_timeout(Some(write_timeout));
-        let transfer_id = format!("send:{}:{}", peer, item.id);
+        let transfer_id = send_transfer_id(&peer, item);
         upsert_transfer(
             runtime,
             TransferProgress {
@@ -905,6 +1034,185 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
         );
     }
     delivered
+}
+
+fn send_file_list_to_all_peers(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    item: &ClipboardItem,
+) -> usize {
+    let mut delivered = 0usize;
+    for peer in collect_peer_targets(runtime, settings) {
+        let transfer_id = send_transfer_id(&peer, item);
+        upsert_transfer(
+            runtime,
+            TransferProgress {
+                id: transfer_id.clone(),
+                direction: "send".to_string(),
+                peer: peer.clone(),
+                item_kind: item.payload.kind().to_string(),
+                item_label: payload_label(&item.payload),
+                item_summary: payload_summary(&item.payload),
+                item_id: item.id.clone(),
+                transferred_bytes: 0,
+                total_bytes: item.size_bytes,
+                percent: 0,
+                status: "sending".to_string(),
+                updated_at_ms: now_ms(),
+                error: None,
+            },
+        );
+
+        match send_file_list_to_peer(runtime, settings, item, &peer, &transfer_id) {
+            Ok(()) => {
+                mark_transfer_completed(runtime, &transfer_id);
+                mark_known_member(runtime, "addr", &peer);
+                delivered += 1;
+            }
+            Err(error) => {
+                mark_transfer_failed(runtime, &transfer_id, error.to_string());
+                push_log(
+                    runtime,
+                    "DEBUG",
+                    &format!("stream file peer failed peer={peer} error={error}"),
+                );
+            }
+        }
+    }
+    delivered
+}
+
+fn send_file_list_to_peer(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    item: &ClipboardItem,
+    peer: &str,
+    transfer_id: &str,
+) -> anyhow::Result<()> {
+    let ClipboardPayload::FileList { paths, .. } = &item.payload else {
+        return Err(anyhow::anyhow!("expected file list payload"));
+    };
+    let socket_addr: SocketAddr = peer.parse()?;
+    let mut stream =
+        TcpStream::connect_timeout(&socket_addr, Duration::from_millis(CONNECT_TIMEOUT_MS))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(write_timeout_for_payload(item.size_bytes)));
+    if let Ok(local_addr) = stream.local_addr() {
+        remember_active_local_ip(runtime, local_addr.ip());
+    }
+
+    let start = WireBody::FileStreamStart(FileStreamStart {
+        item_id: item.id.clone(),
+        content_hash: item.content_hash.clone(),
+        created_at_ms: item.created_at_ms,
+        source_device_id: item.source_device_id.clone(),
+        size_bytes: item.size_bytes,
+        top_level_names: match &item.payload {
+            ClipboardPayload::FileList {
+                top_level_names, ..
+            } => top_level_names.clone(),
+            _ => Vec::new(),
+        },
+    });
+    write_wire_body_to_stream(&mut stream, settings, &start)?;
+
+    {
+        let mut writer = FileStreamWriter {
+            runtime,
+            settings,
+            stream: &mut stream,
+            item_id: item.id.clone(),
+            transfer_id: transfer_id.to_string(),
+            buffer: Vec::with_capacity(TRANSFER_CHUNK_BYTES),
+            sent_archive_bytes: 0,
+            total_archive_bytes: item.size_bytes,
+        };
+        clipboard::stream_file_bundle_archive(paths, &mut writer)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        writer.finish()?;
+    }
+
+    write_wire_body_to_stream(
+        &mut stream,
+        settings,
+        &WireBody::FileStreamEnd {
+            item_id: item.id.clone(),
+        },
+    )?;
+    Ok(())
+}
+
+struct FileStreamWriter<'a> {
+    runtime: &'a RuntimeInner,
+    settings: &'a Settings,
+    stream: &'a mut TcpStream,
+    item_id: String,
+    transfer_id: String,
+    buffer: Vec<u8>,
+    sent_archive_bytes: u64,
+    total_archive_bytes: u64,
+}
+
+impl FileStreamWriter<'_> {
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.flush_chunk()
+    }
+
+    fn flush_chunk(&mut self) -> anyhow::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.buffer);
+        let archive_bytes = bytes.len() as u64;
+        write_wire_body_to_stream(
+            self.stream,
+            self.settings,
+            &WireBody::FileStreamChunk {
+                item_id: self.item_id.clone(),
+                bytes,
+            },
+        )?;
+        self.sent_archive_bytes = self.sent_archive_bytes.saturating_add(archive_bytes);
+        update_transfer_progress(
+            self.runtime,
+            &self.transfer_id,
+            self.sent_archive_bytes,
+            self.total_archive_bytes,
+        );
+        Ok(())
+    }
+}
+
+impl Write for FileStreamWriter<'_> {
+    fn write(&mut self, mut input: &[u8]) -> std::io::Result<usize> {
+        let original_len = input.len();
+        while !input.is_empty() {
+            let remaining = TRANSFER_CHUNK_BYTES.saturating_sub(self.buffer.len());
+            let take = remaining.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() >= TRANSFER_CHUNK_BYTES {
+                self.flush_chunk()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+            }
+        }
+        Ok(original_len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_chunk()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+    }
+}
+
+fn write_wire_body_to_stream(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    body: &WireBody,
+) -> anyhow::Result<()> {
+    let payload = encode_wire_body(body, settings)?;
+    stream.write_all(&payload)?;
+    Ok(())
 }
 
 fn read_exact_with_progress(
@@ -1124,29 +1432,54 @@ fn new_queue_entry(item: ClipboardItem) -> QueueEntry {
 
 fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<String> {
     prune_stale_discovered_devices(runtime);
-    let mut peers = HashSet::new();
+    let mut peer_by_ip = HashMap::new();
+    if let Ok(guard) = runtime.discovered_devices.lock() {
+        for device in guard.iter() {
+            let peer = format!("{}:{}", device.addr, device.port);
+            if let Ok(socket_addr) = peer.parse::<SocketAddr>() {
+                peer_by_ip.insert(socket_addr.ip().to_string(), peer);
+            }
+        }
+    }
     for peer in &settings.sync.peers {
         let addr = normalize_peer(peer, settings.sync.listen_port);
         if !addr.is_empty() {
-            peers.insert(addr);
-        }
-    }
-    if let Ok(guard) = runtime.discovered_devices.lock() {
-        for device in guard.iter() {
-            peers.insert(format!("{}:{}", device.addr, device.port));
+            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+                peer_by_ip
+                    .entry(socket_addr.ip().to_string())
+                    .or_insert(addr);
+            }
         }
     }
     if let Ok(guard) = runtime.known_members.lock() {
         for member in guard.iter() {
             if let Some(addr) = member.strip_prefix("addr:") {
                 let normalized = normalize_peer(addr, settings.sync.listen_port);
-                if !normalized.is_empty() {
-                    peers.insert(normalized);
+                if is_expected_listen_addr(&normalized, settings.sync.listen_port) {
+                    if let Ok(socket_addr) = normalized.parse::<SocketAddr>() {
+                        peer_by_ip
+                            .entry(socket_addr.ip().to_string())
+                            .or_insert(normalized);
+                    }
                 }
             }
         }
     }
-    peers.into_iter().collect()
+    peer_by_ip.into_values().collect()
+}
+
+fn is_expected_listen_addr(addr: &str, listen_port: u16) -> bool {
+    addr.parse::<SocketAddr>()
+        .map(|socket_addr| socket_addr.port() == listen_port)
+        .unwrap_or(false)
+}
+
+fn send_transfer_id(peer: &str, item: &ClipboardItem) -> String {
+    let peer_key = peer
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| peer.to_string());
+    format!("send:{peer_key}:{}", item.id)
 }
 
 fn write_timeout_for_payload(payload_bytes: u64) -> Duration {
@@ -1318,11 +1651,25 @@ pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<Clipboa
         ClipboardPayload::Text { text } => text.as_bytes().to_vec(),
         ClipboardPayload::ImagePng { png_bytes } => png_bytes.clone(),
         ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.clone(),
+        ClipboardPayload::FileList {
+            paths,
+            top_level_names,
+            estimated_archive_bytes,
+        } => {
+            let marker = format!("{paths:?}:{top_level_names:?}:{estimated_archive_bytes}");
+            marker.into_bytes()
+        }
         ClipboardPayload::Html { html } => html.as_bytes().to_vec(),
         ClipboardPayload::Rtf { rtf } => rtf.as_bytes().to_vec(),
     };
 
-    let size_bytes = payload_bytes.len() as u64;
+    let size_bytes = match payload {
+        ClipboardPayload::FileList {
+            estimated_archive_bytes,
+            ..
+        } => *estimated_archive_bytes,
+        _ => payload_bytes.len() as u64,
+    };
     if size_bytes == 0 {
         return None;
     }
@@ -1341,14 +1688,19 @@ pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<Clipboa
 }
 
 fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Result<Vec<u8>> {
-    let plain = bincode::serialize(item)?;
+    encode_wire_body(&WireBody::ClipboardItem(item.clone()), settings)
+}
+
+fn encode_wire_body(body: &WireBody, settings: &Settings) -> anyhow::Result<Vec<u8>> {
+    let plain = bincode::serialize(body)?;
+    let source_device_id = wire_body_source_device_id(body);
     let frame = if settings.security.encryption_enabled {
         let secret = effective_secret(settings);
         let (nonce, body) = encrypt_bytes(&plain, &derive_key(&secret))?;
         WireMessage {
             v: WIRE_VERSION,
             encrypted: true,
-            source_device_id: item.source_device_id.clone(),
+            source_device_id: source_device_id.clone(),
             nonce: Some(nonce),
             body,
         }
@@ -1356,7 +1708,7 @@ fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Res
         WireMessage {
             v: WIRE_VERSION,
             encrypted: false,
-            source_device_id: item.source_device_id.clone(),
+            source_device_id,
             nonce: None,
             body: plain,
         }
@@ -1372,10 +1724,18 @@ fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Res
     Ok(payload)
 }
 
+fn wire_body_source_device_id(body: &WireBody) -> String {
+    match body {
+        WireBody::ClipboardItem(item) => item.source_device_id.clone(),
+        WireBody::FileStreamStart(meta) => meta.source_device_id.clone(),
+        WireBody::FileStreamChunk { .. } | WireBody::FileStreamEnd { .. } => String::new(),
+    }
+}
+
 fn payload_summary(payload: &ClipboardPayload) -> String {
     match payload {
         ClipboardPayload::Text { text } => {
-            let snippet = compact_snippet(text, 88);
+            let snippet = text_preview_snippet(text, 20_000);
             if snippet.is_empty() {
                 "直接复制文字".to_string()
             } else {
@@ -1383,7 +1743,12 @@ fn payload_summary(payload: &ClipboardPayload) -> String {
             }
         }
         ClipboardPayload::ImagePng { .. } => "图片 PNG".to_string(),
-        ClipboardPayload::FileBundle { top_level_names, .. } => {
+        ClipboardPayload::FileBundle {
+            top_level_names, ..
+        }
+        | ClipboardPayload::FileList {
+            top_level_names, ..
+        } => {
             if top_level_names.is_empty() {
                 "文件".to_string()
             } else if top_level_names.len() == 1 {
@@ -1398,19 +1763,19 @@ fn payload_summary(payload: &ClipboardPayload) -> String {
             }
         }
         ClipboardPayload::Html { html } => {
-            let snippet = compact_snippet(html, 48);
+            let snippet = text_preview_snippet(html, 20_000);
             if snippet.is_empty() {
                 "HTML".to_string()
             } else {
-                format!("HTML：{snippet}")
+                snippet
             }
         }
         ClipboardPayload::Rtf { rtf } => {
-            let snippet = compact_snippet(rtf, 32);
+            let snippet = text_preview_snippet(rtf, 20_000);
             if snippet.is_empty() {
                 "RTF".to_string()
             } else {
-                format!("RTF：{snippet}")
+                snippet
             }
         }
     }
@@ -1420,8 +1785,16 @@ fn payload_label(payload: &ClipboardPayload) -> String {
     match payload {
         ClipboardPayload::Text { .. } => "直接复制文字".to_string(),
         ClipboardPayload::ImagePng { .. } => "图片".to_string(),
-        ClipboardPayload::FileBundle { top_level_names, .. } => {
-            if top_level_names.iter().all(|name| looks_like_text_file(name)) {
+        ClipboardPayload::FileBundle {
+            top_level_names, ..
+        }
+        | ClipboardPayload::FileList {
+            top_level_names, ..
+        } => {
+            if top_level_names
+                .iter()
+                .all(|name| looks_like_text_file(name))
+            {
                 "文本文件".to_string()
             } else {
                 "文件".to_string()
@@ -1432,20 +1805,73 @@ fn payload_label(payload: &ClipboardPayload) -> String {
     }
 }
 
+fn file_stream_label(top_level_names: &[String]) -> String {
+    if top_level_names
+        .iter()
+        .all(|name| looks_like_text_file(name))
+    {
+        "文本文件".to_string()
+    } else {
+        "文件".to_string()
+    }
+}
+
+fn file_stream_summary(top_level_names: &[String]) -> String {
+    if top_level_names.is_empty() {
+        return "文件".to_string();
+    }
+    if top_level_names.len() == 1 {
+        return format!(
+            "{}：{}",
+            file_stream_label(top_level_names),
+            top_level_names[0]
+        );
+    }
+    format!(
+        "{}：{} +{}",
+        file_stream_label(top_level_names),
+        top_level_names[0],
+        top_level_names.len() - 1
+    )
+}
+
 fn looks_like_text_file(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     [
-        ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv", ".log",
-        ".xml", ".html", ".css", ".js", ".ts", ".tsx", ".jsx", ".rs", ".py", ".java", ".c",
-        ".cpp", ".h", ".hpp", ".go", ".sh",
+        ".txt",
+        ".md",
+        ".markdown",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".csv",
+        ".log",
+        ".xml",
+        ".html",
+        ".css",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".rs",
+        ".py",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".go",
+        ".sh",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
 }
 
-fn compact_snippet(value: &str, limit: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
+fn text_preview_snippet(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    let mut chars = trimmed.chars();
     let snippet: String = chars.by_ref().take(limit).collect();
     if chars.next().is_some() {
         format!("{snippet}…")
@@ -1454,7 +1880,7 @@ fn compact_snippet(value: &str, limit: usize) -> String {
     }
 }
 
-fn decode_wire_message(frame: &WireMessage, settings: &Settings) -> anyhow::Result<ClipboardItem> {
+fn decode_wire_body(frame: &WireMessage, settings: &Settings) -> anyhow::Result<WireBody> {
     if frame.v != WIRE_VERSION {
         return Err(anyhow::anyhow!("unsupported wire version: {}", frame.v));
     }
@@ -1476,7 +1902,7 @@ fn decode_wire_message(frame: &WireMessage, settings: &Settings) -> anyhow::Resu
         frame.body.clone()
     };
 
-    Ok(bincode::deserialize::<ClipboardItem>(&bytes)?)
+    Ok(bincode::deserialize::<WireBody>(&bytes)?)
 }
 
 fn effective_secret(settings: &Settings) -> String {
@@ -1783,10 +2209,27 @@ fn prune_transfers(runtime: &RuntimeInner) {
     let threshold = now_ms().saturating_sub(TRANSFER_RETENTION_MS);
     if let Ok(mut guard) = runtime.transfers.lock() {
         guard.retain(|entry| {
-            matches!(entry.status.as_str(), "sending" | "receiving" | "queued" | "applying" | "retrying")
-                || entry.updated_at_ms >= threshold
+            matches!(
+                entry.status.as_str(),
+                "sending" | "receiving" | "queued" | "applying" | "retrying"
+            ) || entry.updated_at_ms >= threshold
         });
     }
+}
+
+fn has_active_transfers(runtime: &RuntimeInner) -> bool {
+    runtime
+        .transfers
+        .lock()
+        .map(|guard| {
+            guard.iter().any(|entry| {
+                matches!(
+                    entry.status.as_str(),
+                    "sending" | "receiving" | "queued" | "applying" | "retrying"
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn find_receive_transfer_id(runtime: &RuntimeInner, item_id: &str) -> Option<String> {
@@ -1813,7 +2256,9 @@ fn adopt_receive_transfer(
         let canonical_index = guard.iter().position(|entry| entry.id == canonical_id);
 
         match (transient_index, canonical_index) {
-            (Some(transient_index), Some(canonical_index)) if transient_index != canonical_index => {
+            (Some(transient_index), Some(canonical_index))
+                if transient_index != canonical_index =>
+            {
                 let transient = guard[transient_index].clone();
                 if let Some(existing) = guard.get_mut(canonical_index) {
                     existing.peer = peer.to_string();
@@ -1960,8 +2405,10 @@ pub fn list_network_interfaces() -> Vec<NetworkInterfaceOption> {
         .collect();
 
     interfaces.sort_by(|left, right| {
-        let left_ip: std::net::Ipv4Addr = left.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-        let right_ip: std::net::Ipv4Addr = right.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        let left_ip: std::net::Ipv4Addr =
+            left.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        let right_ip: std::net::Ipv4Addr =
+            right.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
         is_private_lan_ipv4(right_ip)
             .cmp(&is_private_lan_ipv4(left_ip))
             .then_with(|| left.name.cmp(&right.name))
@@ -2035,7 +2482,10 @@ fn pick_local_ip() -> anyhow::Result<IpAddr> {
         .ok_or_else(|| anyhow::anyhow!("no usable local ipv4 address found"))
 }
 
-fn selected_or_active_local_ip(settings: &Settings, active_local_ip: Option<String>) -> Option<String> {
+fn selected_or_active_local_ip(
+    settings: &Settings,
+    active_local_ip: Option<String>,
+) -> Option<String> {
     resolve_local_ip_override(&settings.sync.local_ip)
         .ok()
         .flatten()
@@ -2054,7 +2504,9 @@ fn resolve_local_ip_override(value: &str) -> anyhow::Result<Option<IpAddr>> {
         .map_err(|_| anyhow::anyhow!("invalid selected local ip: {trimmed}"))?;
     match parsed {
         IpAddr::V4(ipv4) if is_usable_ipv4(ipv4) => Ok(Some(IpAddr::V4(ipv4))),
-        IpAddr::V4(_) => Err(anyhow::anyhow!("selected local ip is not usable: {trimmed}")),
+        IpAddr::V4(_) => Err(anyhow::anyhow!(
+            "selected local ip is not usable: {trimmed}"
+        )),
         IpAddr::V6(_) => Err(anyhow::anyhow!("selected local ip must be ipv4: {trimmed}")),
     }
 }

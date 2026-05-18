@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClipboardPayload {
@@ -11,6 +12,11 @@ pub enum ClipboardPayload {
     FileBundle {
         archive_bytes: Vec<u8>,
         top_level_names: Vec<String>,
+    },
+    FileList {
+        paths: Vec<PathBuf>,
+        top_level_names: Vec<String>,
+        estimated_archive_bytes: u64,
     },
     Html {
         html: String,
@@ -25,7 +31,9 @@ impl ClipboardPayload {
         match self {
             ClipboardPayload::Text { .. } => "text",
             ClipboardPayload::ImagePng { .. } => "image_png",
-            ClipboardPayload::FileBundle { .. } => "file_bundle",
+            ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => {
+                "file_bundle"
+            }
             ClipboardPayload::Html { .. } => "html",
             ClipboardPayload::Rtf { .. } => "rtf",
         }
