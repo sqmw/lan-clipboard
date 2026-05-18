@@ -12,6 +12,7 @@ pub enum ClipboardPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardItem {
     pub id: String,
+    pub content_hash: String,
     pub created_at_ms: u64,
     pub source_device_id: String,
     pub size_bytes: u64,

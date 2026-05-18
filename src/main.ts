@@ -54,7 +54,6 @@ let observedMemberCount = 1;
 
 async function loadSettings(): Promise<void> {
   settings = await invoke<Settings>("get_settings");
-  getInput("poll-interval-ms").value = String(settings.sync.poll_interval_ms);
   getTextArea("peers").value = settings.sync.peers.join("\n");
   getInput("encryption-enabled").checked = settings.security.encryption_enabled;
   getInput("pairing-code").value = settings.security.pairing_code;
@@ -82,7 +81,6 @@ function collectSettings(): Settings {
       shared_code: getInput("shared-code").value.trim(),
       enabled: true,
       peers,
-      poll_interval_ms: Number(getInput("poll-interval-ms").value),
     },
     security: {
       ...settings.security,
@@ -250,7 +248,6 @@ window.addEventListener("DOMContentLoaded", () => {
 
   [
     "shared-code",
-    "poll-interval-ms",
     "max-item-mb",
     "pairing-code",
   ].forEach((id) => {

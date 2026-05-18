@@ -2,7 +2,12 @@ use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::SizeLimits;
 use base64::Engine;
 use image::ImageEncoder;
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
+
+const CLIPBOARD_IO_RETRIES: usize = 10;
+const CLIPBOARD_IO_DELAY_MS: u64 = 40;
 
 #[derive(Debug, Error)]
 pub enum ClipboardError {
@@ -15,19 +20,12 @@ pub enum ClipboardError {
 }
 
 pub fn read_snapshot(limits: &SizeLimits) -> Result<ClipboardPayload, ClipboardError> {
+    retry_clipboard_io(|| read_snapshot_once(limits))
+}
+
+fn read_snapshot_once(limits: &SizeLimits) -> Result<ClipboardPayload, ClipboardError> {
     let mut clipboard =
         arboard::Clipboard::new().map_err(|e| ClipboardError::Backend(e.to_string()))?;
-
-    if let Ok(text) = clipboard.get_text() {
-        let size_bytes = text.as_bytes().len() as u64;
-        if size_bytes > limits.max_item_bytes {
-            return Err(ClipboardError::TooLarge {
-                size_bytes,
-                limit_bytes: limits.max_item_bytes,
-            });
-        }
-        return Ok(ClipboardPayload::Text { text });
-    }
 
     if let Ok(image) = clipboard.get_image() {
         let rgba = image::RgbaImage::from_raw(
@@ -61,10 +59,25 @@ pub fn read_snapshot(limits: &SizeLimits) -> Result<ClipboardPayload, ClipboardE
         });
     }
 
+    if let Ok(text) = clipboard.get_text() {
+        let size_bytes = text.as_bytes().len() as u64;
+        if size_bytes > limits.max_item_bytes {
+            return Err(ClipboardError::TooLarge {
+                size_bytes,
+                limit_bytes: limits.max_item_bytes,
+            });
+        }
+        return Ok(ClipboardPayload::Text { text });
+    }
+
     Err(ClipboardError::Unsupported)
 }
 
 pub fn write_item(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
+    retry_clipboard_io(|| write_item_once(item, limits))
+}
+
+fn write_item_once(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
     if item.size_bytes > limits.max_item_bytes {
         return Err(ClipboardError::TooLarge {
             size_bytes: item.size_bytes,
@@ -112,4 +125,28 @@ pub fn write_item(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), Clipb
             Err(ClipboardError::Unsupported)
         }
     }
+}
+
+fn retry_clipboard_io<T, F>(mut action: F) -> Result<T, ClipboardError>
+where
+    F: FnMut() -> Result<T, ClipboardError>,
+{
+    let mut last_backend_error = None;
+
+    for attempt in 0..CLIPBOARD_IO_RETRIES {
+        match action() {
+            Ok(value) => return Ok(value),
+            Err(error @ ClipboardError::Backend(_)) => {
+                last_backend_error = Some(error);
+                if attempt + 1 < CLIPBOARD_IO_RETRIES {
+                    thread::sleep(Duration::from_millis(CLIPBOARD_IO_DELAY_MS));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_backend_error.unwrap_or_else(|| {
+        ClipboardError::Backend("clipboard backend exhausted retries".to_string())
+    }))
 }

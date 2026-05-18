@@ -4,14 +4,15 @@ use crate::settings::Settings;
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
 use base64::Engine;
+use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,17 @@ const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
 const UDP_DISCOVERY_PORT: u16 = 32911;
 const UDP_ANNOUNCE_MS: u64 = 1_000;
 const DISCOVERY_APP: &str = "lan-clipboard";
+const LOCAL_EVENT_DEBOUNCE_MS: u64 = 250;
+const RECENT_EVENT_TTL_MS: u64 = 120_000;
+const QUEUE_RETRY_BASE_MS: u64 = 120;
+const QUEUE_RETRY_MAX_MS: u64 = 1_500;
+const QUEUE_MAX_RETRIES: u32 = 24;
+const QUEUE_MAX_AGE_MS: u64 = 30_000;
+const CONNECT_TIMEOUT_MS: u64 = 900;
+const MIN_WRITE_TIMEOUT_MS: u64 = 1_500;
+const MAX_WRITE_TIMEOUT_MS: u64 = 30_000;
+const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 4 * 1024;
+const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
@@ -78,8 +90,12 @@ struct RuntimeInner {
     stop_flag: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
-    muted_until: Mutex<Instant>,
-    last_hash: Mutex<Option<String>>,
+    suppress_until_ms: AtomicU64,
+    outbound_queue: Mutex<VecDeque<QueueEntry>>,
+    inbound_queue: Mutex<VecDeque<QueueEntry>>,
+    latest_item: Mutex<Option<ItemMarker>>,
+    last_local_observed: Mutex<Option<ObservedClipboard>>,
+    recent_event_ids: Mutex<HashMap<String, Instant>>,
     logs: Mutex<Vec<RuntimeLog>>,
     discovered_devices: Mutex<Vec<DiscoveredDevice>>,
     discovered_seen_at: Mutex<HashMap<String, Instant>>,
@@ -93,8 +109,12 @@ impl Default for RuntimeInner {
             stop_flag: AtomicBool::new(false),
             worker: Mutex::new(None),
             last_error: Mutex::new(None),
-            muted_until: Mutex::new(Instant::now()),
-            last_hash: Mutex::new(None),
+            suppress_until_ms: AtomicU64::new(0),
+            outbound_queue: Mutex::new(VecDeque::new()),
+            inbound_queue: Mutex::new(VecDeque::new()),
+            latest_item: Mutex::new(None),
+            last_local_observed: Mutex::new(None),
+            recent_event_ids: Mutex::new(HashMap::new()),
             logs: Mutex::new(Vec::new()),
             discovered_devices: Mutex::new(Vec::new()),
             discovered_seen_at: Mutex::new(HashMap::new()),
@@ -136,6 +156,34 @@ struct PresenceConfig {
     device_name: String,
     shared_code: String,
     listen_port: u16,
+}
+
+#[derive(Debug, Clone)]
+struct ItemMarker {
+    id: String,
+    created_at_ms: u64,
+    source_device_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedClipboard {
+    content_hash: String,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QueueEntry {
+    item: ClipboardItem,
+    attempts: u32,
+    queued_at_ms: u64,
+    next_attempt_at_ms: u64,
+}
+
+struct ClipboardWatchHandler {
+    runtime: Arc<RuntimeInner>,
+    limits: crate::settings::SizeLimits,
+    device_id: String,
+    poll_interval: Duration,
 }
 
 impl SyncEngine {
@@ -315,6 +363,43 @@ impl Drop for PresenceService {
     }
 }
 
+impl ClipboardHandler for ClipboardWatchHandler {
+    fn on_clipboard_change(&mut self) -> CallbackResult {
+        if is_clipboard_suppressed(&self.runtime) {
+            return CallbackResult::Next;
+        }
+
+        let payload = match clipboard::read_snapshot(&self.limits) {
+            Ok(payload) => payload,
+            Err(clipboard::ClipboardError::Unsupported) => return CallbackResult::Next,
+            Err(error) => {
+                set_error(
+                    &self.runtime,
+                    format!("clipboard watcher read failed: {error}"),
+                );
+                return CallbackResult::Next;
+            }
+        };
+
+        let Some(item) = build_item(&payload, &self.device_id) else {
+            return CallbackResult::Next;
+        };
+
+        if should_ignore_local_observation(&self.runtime, &item.content_hash) {
+            return CallbackResult::Next;
+        }
+
+        register_recent_event(&self.runtime, &item.id);
+        update_latest_item(&self.runtime, &item);
+        enqueue_outbound_item(&self.runtime, item);
+        CallbackResult::Next
+    }
+
+    fn sleep_interval(&self) -> Duration {
+        self.poll_interval
+    }
+}
+
 fn run_presence_loop(runtime: Arc<PresenceInner>, config: PresenceConfig) {
     let mdns = match ServiceDaemon::new() {
         Ok(value) => value,
@@ -379,6 +464,38 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     let mut last_discovery = Instant::now() - Duration::from_millis(DISCOVERY_REFRESH_MS);
     let mut last_udp_announce = Instant::now() - Duration::from_millis(UDP_ANNOUNCE_MS);
     let device_name = local_device_name();
+    let watcher_runtime = Arc::clone(&runtime);
+    let watcher_stop_runtime = Arc::clone(&runtime);
+    let watcher_limits = settings.limits.clone();
+    let watcher_device_id = device_id.clone();
+    let watcher_poll_interval = Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS);
+    let watcher = std::thread::Builder::new()
+        .name("lan-clipboard-watch".to_string())
+        .spawn(move || {
+            let handler = ClipboardWatchHandler {
+                runtime: watcher_runtime,
+                limits: watcher_limits,
+                device_id: watcher_device_id,
+                poll_interval: watcher_poll_interval,
+            };
+            let Ok(mut master) = Master::new(handler) else {
+                return;
+            };
+            let shutdown = master.shutdown_channel();
+            let _shutdown_guard = std::thread::Builder::new()
+                .name("lan-clipboard-watch-stop".to_string())
+                .spawn({
+                    let runtime = watcher_stop_runtime;
+                    move || {
+                        while !runtime.stop_flag.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        shutdown.signal();
+                    }
+                });
+            let _ = master.run();
+        })
+        .ok();
 
     while !runtime.stop_flag.load(Ordering::SeqCst) {
         if let Some(socket) = udp_socket.as_ref() {
@@ -404,23 +521,16 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
             Err(error) => set_error(&runtime, format!("listener accept failed: {error}")),
         }
 
-        if should_send(&runtime) {
-            match clipboard::read_snapshot(&settings.limits) {
-                Ok(payload) => {
-                    if let Some(item) = build_item(&payload, &device_id) {
-                        if is_new_hash(&runtime, &item.id) {
-                            send_to_all_peers(&runtime, &settings, &item);
-                        }
-                    }
-                }
-                Err(clipboard::ClipboardError::Unsupported) => {}
-                Err(error) => set_error(&runtime, format!("clipboard read failed: {error}")),
-            }
-        }
+        process_inbound_queue(&runtime, &settings);
+        process_outbound_queue(&runtime, &settings);
+        prune_recent_event_ids(&runtime);
 
-        std::thread::sleep(Duration::from_millis(settings.sync.poll_interval_ms));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
+    if let Some(handle) = watcher {
+        let _ = handle.join();
+    }
     runtime.running.store(false, Ordering::SeqCst);
 }
 
@@ -529,14 +639,6 @@ fn refresh_discovered_devices(
     }
 }
 
-fn should_send(runtime: &RuntimeInner) -> bool {
-    runtime
-        .muted_until
-        .lock()
-        .map(|guard| Instant::now() >= *guard)
-        .unwrap_or(true)
-}
-
 fn handle_incoming(
     runtime: &RuntimeInner,
     settings: &Settings,
@@ -562,24 +664,15 @@ fn handle_incoming(
         if let Some(addr) = &remote_addr {
             mark_known_member(runtime, "addr", addr);
         }
-        if !is_new_hash(runtime, &item.id) {
+        if should_skip_remote_item(runtime, &item) {
             continue;
         }
-
-        clipboard::write_item(&item, &settings.limits)?;
-        push_log(
-            runtime,
-            "INFO",
-            &format!("applied item from {}", item.source_device_id),
-        );
-        if let Ok(mut guard) = runtime.muted_until.lock() {
-            *guard = Instant::now() + Duration::from_millis(APPLY_MUTE_MS);
-        }
+        enqueue_inbound_item(runtime, item);
     }
     Ok(())
 }
 
-fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) {
+fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) -> usize {
     let payload = match encode_wire_message(item, settings) {
         Ok(mut payload) => {
             payload.push('\n');
@@ -587,13 +680,14 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
         }
         Err(error) => {
             set_error(runtime, format!("encode payload failed: {error}"));
-            return;
+            return 0;
         }
     };
 
     let mut delivered = 0usize;
     for peer in collect_peer_targets(runtime, settings) {
-        let timeout = Duration::from_millis(900);
+        let connect_timeout = Duration::from_millis(CONNECT_TIMEOUT_MS);
+        let write_timeout = write_timeout_for_payload(payload.len() as u64);
         let stream = TcpStream::connect_timeout(
             &match peer.parse() {
                 Ok(socket_addr) => socket_addr,
@@ -602,17 +696,34 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
                     continue;
                 }
             },
-            timeout,
+            connect_timeout,
         );
 
         let mut stream = match stream {
             Ok(stream) => stream,
-            Err(_) => continue,
+            Err(error) => {
+                push_log(
+                    runtime,
+                    "DEBUG",
+                    &format!("connect peer failed peer={peer} error={error}"),
+                );
+                continue;
+            }
         };
-        let _ = stream.set_write_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(write_timeout));
         if stream.write_all(payload.as_bytes()).is_ok() {
             mark_known_member(runtime, "addr", &peer);
             delivered += 1;
+        } else {
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!(
+                    "write peer failed peer={peer} payload_bytes={} timeout_ms={}",
+                    payload.len(),
+                    write_timeout.as_millis()
+                ),
+            );
         }
     }
 
@@ -622,6 +733,145 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
             "DEBUG",
             &format!("broadcast delivered={}", delivered),
         );
+    }
+    delivered
+}
+
+fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
+    loop {
+        let Some(mut entry) = pop_ready_queue_entry(&runtime.inbound_queue) else {
+            break;
+        };
+
+        set_clipboard_suppressed(runtime, APPLY_MUTE_MS);
+        match clipboard::write_item(&entry.item, &settings.limits) {
+            Ok(()) => push_log(
+                runtime,
+                "INFO",
+                &format!(
+                    "applied item {} from {} after {} attempt(s)",
+                    entry.item.id,
+                    entry.item.source_device_id,
+                    entry.attempts + 1
+                ),
+            ),
+            Err(crate::clipboard::ClipboardError::Backend(error)) => {
+                if schedule_retry(&mut entry) {
+                    push_log(
+                        runtime,
+                        "WARN",
+                        &format!(
+                            "apply retry queued for item {}: {} (attempt={})",
+                            entry.item.id, error, entry.attempts
+                        ),
+                    );
+                    push_queue_entry(&runtime.inbound_queue, entry);
+                } else {
+                    set_error(
+                        runtime,
+                        format!(
+                            "apply clipboard item failed after retries: item={} error={error}",
+                            entry.item.id
+                        ),
+                    );
+                }
+            }
+            Err(error) => set_error(
+                runtime,
+                format!(
+                    "apply clipboard item failed permanently: item={} error={error}",
+                    entry.item.id
+                ),
+            ),
+        }
+    }
+}
+
+fn process_outbound_queue(runtime: &RuntimeInner, settings: &Settings) {
+    if is_clipboard_suppressed(runtime) {
+        return;
+    }
+
+    loop {
+        let Some(mut entry) = pop_ready_queue_entry(&runtime.outbound_queue) else {
+            break;
+        };
+
+        let attempted = collect_peer_targets(runtime, settings).len();
+        let delivered = send_to_all_peers(runtime, settings, &entry.item);
+        if attempted == 0 || delivered < attempted {
+            if schedule_retry(&mut entry) {
+                push_log(
+                    runtime,
+                    "DEBUG",
+                    &format!(
+                        "outbound item {} pending peers delivered={delivered} attempted={attempted} retry={}",
+                        entry.item.id, entry.attempts
+                    ),
+                );
+                push_queue_entry(&runtime.outbound_queue, entry);
+                continue;
+            }
+            push_log(
+                runtime,
+                "WARN",
+                &format!(
+                    "drop outbound item {} after retries delivered={delivered} attempted={attempted}",
+                    entry.item.id
+                ),
+            );
+            continue;
+        }
+
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!(
+                "outbound item {} completed delivered={delivered} attempted={attempted}",
+                entry.item.id
+            ),
+        );
+    }
+}
+
+fn pop_ready_queue_entry(queue: &Mutex<VecDeque<QueueEntry>>) -> Option<QueueEntry> {
+    let now = now_ms();
+    queue.lock().ok().and_then(|mut guard| {
+        let position = guard
+            .iter()
+            .position(|entry| entry.next_attempt_at_ms <= now)?;
+        guard.remove(position)
+    })
+}
+
+fn push_queue_entry(queue: &Mutex<VecDeque<QueueEntry>>, entry: QueueEntry) {
+    if let Ok(mut guard) = queue.lock() {
+        guard.push_back(entry);
+    }
+}
+
+fn schedule_retry(entry: &mut QueueEntry) -> bool {
+    if entry.attempts >= QUEUE_MAX_RETRIES {
+        return false;
+    }
+    if now_ms().saturating_sub(entry.queued_at_ms) >= QUEUE_MAX_AGE_MS {
+        return false;
+    }
+
+    entry.attempts += 1;
+    let retry_delay_ms =
+        (QUEUE_RETRY_BASE_MS.saturating_mul(entry.attempts as u64)).min(QUEUE_RETRY_MAX_MS);
+    entry.next_attempt_at_ms = now_ms().saturating_add(retry_delay_ms);
+    true
+}
+
+fn new_queue_entry(item: ClipboardItem) -> QueueEntry {
+    let queued_at_ms = now_ms();
+    QueueEntry {
+        item,
+        attempts: 0,
+        queued_at_ms,
+        next_attempt_at_ms: queued_at_ms,
     }
 }
 
@@ -639,7 +889,25 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
             peers.insert(format!("{}:{}", device.addr, device.port));
         }
     }
+    if let Ok(guard) = runtime.known_members.lock() {
+        for member in guard.iter() {
+            if let Some(addr) = member.strip_prefix("addr:") {
+                let normalized = normalize_peer(addr, settings.sync.listen_port);
+                if !normalized.is_empty() {
+                    peers.insert(normalized);
+                }
+            }
+        }
+    }
     peers.into_iter().collect()
+}
+
+fn write_timeout_for_payload(payload_bytes: u64) -> Duration {
+    let estimated_ms = payload_bytes
+        .checked_div(WRITE_TIMEOUT_BYTES_PER_MS)
+        .unwrap_or(MAX_WRITE_TIMEOUT_MS)
+        .saturating_add(MIN_WRITE_TIMEOUT_MS);
+    Duration::from_millis(estimated_ms.clamp(MIN_WRITE_TIMEOUT_MS, MAX_WRITE_TIMEOUT_MS))
 }
 
 fn cached_member_signal_count(runtime: &RuntimeInner) -> usize {
@@ -720,6 +988,22 @@ fn clear_member_cache(runtime: &RuntimeInner) {
     if let Ok(mut guard) = runtime.known_members.lock() {
         guard.clear();
     }
+    if let Ok(mut guard) = runtime.outbound_queue.lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = runtime.inbound_queue.lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = runtime.latest_item.lock() {
+        guard.take();
+    }
+    if let Ok(mut guard) = runtime.last_local_observed.lock() {
+        guard.take();
+    }
+    if let Ok(mut guard) = runtime.recent_event_ids.lock() {
+        guard.clear();
+    }
+    runtime.suppress_until_ms.store(0, Ordering::SeqCst);
 }
 
 fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevice>) {
@@ -785,7 +1069,9 @@ fn normalize_peer(peer: &str, fallback_port: u16) -> String {
 pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<ClipboardItem> {
     let payload_bytes = match payload {
         ClipboardPayload::Text { text } => text.as_bytes().to_vec(),
-        ClipboardPayload::ImagePng { png_base64 } => png_base64.as_bytes().to_vec(),
+        ClipboardPayload::ImagePng { png_base64 } => base64::engine::general_purpose::STANDARD
+            .decode(png_base64.as_bytes())
+            .ok()?,
         ClipboardPayload::Html { html } => html.as_bytes().to_vec(),
         ClipboardPayload::Rtf { rtf } => rtf.as_bytes().to_vec(),
     };
@@ -796,9 +1082,11 @@ pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<Clipboa
     }
 
     let created_at_ms = now_ms();
+    let content_hash = payload_hash(&payload_bytes);
 
     Some(ClipboardItem {
-        id: payload_hash(&payload_bytes),
+        id: Uuid::new_v4().to_string(),
+        content_hash,
         created_at_ms,
         source_device_id: device_id.to_string(),
         size_bytes,
@@ -904,15 +1192,122 @@ fn payload_hash(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn is_new_hash(runtime: &RuntimeInner, hash: &str) -> bool {
-    if let Ok(mut guard) = runtime.last_hash.lock() {
-        if guard.as_deref() == Some(hash) {
-            return false;
+fn is_clipboard_suppressed(runtime: &RuntimeInner) -> bool {
+    runtime.suppress_until_ms.load(Ordering::SeqCst) > now_ms()
+}
+
+fn set_clipboard_suppressed(runtime: &RuntimeInner, duration_ms: u64) {
+    runtime
+        .suppress_until_ms
+        .store(now_ms().saturating_add(duration_ms), Ordering::SeqCst);
+}
+
+fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -> bool {
+    let observed_at_ms = now_ms();
+    if let Ok(mut guard) = runtime.last_local_observed.lock() {
+        if let Some(previous) = guard.as_ref() {
+            if previous.content_hash == content_hash
+                && observed_at_ms.saturating_sub(previous.observed_at_ms) <= LOCAL_EVENT_DEBOUNCE_MS
+            {
+                return true;
+            }
         }
-        *guard = Some(hash.to_string());
+        *guard = Some(ObservedClipboard {
+            content_hash: content_hash.to_string(),
+            observed_at_ms,
+        });
+    }
+    false
+}
+
+fn recent_event_seen(runtime: &RuntimeInner, event_id: &str) -> bool {
+    runtime
+        .recent_event_ids
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(event_id).copied())
+        .map(|seen_at| seen_at.elapsed() < Duration::from_millis(RECENT_EVENT_TTL_MS))
+        .unwrap_or(false)
+}
+
+fn register_recent_event(runtime: &RuntimeInner, event_id: &str) {
+    if let Ok(mut guard) = runtime.recent_event_ids.lock() {
+        guard.insert(event_id.to_string(), Instant::now());
+    }
+}
+
+fn prune_recent_event_ids(runtime: &RuntimeInner) {
+    if let Ok(mut guard) = runtime.recent_event_ids.lock() {
+        guard.retain(|_, seen_at| seen_at.elapsed() < Duration::from_millis(RECENT_EVENT_TTL_MS));
+    }
+}
+
+fn item_marker(item: &ClipboardItem) -> ItemMarker {
+    ItemMarker {
+        id: item.id.clone(),
+        created_at_ms: item.created_at_ms,
+        source_device_id: item.source_device_id.clone(),
+    }
+}
+
+fn compare_markers(left: &ItemMarker, right: &ItemMarker) -> std::cmp::Ordering {
+    left.created_at_ms
+        .cmp(&right.created_at_ms)
+        .then_with(|| left.source_device_id.cmp(&right.source_device_id))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn update_latest_item(runtime: &RuntimeInner, item: &ClipboardItem) {
+    if let Ok(mut guard) = runtime.latest_item.lock() {
+        let marker = item_marker(item);
+        let replace = guard
+            .as_ref()
+            .map(|current| compare_markers(&marker, current).is_gt())
+            .unwrap_or(true);
+        if replace {
+            *guard = Some(marker);
+        }
+    }
+}
+
+fn should_skip_remote_item(runtime: &RuntimeInner, item: &ClipboardItem) -> bool {
+    if recent_event_seen(runtime, &item.id) {
         return true;
     }
-    true
+
+    let marker = item_marker(item);
+    let should_skip = runtime
+        .latest_item
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|current| compare_markers(&marker, &current).is_lt())
+        .unwrap_or(false);
+
+    if should_skip {
+        return true;
+    }
+
+    register_recent_event(runtime, &item.id);
+    update_latest_item(runtime, item);
+    false
+}
+
+fn enqueue_outbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
+    let item_id = item.id.clone();
+    push_queue_entry(&runtime.outbound_queue, new_queue_entry(item));
+    push_log(runtime, "DEBUG", &format!("queued outbound item {item_id}"));
+}
+
+fn enqueue_inbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
+    let item_id = item.id.clone();
+    let source = item.source_device_id.clone();
+    push_queue_entry(&runtime.inbound_queue, new_queue_entry(item));
+    push_log(
+        runtime,
+        "DEBUG",
+        &format!("queued inbound item {item_id} from {source}"),
+    );
 }
 
 fn set_error(runtime: &RuntimeInner, message: String) {
