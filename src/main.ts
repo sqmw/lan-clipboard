@@ -71,6 +71,8 @@ const getTextArea = (id: string): HTMLTextAreaElement =>
   document.querySelector(`#${id}`) as HTMLTextAreaElement;
 const getText = (id: string): HTMLElement =>
   document.querySelector(`#${id}`) as HTMLElement;
+const MIN_MAX_ITEM_MB = 1;
+const MAX_MAX_ITEM_MB = 1000;
 
 let settings: Settings;
 let lastDiscovered: DiscoveredDevice[] = [];
@@ -185,7 +187,12 @@ function collectSettings(): Settings {
     .filter(Boolean);
 
   const mb = Number(getInput("max-item-mb").value);
-  const max_item_bytes = Math.max(1, Math.min(100, mb)) * 1024 * 1024;
+  const normalizedMb = Math.max(
+    MIN_MAX_ITEM_MB,
+    Math.min(MAX_MAX_ITEM_MB, Number.isFinite(mb) ? Math.round(mb) : MIN_MAX_ITEM_MB),
+  );
+  getInput("max-item-mb").value = String(normalizedMb);
+  const max_item_bytes = normalizedMb * 1024 * 1024;
 
   return {
     ...settings,
