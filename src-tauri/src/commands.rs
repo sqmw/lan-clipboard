@@ -1,5 +1,5 @@
 use crate::clipboard;
-use crate::net::{self, DiscoveredDevice, RuntimeLog, RuntimeStatus};
+use crate::net::{self, DiscoveredDevice, NetworkInterfaceOption, RuntimeLog, RuntimeStatus};
 use crate::protocol::ClipboardPayload;
 use crate::settings::Settings;
 use crate::state::AppState;
@@ -141,6 +141,11 @@ pub fn discover_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevi
 #[tauri::command]
 pub fn cached_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevice>, String> {
     Ok(state.sync_engine.devices())
+}
+
+#[tauri::command]
+pub fn list_network_interfaces() -> Result<Vec<NetworkInterfaceOption>, String> {
+    Ok(net::list_network_interfaces())
 }
 
 #[tauri::command]

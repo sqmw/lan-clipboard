@@ -18,7 +18,7 @@
           <button class="ghost-button" id="refresh-domain" type="button">刷新</button>
         </div>
         <div class="connect-box connect-list">
-          <div class="label">当前共享域成员</div>
+          <div class="label">设备列表</div>
           <div id="discovered-devices"></div>
           <p class="list-feedback" id="scan-feedback">当前没有发现其他共享域成员。</p>
         </div>
@@ -54,11 +54,15 @@
             <input id="shared-code" placeholder="6位数字" maxlength="6" inputmode="numeric" />
           </label>
           <label>
+            使用网络
+            <select id="network-ip"></select>
+          </label>
+          <label>
             最大发送大小（MB）
             <input id="max-item-mb" type="number" min="1" max="100" step="1" />
           </label>
         </div>
-        <p class="hint">推荐家庭或小团队共用一个 6 位码；同网段内填写相同共享码的设备都会加入同一个共享域。</p>
+        <p class="hint">推荐家庭或小团队共用一个 6 位码；同网段内填写相同共享码的设备都会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。</p>
         <p class="save-feedback" id="config-feedback">修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。</p>
         <details class="advanced">
           <summary>高级 / 日志</summary>

@@ -3,14 +3,13 @@ use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-use base64::Engine;
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,34 +19,45 @@ use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_lan-clipboard._tcp.local.";
 const LOG_LIMIT: usize = 800;
-const DISCOVERY_REFRESH_MS: u64 = 2_500;
+const DISCOVERY_REFRESH_MS: u64 = 1_000;
 const DISCOVERY_TIMEOUT_MS: u64 = 900;
 const STATUS_DISCOVERY_TIMEOUT_MS: u64 = 350;
 const APPLY_MUTE_MS: u64 = 1_200;
 const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
 const UDP_DISCOVERY_PORT: u16 = 32911;
-const UDP_ANNOUNCE_MS: u64 = 1_000;
+const UDP_ANNOUNCE_MS: u64 = 500;
 const DISCOVERY_APP: &str = "lan-clipboard";
 const LOCAL_EVENT_DEBOUNCE_MS: u64 = 250;
 const RECENT_EVENT_TTL_MS: u64 = 120_000;
-const QUEUE_RETRY_BASE_MS: u64 = 120;
-const QUEUE_RETRY_MAX_MS: u64 = 1_500;
+const QUEUE_RETRY_BASE_MS: u64 = 30;
+const QUEUE_RETRY_MAX_MS: u64 = 500;
 const QUEUE_MAX_RETRIES: u32 = 24;
 const QUEUE_MAX_AGE_MS: u64 = 30_000;
 const CONNECT_TIMEOUT_MS: u64 = 900;
 const MIN_WRITE_TIMEOUT_MS: u64 = 1_500;
 const MAX_WRITE_TIMEOUT_MS: u64 = 30_000;
 const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 4 * 1024;
-const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 120;
+const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 50;
+const WIRE_VERSION: u8 = 2;
+const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
     pub running: bool,
     pub device_id: String,
+    pub device_name: String,
+    pub local_ip: Option<String>,
     pub shared_code: String,
     pub last_error: Option<String>,
     pub recent_log_count: usize,
     pub peer_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkInterfaceOption {
+    pub name: String,
+    pub ip: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,8 +80,8 @@ struct WireMessage {
     pub v: u8,
     pub encrypted: bool,
     pub source_device_id: String,
-    pub nonce_base64: Option<String>,
-    pub body_base64: String,
+    pub nonce: Option<[u8; 12]>,
+    pub body: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +100,7 @@ struct RuntimeInner {
     stop_flag: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
+    active_local_ip: Mutex<Option<String>>,
     suppress_until_ms: AtomicU64,
     outbound_queue: Mutex<VecDeque<QueueEntry>>,
     inbound_queue: Mutex<VecDeque<QueueEntry>>,
@@ -109,6 +120,7 @@ impl Default for RuntimeInner {
             stop_flag: AtomicBool::new(false),
             worker: Mutex::new(None),
             last_error: Mutex::new(None),
+            active_local_ip: Mutex::new(None),
             suppress_until_ms: AtomicU64::new(0),
             outbound_queue: Mutex::new(VecDeque::new()),
             inbound_queue: Mutex::new(VecDeque::new()),
@@ -155,6 +167,7 @@ struct PresenceConfig {
     device_id: String,
     device_name: String,
     shared_code: String,
+    local_ip: String,
     listen_port: u16,
 }
 
@@ -203,11 +216,19 @@ impl SyncEngine {
             .lock()
             .ok()
             .and_then(|guard| (*guard).clone());
+        let active_local_ip = self
+            .inner
+            .active_local_ip
+            .lock()
+            .ok()
+            .and_then(|guard| (*guard).clone());
         let recent_log_count = self.inner.logs.lock().map(|guard| guard.len()).unwrap_or(0);
         let peer_count = current_member_count(&self.inner, settings);
         RuntimeStatus {
             running: self.inner.running.load(Ordering::SeqCst),
             device_id: settings.sync_device_id(),
+            device_name: local_device_name(),
+            local_ip: selected_or_active_local_ip(settings, active_local_ip),
             shared_code: settings.sync.shared_code.clone(),
             last_error: error,
             recent_log_count,
@@ -262,6 +283,9 @@ impl SyncEngine {
         self.inner.running.store(true, Ordering::SeqCst);
         self.inner.stop_flag.store(false, Ordering::SeqCst);
         clear_member_cache(&self.inner);
+        if let Ok(mut guard) = self.inner.active_local_ip.lock() {
+            *guard = None;
+        }
         if let Ok(mut guard) = self.inner.last_error.lock() {
             *guard = None;
         }
@@ -312,11 +336,16 @@ impl PresenceService {
             device_id,
             device_name: local_device_name(),
             shared_code: settings.sync.shared_code.trim().to_string(),
+            local_ip: settings.sync.local_ip.trim().to_string(),
             listen_port: settings.sync.listen_port,
         };
         let signature = format!(
-            "{}:{}:{}:{}",
-            config.device_id, config.device_name, config.shared_code, config.listen_port
+            "{}:{}:{}:{}:{}",
+            config.device_id,
+            config.device_name,
+            config.shared_code,
+            config.local_ip,
+            config.listen_port
         );
 
         if self
@@ -389,6 +418,16 @@ impl ClipboardHandler for ClipboardWatchHandler {
             return CallbackResult::Next;
         }
 
+        push_log(
+            &self.runtime,
+            "INFO",
+            &format!(
+                "detected local clipboard kind={} size_bytes={} item={}",
+                item.payload.kind(),
+                item.size_bytes,
+                item.id
+            ),
+        );
         register_recent_event(&self.runtime, &item.id);
         update_latest_item(&self.runtime, &item);
         enqueue_outbound_item(&self.runtime, item);
@@ -525,7 +564,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
         process_outbound_queue(&runtime, &settings);
         prune_recent_event_ids(&runtime);
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     if let Some(handle) = watcher {
@@ -551,7 +590,7 @@ fn send_udp_announcement(
     let Ok(bytes) = serde_json::to_vec(&announcement) else {
         return;
     };
-    for target in udp_broadcast_targets() {
+    for target in udp_broadcast_targets(&settings.sync.local_ip) {
         let _ = socket.send_to(&bytes, target);
     }
 }
@@ -645,16 +684,13 @@ fn handle_incoming(
     stream: TcpStream,
     device_id: &str,
 ) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let remote_addr = reader
-        .get_ref()
-        .peer_addr()
-        .ok()
-        .map(|addr| addr.to_string());
-    let mut line = String::new();
-    while reader.read_line(&mut line)? > 0 {
-        let frame = serde_json::from_str::<WireMessage>(line.trim())?;
-        line.clear();
+    let remote_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
+    if let Ok(local_addr) = stream.local_addr() {
+        remember_active_local_ip(runtime, local_addr.ip());
+    }
+    let mut stream = stream;
+    while let Some(frame_bytes) = read_wire_frame(&mut stream)? {
+        let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
         let item = decode_wire_message(&frame, settings)?;
 
         if item.source_device_id == device_id {
@@ -667,17 +703,44 @@ fn handle_incoming(
         if should_skip_remote_item(runtime, &item) {
             continue;
         }
+        push_log(
+            runtime,
+            "INFO",
+            &format!(
+                "received item {} kind={} size_bytes={} from {}",
+                item.id,
+                item.payload.kind(),
+                item.size_bytes,
+                item.source_device_id
+            ),
+        );
         enqueue_inbound_item(runtime, item);
     }
     Ok(())
 }
 
+fn read_wire_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut len_bytes = [0u8; 4];
+    match stream.read_exact(&mut len_bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+
+    let frame_len = u32::from_be_bytes(len_bytes) as usize;
+    if frame_len == 0 || frame_len > MAX_WIRE_FRAME_BYTES {
+        return Err(anyhow::anyhow!("invalid wire frame length: {frame_len}"));
+    }
+
+    let mut frame = vec![0u8; frame_len];
+    stream.read_exact(&mut frame)?;
+    Ok(Some(frame))
+}
+
 fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) -> usize {
     let payload = match encode_wire_message(item, settings) {
-        Ok(mut payload) => {
-            payload.push('\n');
-            payload
-        }
+        Ok(payload) => payload,
         Err(error) => {
             set_error(runtime, format!("encode payload failed: {error}"));
             return 0;
@@ -710,8 +773,11 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
                 continue;
             }
         };
+        if let Ok(local_addr) = stream.local_addr() {
+            remember_active_local_ip(runtime, local_addr.ip());
+        }
         let _ = stream.set_write_timeout(Some(write_timeout));
-        if stream.write_all(payload.as_bytes()).is_ok() {
+        if stream.write_all(&payload).is_ok() {
             mark_known_member(runtime, "addr", &peer);
             delivered += 1;
         } else {
@@ -749,8 +815,10 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
                 runtime,
                 "INFO",
                 &format!(
-                    "applied item {} from {} after {} attempt(s)",
+                    "applied item {} kind={} size_bytes={} from {} after {} attempt(s)",
                     entry.item.id,
+                    entry.item.payload.kind(),
+                    entry.item.size_bytes,
                     entry.item.source_device_id,
                     entry.attempts + 1
                 ),
@@ -1069,9 +1137,8 @@ fn normalize_peer(peer: &str, fallback_port: u16) -> String {
 pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<ClipboardItem> {
     let payload_bytes = match payload {
         ClipboardPayload::Text { text } => text.as_bytes().to_vec(),
-        ClipboardPayload::ImagePng { png_base64 } => base64::engine::general_purpose::STANDARD
-            .decode(png_base64.as_bytes())
-            .ok()?,
+        ClipboardPayload::ImagePng { png_bytes } => png_bytes.clone(),
+        ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.clone(),
         ClipboardPayload::Html { html } => html.as_bytes().to_vec(),
         ClipboardPayload::Rtf { rtf } => rtf.as_bytes().to_vec(),
     };
@@ -1094,39 +1161,49 @@ pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<Clipboa
     })
 }
 
-fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Result<String> {
-    let plain = serde_json::to_vec(item)?;
-    if settings.security.encryption_enabled {
+fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Result<Vec<u8>> {
+    let plain = bincode::serialize(item)?;
+    let frame = if settings.security.encryption_enabled {
         let secret = effective_secret(settings);
-        let (nonce_base64, body_base64) = encrypt_bytes(&plain, &derive_key(&secret))?;
-        let frame = WireMessage {
-            v: 1,
+        let (nonce, body) = encrypt_bytes(&plain, &derive_key(&secret))?;
+        WireMessage {
+            v: WIRE_VERSION,
             encrypted: true,
             source_device_id: item.source_device_id.clone(),
-            nonce_base64: Some(nonce_base64),
-            body_base64,
-        };
-        return Ok(serde_json::to_string(&frame)?);
-    }
-
-    let frame = WireMessage {
-        v: 1,
-        encrypted: false,
-        source_device_id: item.source_device_id.clone(),
-        nonce_base64: None,
-        body_base64: base64::engine::general_purpose::STANDARD.encode(plain),
+            nonce: Some(nonce),
+            body,
+        }
+    } else {
+        WireMessage {
+            v: WIRE_VERSION,
+            encrypted: false,
+            source_device_id: item.source_device_id.clone(),
+            nonce: None,
+            body: plain,
+        }
     };
-    Ok(serde_json::to_string(&frame)?)
+
+    let frame_bytes = bincode::serialize(&frame)?;
+    if frame_bytes.len() > u32::MAX as usize {
+        return Err(anyhow::anyhow!("wire frame too large"));
+    }
+    let mut payload = Vec::with_capacity(4 + frame_bytes.len());
+    payload.extend_from_slice(&(frame_bytes.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&frame_bytes);
+    Ok(payload)
 }
 
 fn decode_wire_message(frame: &WireMessage, settings: &Settings) -> anyhow::Result<ClipboardItem> {
+    if frame.v != WIRE_VERSION {
+        return Err(anyhow::anyhow!("unsupported wire version: {}", frame.v));
+    }
+
     let bytes = if frame.encrypted {
         decrypt_bytes(
-            &frame.body_base64,
             frame
-                .nonce_base64
-                .as_ref()
+                .nonce
                 .ok_or_else(|| anyhow::anyhow!("missing nonce"))?,
+            &frame.body,
             &derive_key(&effective_secret(settings)),
         )?
     } else {
@@ -1135,10 +1212,10 @@ fn decode_wire_message(frame: &WireMessage, settings: &Settings) -> anyhow::Resu
                 "received plain frame but encryption enabled"
             ));
         }
-        base64::engine::general_purpose::STANDARD.decode(frame.body_base64.as_bytes())?
+        frame.body.clone()
     };
 
-    Ok(serde_json::from_slice::<ClipboardItem>(&bytes)?)
+    Ok(bincode::deserialize::<ClipboardItem>(&bytes)?)
 }
 
 fn effective_secret(settings: &Settings) -> String {
@@ -1158,7 +1235,7 @@ fn derive_key(secret: &str) -> [u8; 32] {
     key
 }
 
-fn encrypt_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<(String, String)> {
+fn encrypt_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<([u8; 12], Vec<u8>)> {
     let cipher = Aes256GcmSiv::new_from_slice(key)?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -1166,22 +1243,14 @@ fn encrypt_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<(String, String
     let encrypted = cipher
         .encrypt(nonce, plain)
         .map_err(|_| anyhow::anyhow!("encrypt failed"))?;
-    Ok((
-        base64::engine::general_purpose::STANDARD.encode(nonce_bytes),
-        base64::engine::general_purpose::STANDARD.encode(encrypted),
-    ))
+    Ok((nonce_bytes, encrypted))
 }
 
-fn decrypt_bytes(body_base64: &str, nonce_base64: &str, key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+fn decrypt_bytes(nonce_bytes: [u8; 12], body: &[u8], key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     let cipher = Aes256GcmSiv::new_from_slice(key)?;
-    let nonce_bytes = base64::engine::general_purpose::STANDARD.decode(nonce_base64.as_bytes())?;
-    if nonce_bytes.len() != 12 {
-        return Err(anyhow::anyhow!("invalid nonce length"));
-    }
-    let body = base64::engine::general_purpose::STANDARD.decode(body_base64.as_bytes())?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plain = cipher
-        .decrypt(nonce, body.as_ref())
+        .decrypt(nonce, body)
         .map_err(|_| anyhow::anyhow!("decrypt failed (shared code or pairing code mismatch?)"))?;
     Ok(plain)
 }
@@ -1295,18 +1364,26 @@ fn should_skip_remote_item(runtime: &RuntimeInner, item: &ClipboardItem) -> bool
 
 fn enqueue_outbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
     let item_id = item.id.clone();
+    let kind = item.payload.kind();
+    let size_bytes = item.size_bytes;
     push_queue_entry(&runtime.outbound_queue, new_queue_entry(item));
-    push_log(runtime, "DEBUG", &format!("queued outbound item {item_id}"));
+    push_log(
+        runtime,
+        "DEBUG",
+        &format!("queued outbound item {item_id} kind={kind} size_bytes={size_bytes}"),
+    );
 }
 
 fn enqueue_inbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
     let item_id = item.id.clone();
     let source = item.source_device_id.clone();
+    let kind = item.payload.kind();
+    let size_bytes = item.size_bytes;
     push_queue_entry(&runtime.inbound_queue, new_queue_entry(item));
     push_log(
         runtime,
         "DEBUG",
-        &format!("queued inbound item {item_id} from {source}"),
+        &format!("queued inbound item {item_id} kind={kind} size_bytes={size_bytes} from {source}"),
     );
 }
 
@@ -1318,6 +1395,7 @@ fn set_error(runtime: &RuntimeInner, message: String) {
 }
 
 fn push_log(runtime: &RuntimeInner, level: &str, message: &str) {
+    append_runtime_log_file(level, message);
     if let Ok(mut guard) = runtime.logs.lock() {
         guard.push(RuntimeLog {
             ts_ms: now_ms(),
@@ -1331,8 +1409,32 @@ fn push_log(runtime: &RuntimeInner, level: &str, message: &str) {
     }
 }
 
+fn append_runtime_log_file(level: &str, message: &str) {
+    let dir = std::env::temp_dir().join("lan-clipboard");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("runtime.log");
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let _ = writeln!(
+        file,
+        "{} [{}] [pid={}] {}",
+        now_ms(),
+        level,
+        std::process::id(),
+        message
+    );
+}
+
 fn build_service_info(config: &PresenceConfig) -> anyhow::Result<ServiceInfo> {
-    let local_ip = pick_local_ip()?;
+    let local_ip = resolve_local_ip_override(&config.local_ip)?.unwrap_or(pick_local_ip()?);
     let host_name = format!("lan-clipboard-{}.local.", config.device_id);
     let properties = [
         ("device_id", config.device_id.as_str()),
@@ -1392,6 +1494,45 @@ pub fn discover_devices(
     Ok(devices)
 }
 
+pub fn list_network_interfaces() -> Vec<NetworkInterfaceOption> {
+    let Ok(all) = local_ip_address::list_afinet_netifas() else {
+        return Vec::new();
+    };
+
+    let mut interfaces: Vec<NetworkInterfaceOption> = all
+        .into_iter()
+        .filter_map(|(name, ip)| {
+            let IpAddr::V4(ipv4) = ip else {
+                return None;
+            };
+            if !is_usable_ipv4(ipv4) {
+                return None;
+            }
+            let label = if is_private_lan_ipv4(ipv4) {
+                format!("{name} ({ipv4})")
+            } else {
+                format!("{name} ({ipv4}, 非局域网优先)")
+            };
+            Some(NetworkInterfaceOption {
+                name,
+                ip: ipv4.to_string(),
+                label,
+            })
+        })
+        .collect();
+
+    interfaces.sort_by(|left, right| {
+        let left_ip: std::net::Ipv4Addr = left.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        let right_ip: std::net::Ipv4Addr = right.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+        is_private_lan_ipv4(right_ip)
+            .cmp(&is_private_lan_ipv4(left_ip))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.ip.cmp(&right.ip))
+    });
+    interfaces.dedup_by(|left, right| left.ip == right.ip);
+    interfaces
+}
+
 fn shutdown_discovery_daemon(mdns: &ServiceDaemon, receiver: mdns_sd::Receiver<ServiceEvent>) {
     let _ = mdns.stop_browse(SERVICE_TYPE);
     while let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
@@ -1438,36 +1579,125 @@ fn info_to_device(
 }
 
 fn pick_ipv4(addresses: &HashSet<IpAddr>) -> Option<String> {
-    for address in addresses {
-        if let IpAddr::V4(ipv4) = address {
-            if !ipv4.is_loopback() {
-                return Some(ipv4.to_string());
-            }
-        }
-    }
-    None
+    pick_best_ipv4(addresses.iter().filter_map(|address| match address {
+        IpAddr::V4(ipv4) => Some(*ipv4),
+        IpAddr::V6(_) => None,
+    }))
+    .map(|ip| ip.to_string())
 }
 
 fn pick_local_ip() -> anyhow::Result<IpAddr> {
     let all = local_ip_address::list_afinet_netifas()?;
-    for (_, ip) in all {
-        if let IpAddr::V4(v4) = ip {
-            if !v4.is_loopback() && !v4.is_link_local() {
-                return Ok(IpAddr::V4(v4));
-            }
-        }
-    }
-    Err(anyhow::anyhow!("no usable local ipv4 address found"))
+    let candidates = all.into_iter().filter_map(|(_, ip)| match ip {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(_) => None,
+    });
+    pick_best_ipv4(candidates)
+        .map(IpAddr::V4)
+        .ok_or_else(|| anyhow::anyhow!("no usable local ipv4 address found"))
 }
 
-fn udp_broadcast_targets() -> Vec<SocketAddr> {
+fn selected_or_active_local_ip(settings: &Settings, active_local_ip: Option<String>) -> Option<String> {
+    resolve_local_ip_override(&settings.sync.local_ip)
+        .ok()
+        .flatten()
+        .map(|ip| ip.to_string())
+        .or(active_local_ip)
+        .or_else(|| pick_local_ip().ok().map(|ip| ip.to_string()))
+}
+
+fn resolve_local_ip_override(value: &str) -> anyhow::Result<Option<IpAddr>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed: IpAddr = trimmed
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid selected local ip: {trimmed}"))?;
+    match parsed {
+        IpAddr::V4(ipv4) if is_usable_ipv4(ipv4) => Ok(Some(IpAddr::V4(ipv4))),
+        IpAddr::V4(_) => Err(anyhow::anyhow!("selected local ip is not usable: {trimmed}")),
+        IpAddr::V6(_) => Err(anyhow::anyhow!("selected local ip must be ipv4: {trimmed}")),
+    }
+}
+
+fn pick_best_ipv4<I>(candidates: I) -> Option<std::net::Ipv4Addr>
+where
+    I: IntoIterator<Item = std::net::Ipv4Addr>,
+{
+    let mut preferred = None;
+    let mut fallback = None;
+
+    for ipv4 in candidates {
+        if !is_usable_ipv4(ipv4) {
+            continue;
+        }
+        if preferred.is_none() && is_private_lan_ipv4(ipv4) {
+            preferred = Some(ipv4);
+        } else if fallback.is_none() {
+            fallback = Some(ipv4);
+        }
+    }
+
+    preferred.or(fallback)
+}
+
+fn remember_active_local_ip(runtime: &RuntimeInner, ip: IpAddr) {
+    let IpAddr::V4(ipv4) = ip else {
+        return;
+    };
+    if !is_usable_ipv4(ipv4) {
+        return;
+    }
+    if let Ok(mut guard) = runtime.active_local_ip.lock() {
+        let should_replace = match guard.as_deref().and_then(|value| value.parse().ok()) {
+            Some(existing) => !is_private_lan_ipv4(existing) && is_private_lan_ipv4(ipv4),
+            None => true,
+        };
+        if should_replace {
+            *guard = Some(ipv4.to_string());
+        }
+    }
+}
+
+fn is_usable_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
+    !ipv4.is_loopback()
+        && !ipv4.is_link_local()
+        && !ipv4.is_unspecified()
+        && !ipv4.is_broadcast()
+        && !is_benchmark_ipv4(ipv4)
+        && !is_multicast_ipv4(ipv4)
+}
+
+fn is_private_lan_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = ipv4.octets();
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
+fn is_benchmark_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = ipv4.octets();
+    a == 198 && (b == 18 || b == 19)
+}
+
+fn is_multicast_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
+    let [a, _, _, _] = ipv4.octets();
+    (224..=239).contains(&a)
+}
+
+fn udp_broadcast_targets(selected_local_ip: &str) -> Vec<SocketAddr> {
     let mut targets = HashSet::new();
     targets.insert(SocketAddr::from(([255, 255, 255, 255], UDP_DISCOVERY_PORT)));
+
+    if let Ok(Some(IpAddr::V4(ipv4))) = resolve_local_ip_override(selected_local_ip) {
+        let [a, b, c, _] = ipv4.octets();
+        targets.insert(SocketAddr::from(([a, b, c, 255], UDP_DISCOVERY_PORT)));
+        return targets.into_iter().collect();
+    }
 
     if let Ok(all) = local_ip_address::list_afinet_netifas() {
         for (_, ip) in all {
             if let IpAddr::V4(ipv4) = ip {
-                if ipv4.is_loopback() || ipv4.is_link_local() {
+                if !is_usable_ipv4(ipv4) {
                     continue;
                 }
                 let [a, b, c, _] = ipv4.octets();

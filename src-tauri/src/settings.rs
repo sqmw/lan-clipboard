@@ -33,6 +33,7 @@ pub struct SyncConfig {
     #[serde(alias = "device_code")]
     pub shared_code: String,
     pub enabled: bool,
+    pub local_ip: String,
     pub listen_port: u16,
     pub peers: Vec<String>,
     pub poll_interval_ms: u64,
@@ -44,6 +45,7 @@ impl Default for SyncConfig {
             device_id: crate::net::new_device_id(),
             shared_code: generate_shared_code(),
             enabled: true,
+            local_ip: String::new(),
             listen_port: 32910,
             peers: Vec::new(),
             poll_interval_ms: 900,

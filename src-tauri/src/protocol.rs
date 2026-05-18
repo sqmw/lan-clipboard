@@ -1,12 +1,35 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
 pub enum ClipboardPayload {
-    Text { text: String },
-    ImagePng { png_base64: String },
-    Html { html: String },
-    Rtf { rtf: String },
+    Text {
+        text: String,
+    },
+    ImagePng {
+        png_bytes: Vec<u8>,
+    },
+    FileBundle {
+        archive_bytes: Vec<u8>,
+        top_level_names: Vec<String>,
+    },
+    Html {
+        html: String,
+    },
+    Rtf {
+        rtf: String,
+    },
+}
+
+impl ClipboardPayload {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ClipboardPayload::Text { .. } => "text",
+            ClipboardPayload::ImagePng { .. } => "image_png",
+            ClipboardPayload::FileBundle { .. } => "file_bundle",
+            ClipboardPayload::Html { .. } => "html",
+            ClipboardPayload::Rtf { .. } => "rtf",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,6 +5,8 @@ mod protocol;
 mod settings;
 mod state;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -12,6 +14,13 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .manage(state::AppState::default())
         .invoke_handler(tauri::generate_handler![
@@ -25,6 +34,7 @@ pub fn run() {
             commands::list_devices,
             commands::discover_devices,
             commands::cached_devices,
+            commands::list_network_interfaces,
             commands::get_runtime_logs,
             commands::clear_runtime_logs,
         ])
