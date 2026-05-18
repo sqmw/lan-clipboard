@@ -23,11 +23,14 @@ const DISCOVERY_REFRESH_MS: u64 = 1_000;
 const DISCOVERY_TIMEOUT_MS: u64 = 900;
 const STATUS_DISCOVERY_TIMEOUT_MS: u64 = 350;
 const APPLY_MUTE_MS: u64 = 1_200;
+const APPLY_RICH_TEXT_MUTE_MS: u64 = 2_500;
+const APPLY_FILE_MUTE_MS: u64 = 5_000;
 const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
 const UDP_DISCOVERY_PORT: u16 = 32911;
 const UDP_ANNOUNCE_MS: u64 = 500;
 const DISCOVERY_APP: &str = "lan-clipboard";
 const LOCAL_EVENT_DEBOUNCE_MS: u64 = 250;
+const APPLIED_HASH_TTL_MS: u64 = 10_000;
 const RECENT_EVENT_TTL_MS: u64 = 120_000;
 const QUEUE_RETRY_BASE_MS: u64 = 30;
 const QUEUE_RETRY_MAX_MS: u64 = 500;
@@ -150,6 +153,7 @@ struct RuntimeInner {
     inbound_queue: Mutex<VecDeque<QueueEntry>>,
     latest_item: Mutex<Option<ItemMarker>>,
     last_local_observed: Mutex<Option<ObservedClipboard>>,
+    ignored_local_hashes: Mutex<HashMap<String, Instant>>,
     recent_event_ids: Mutex<HashMap<String, Instant>>,
     logs: Mutex<Vec<RuntimeLog>>,
     transfers: Mutex<Vec<TransferProgress>>,
@@ -171,6 +175,7 @@ impl Default for RuntimeInner {
             inbound_queue: Mutex::new(VecDeque::new()),
             latest_item: Mutex::new(None),
             last_local_observed: Mutex::new(None),
+            ignored_local_hashes: Mutex::new(HashMap::new()),
             recent_event_ids: Mutex::new(HashMap::new()),
             logs: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
@@ -623,6 +628,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
         process_inbound_queue(&runtime, &settings);
         process_outbound_queue(&runtime, &settings);
+        prune_ignored_local_hashes(&runtime);
         prune_recent_event_ids(&runtime);
 
         std::thread::sleep(Duration::from_millis(10));
@@ -1263,7 +1269,8 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
             break;
         };
 
-        set_clipboard_suppressed(runtime, APPLY_MUTE_MS);
+        register_ignored_local_hash(runtime, &entry.item.content_hash);
+        set_clipboard_suppressed(runtime, apply_mute_duration_ms(&entry.item));
         let transfer_id = find_receive_transfer_id(runtime, &entry.item.id);
         if let Some(transfer_id) = transfer_id.as_deref() {
             update_transfer_metadata(
@@ -1579,6 +1586,9 @@ fn clear_member_cache(runtime: &RuntimeInner) {
     }
     if let Ok(mut guard) = runtime.last_local_observed.lock() {
         guard.take();
+    }
+    if let Ok(mut guard) = runtime.ignored_local_hashes.lock() {
+        guard.clear();
     }
     if let Ok(mut guard) = runtime.recent_event_ids.lock() {
         guard.clear();
@@ -1959,6 +1969,10 @@ fn set_clipboard_suppressed(runtime: &RuntimeInner, duration_ms: u64) {
 }
 
 fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -> bool {
+    if recent_applied_hash_seen(runtime, content_hash) {
+        return true;
+    }
+
     let observed_at_ms = now_ms();
     if let Ok(mut guard) = runtime.last_local_observed.lock() {
         if let Some(previous) = guard.as_ref() {
@@ -1974,6 +1988,38 @@ fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -
         });
     }
     false
+}
+
+fn register_ignored_local_hash(runtime: &RuntimeInner, content_hash: &str) {
+    if let Ok(mut guard) = runtime.ignored_local_hashes.lock() {
+        guard.insert(content_hash.to_string(), Instant::now());
+    }
+}
+
+fn recent_applied_hash_seen(runtime: &RuntimeInner, content_hash: &str) -> bool {
+    runtime
+        .ignored_local_hashes
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(content_hash).copied())
+        .map(|seen_at| seen_at.elapsed() < Duration::from_millis(APPLIED_HASH_TTL_MS))
+        .unwrap_or(false)
+}
+
+fn prune_ignored_local_hashes(runtime: &RuntimeInner) {
+    if let Ok(mut guard) = runtime.ignored_local_hashes.lock() {
+        guard.retain(|_, seen_at| seen_at.elapsed() < Duration::from_millis(APPLIED_HASH_TTL_MS));
+    }
+}
+
+fn apply_mute_duration_ms(item: &ClipboardItem) -> u64 {
+    match &item.payload {
+        ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => {
+            APPLY_FILE_MUTE_MS
+        }
+        ClipboardPayload::Html { .. } | ClipboardPayload::Rtf { .. } => APPLY_RICH_TEXT_MUTE_MS,
+        _ => APPLY_MUTE_MS,
+    }
 }
 
 fn recent_event_seen(runtime: &RuntimeInner, event_id: &str) -> bool {
