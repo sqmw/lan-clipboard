@@ -33,13 +33,16 @@ const QUEUE_RETRY_BASE_MS: u64 = 30;
 const QUEUE_RETRY_MAX_MS: u64 = 500;
 const QUEUE_MAX_RETRIES: u32 = 24;
 const QUEUE_MAX_AGE_MS: u64 = 30_000;
-const CONNECT_TIMEOUT_MS: u64 = 900;
-const MIN_WRITE_TIMEOUT_MS: u64 = 1_500;
-const MAX_WRITE_TIMEOUT_MS: u64 = 30_000;
-const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 4 * 1024;
+const CONNECT_TIMEOUT_MS: u64 = 2_000;
+const MIN_WRITE_TIMEOUT_MS: u64 = 8_000;
+const MAX_WRITE_TIMEOUT_MS: u64 = 120_000;
+const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 512;
 const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 50;
 const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
+const TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
+const TRANSFER_HISTORY_LIMIT: usize = 24;
+const TRANSFER_RETENTION_MS: u64 = 15_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
@@ -51,6 +54,23 @@ pub struct RuntimeStatus {
     pub last_error: Option<String>,
     pub recent_log_count: usize,
     pub peer_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferProgress {
+    pub id: String,
+    pub direction: String,
+    pub peer: String,
+    pub item_kind: String,
+    pub item_label: String,
+    pub item_summary: String,
+    pub item_id: String,
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u8,
+    pub status: String,
+    pub updated_at_ms: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +128,7 @@ struct RuntimeInner {
     last_local_observed: Mutex<Option<ObservedClipboard>>,
     recent_event_ids: Mutex<HashMap<String, Instant>>,
     logs: Mutex<Vec<RuntimeLog>>,
+    transfers: Mutex<Vec<TransferProgress>>,
     discovered_devices: Mutex<Vec<DiscoveredDevice>>,
     discovered_seen_at: Mutex<HashMap<String, Instant>>,
     known_members: Mutex<HashSet<String>>,
@@ -128,6 +149,7 @@ impl Default for RuntimeInner {
             last_local_observed: Mutex::new(None),
             recent_event_ids: Mutex::new(HashMap::new()),
             logs: Mutex::new(Vec::new()),
+            transfers: Mutex::new(Vec::new()),
             discovered_devices: Mutex::new(Vec::new()),
             discovered_seen_at: Mutex::new(HashMap::new()),
             known_members: Mutex::new(HashSet::new()),
@@ -256,6 +278,15 @@ impl SyncEngine {
         if let Ok(mut guard) = self.inner.logs.lock() {
             guard.clear();
         }
+    }
+
+    pub fn transfers(&self) -> Vec<TransferProgress> {
+        prune_transfers(&self.inner);
+        self.inner
+            .transfers
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     pub fn devices(&self) -> Vec<DiscoveredDevice> {
@@ -552,6 +583,8 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
         match listener.accept() {
             Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(write_timeout_for_payload(MAX_WIRE_FRAME_BYTES as u64)));
                 if let Err(error) = handle_incoming(&runtime, &settings, stream, &device_id) {
                     set_error(&runtime, format!("incoming handler failed: {error}"));
                 }
@@ -689,9 +722,29 @@ fn handle_incoming(
         remember_active_local_ip(runtime, local_addr.ip());
     }
     let mut stream = stream;
-    while let Some(frame_bytes) = read_wire_frame(&mut stream)? {
+    while let Some((transfer_id, frame_bytes)) = read_wire_frame(
+        runtime,
+        &mut stream,
+        remote_addr.as_deref().unwrap_or("未知来源"),
+    )? {
         let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
         let item = decode_wire_message(&frame, settings)?;
+        let canonical_transfer_id = canonical_receive_transfer_id(&item);
+        adopt_receive_transfer(
+            runtime,
+            &transfer_id,
+            &canonical_transfer_id,
+            remote_addr.as_deref().unwrap_or("未知来源"),
+        );
+        update_transfer_metadata(
+            runtime,
+            &canonical_transfer_id,
+            item.payload.kind(),
+            &payload_label(&item.payload),
+            &payload_summary(&item.payload),
+            &item.id,
+            "received",
+        );
 
         if item.source_device_id == device_id {
             continue;
@@ -714,12 +767,21 @@ fn handle_incoming(
                 item.source_device_id
             ),
         );
-        enqueue_inbound_item(runtime, item);
+        enqueue_inbound_item(
+            runtime,
+            item,
+            &canonical_transfer_id,
+            remote_addr.as_deref().unwrap_or("未知来源"),
+        );
     }
     Ok(())
 }
 
-fn read_wire_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
+fn read_wire_frame(
+    runtime: &RuntimeInner,
+    stream: &mut TcpStream,
+    peer: &str,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
     let mut len_bytes = [0u8; 4];
     match stream.read_exact(&mut len_bytes) {
         Ok(()) => {}
@@ -733,9 +795,30 @@ fn read_wire_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
         return Err(anyhow::anyhow!("invalid wire frame length: {frame_len}"));
     }
 
+    let transfer_id = format!("recv:{}:{}", peer, now_ms());
+    let total_bytes = frame_len as u64 + 4;
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "receive".to_string(),
+            peer: peer.to_string(),
+            item_kind: "识别中".to_string(),
+            item_label: "识别中".to_string(),
+            item_summary: "正在解析内容".to_string(),
+            item_id: String::new(),
+            transferred_bytes: 4,
+            total_bytes,
+            percent: percent_for(4, total_bytes),
+            status: "receiving".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
+
     let mut frame = vec![0u8; frame_len];
-    stream.read_exact(&mut frame)?;
-    Ok(Some(frame))
+    read_exact_with_progress(runtime, stream, &mut frame, &transfer_id, total_bytes, 4)?;
+    Ok(Some((transfer_id, frame)))
 }
 
 fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) -> usize {
@@ -777,10 +860,31 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
             remember_active_local_ip(runtime, local_addr.ip());
         }
         let _ = stream.set_write_timeout(Some(write_timeout));
-        if stream.write_all(&payload).is_ok() {
+        let transfer_id = format!("send:{}:{}", peer, item.id);
+        upsert_transfer(
+            runtime,
+            TransferProgress {
+                id: transfer_id.clone(),
+                direction: "send".to_string(),
+                peer: peer.clone(),
+                item_kind: item.payload.kind().to_string(),
+                item_label: payload_label(&item.payload),
+                item_summary: payload_summary(&item.payload),
+                item_id: item.id.clone(),
+                transferred_bytes: 0,
+                total_bytes: payload.len() as u64,
+                percent: 0,
+                status: "sending".to_string(),
+                updated_at_ms: now_ms(),
+                error: None,
+            },
+        );
+        if write_all_with_progress(runtime, &mut stream, &payload, &transfer_id).is_ok() {
+            mark_transfer_completed(runtime, &transfer_id);
             mark_known_member(runtime, "addr", &peer);
             delivered += 1;
         } else {
+            mark_transfer_failed(runtime, &transfer_id, "发送失败".to_string());
             push_log(
                 runtime,
                 "DEBUG",
@@ -803,6 +907,48 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
     delivered
 }
 
+fn read_exact_with_progress(
+    runtime: &RuntimeInner,
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    transfer_id: &str,
+    total_bytes: u64,
+    initial_bytes: u64,
+) -> anyhow::Result<()> {
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        let end = (offset + TRANSFER_CHUNK_BYTES).min(buffer.len());
+        if let Err(error) = stream.read_exact(&mut buffer[offset..end]) {
+            mark_transfer_failed(runtime, transfer_id, error.to_string());
+            return Err(error.into());
+        }
+        offset = end;
+        let transferred_bytes = initial_bytes + offset as u64;
+        update_transfer_progress(runtime, transfer_id, transferred_bytes, total_bytes);
+    }
+    Ok(())
+}
+
+fn write_all_with_progress(
+    runtime: &RuntimeInner,
+    stream: &mut TcpStream,
+    buffer: &[u8],
+    transfer_id: &str,
+) -> anyhow::Result<()> {
+    let total_bytes = buffer.len() as u64;
+    let mut offset = 0usize;
+    while offset < buffer.len() {
+        let end = (offset + TRANSFER_CHUNK_BYTES).min(buffer.len());
+        if let Err(error) = stream.write_all(&buffer[offset..end]) {
+            mark_transfer_failed(runtime, transfer_id, error.to_string());
+            return Err(error.into());
+        }
+        offset = end;
+        update_transfer_progress(runtime, transfer_id, offset as u64, total_bytes);
+    }
+    Ok(())
+}
+
 fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
     loop {
         let Some(mut entry) = pop_ready_queue_entry(&runtime.inbound_queue) else {
@@ -810,21 +956,46 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
         };
 
         set_clipboard_suppressed(runtime, APPLY_MUTE_MS);
-        match clipboard::write_item(&entry.item, &settings.limits) {
-            Ok(()) => push_log(
+        let transfer_id = find_receive_transfer_id(runtime, &entry.item.id);
+        if let Some(transfer_id) = transfer_id.as_deref() {
+            update_transfer_metadata(
                 runtime,
-                "INFO",
-                &format!(
-                    "applied item {} kind={} size_bytes={} from {} after {} attempt(s)",
-                    entry.item.id,
-                    entry.item.payload.kind(),
-                    entry.item.size_bytes,
-                    entry.item.source_device_id,
-                    entry.attempts + 1
-                ),
-            ),
+                transfer_id,
+                entry.item.payload.kind(),
+                &payload_label(&entry.item.payload),
+                &payload_summary(&entry.item.payload),
+                &entry.item.id,
+                "applying",
+            );
+        }
+        match clipboard::write_item(&entry.item, &settings.limits) {
+            Ok(()) => {
+                if let Some(transfer_id) = transfer_id.as_deref() {
+                    mark_transfer_completed(runtime, transfer_id);
+                }
+                push_log(
+                    runtime,
+                    "INFO",
+                    &format!(
+                        "applied item {} kind={} size_bytes={} from {} after {} attempt(s)",
+                        entry.item.id,
+                        entry.item.payload.kind(),
+                        entry.item.size_bytes,
+                        entry.item.source_device_id,
+                        entry.attempts + 1
+                    ),
+                )
+            }
             Err(crate::clipboard::ClipboardError::Backend(error)) => {
                 if schedule_retry(&mut entry) {
+                    if let Some(transfer_id) = transfer_id.as_deref() {
+                        update_transfer_status(
+                            runtime,
+                            transfer_id,
+                            "retrying",
+                            Some(error.clone()),
+                        );
+                    }
                     push_log(
                         runtime,
                         "WARN",
@@ -835,6 +1006,9 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
                     );
                     push_queue_entry(&runtime.inbound_queue, entry);
                 } else {
+                    if let Some(transfer_id) = transfer_id.as_deref() {
+                        mark_transfer_failed(runtime, transfer_id, error.clone());
+                    }
                     set_error(
                         runtime,
                         format!(
@@ -844,13 +1018,18 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
                     );
                 }
             }
-            Err(error) => set_error(
-                runtime,
-                format!(
-                    "apply clipboard item failed permanently: item={} error={error}",
-                    entry.item.id
-                ),
-            ),
+            Err(error) => {
+                if let Some(transfer_id) = transfer_id.as_deref() {
+                    mark_transfer_failed(runtime, transfer_id, error.to_string());
+                }
+                set_error(
+                    runtime,
+                    format!(
+                        "apply clipboard item failed permanently: item={} error={error}",
+                        entry.item.id
+                    ),
+                )
+            }
         }
     }
 }
@@ -1193,6 +1372,88 @@ fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Res
     Ok(payload)
 }
 
+fn payload_summary(payload: &ClipboardPayload) -> String {
+    match payload {
+        ClipboardPayload::Text { text } => {
+            let snippet = compact_snippet(text, 88);
+            if snippet.is_empty() {
+                "直接复制文字".to_string()
+            } else {
+                snippet
+            }
+        }
+        ClipboardPayload::ImagePng { .. } => "图片 PNG".to_string(),
+        ClipboardPayload::FileBundle { top_level_names, .. } => {
+            if top_level_names.is_empty() {
+                "文件".to_string()
+            } else if top_level_names.len() == 1 {
+                format!("{}：{}", payload_label(payload), top_level_names[0])
+            } else {
+                format!(
+                    "{}：{} +{}",
+                    payload_label(payload),
+                    top_level_names[0],
+                    top_level_names.len() - 1
+                )
+            }
+        }
+        ClipboardPayload::Html { html } => {
+            let snippet = compact_snippet(html, 48);
+            if snippet.is_empty() {
+                "HTML".to_string()
+            } else {
+                format!("HTML：{snippet}")
+            }
+        }
+        ClipboardPayload::Rtf { rtf } => {
+            let snippet = compact_snippet(rtf, 32);
+            if snippet.is_empty() {
+                "RTF".to_string()
+            } else {
+                format!("RTF：{snippet}")
+            }
+        }
+    }
+}
+
+fn payload_label(payload: &ClipboardPayload) -> String {
+    match payload {
+        ClipboardPayload::Text { .. } => "直接复制文字".to_string(),
+        ClipboardPayload::ImagePng { .. } => "图片".to_string(),
+        ClipboardPayload::FileBundle { top_level_names, .. } => {
+            if top_level_names.iter().all(|name| looks_like_text_file(name)) {
+                "文本文件".to_string()
+            } else {
+                "文件".to_string()
+            }
+        }
+        ClipboardPayload::Html { .. } => "HTML 富文本".to_string(),
+        ClipboardPayload::Rtf { .. } => "RTF 富文本".to_string(),
+    }
+}
+
+fn looks_like_text_file(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    [
+        ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv", ".log",
+        ".xml", ".html", ".css", ".js", ".ts", ".tsx", ".jsx", ".rs", ".py", ".java", ".c",
+        ".cpp", ".h", ".hpp", ".go", ".sh",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+fn compact_snippet(value: &str, limit: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let snippet: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
 fn decode_wire_message(frame: &WireMessage, settings: &Settings) -> anyhow::Result<ClipboardItem> {
     if frame.v != WIRE_VERSION {
         return Err(anyhow::anyhow!("unsupported wire version: {}", frame.v));
@@ -1374,11 +1635,31 @@ fn enqueue_outbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
     );
 }
 
-fn enqueue_inbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
+fn enqueue_inbound_item(
+    runtime: &RuntimeInner,
+    item: ClipboardItem,
+    transfer_id: &str,
+    peer: &str,
+) {
     let item_id = item.id.clone();
     let source = item.source_device_id.clone();
     let kind = item.payload.kind();
     let size_bytes = item.size_bytes;
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.peer = peer.to_string();
+            entry.item_kind = kind.to_string();
+            entry.item_label = payload_label(&item.payload);
+            entry.item_summary = payload_summary(&item.payload);
+            entry.item_id = item_id.clone();
+            entry.transferred_bytes = size_bytes;
+            entry.total_bytes = size_bytes;
+            entry.percent = 100;
+            entry.status = "queued".to_string();
+            entry.updated_at_ms = now_ms();
+            entry.error = None;
+        }
+    }
     push_queue_entry(&runtime.inbound_queue, new_queue_entry(item));
     push_log(
         runtime,
@@ -1407,6 +1688,163 @@ fn push_log(runtime: &RuntimeInner, level: &str, message: &str) {
             guard.drain(0..drain_size);
         }
     }
+}
+
+fn upsert_transfer(runtime: &RuntimeInner, transfer: TransferProgress) {
+    prune_transfers(runtime);
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(existing) = guard.iter_mut().find(|entry| entry.id == transfer.id) {
+            *existing = transfer;
+        } else {
+            guard.push(transfer);
+        }
+        guard.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        if guard.len() > TRANSFER_HISTORY_LIMIT {
+            guard.truncate(TRANSFER_HISTORY_LIMIT);
+        }
+    }
+}
+
+fn update_transfer_progress(
+    runtime: &RuntimeInner,
+    transfer_id: &str,
+    transferred_bytes: u64,
+    total_bytes: u64,
+) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.transferred_bytes = transferred_bytes.min(total_bytes);
+            entry.total_bytes = total_bytes;
+            entry.percent = percent_for(entry.transferred_bytes, entry.total_bytes);
+            entry.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn update_transfer_metadata(
+    runtime: &RuntimeInner,
+    transfer_id: &str,
+    item_kind: &str,
+    item_label: &str,
+    item_summary: &str,
+    item_id: &str,
+    status: &str,
+) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.item_kind = item_kind.to_string();
+            entry.item_label = item_label.to_string();
+            entry.item_summary = item_summary.to_string();
+            entry.item_id = item_id.to_string();
+            entry.status = status.to_string();
+            entry.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn update_transfer_status(
+    runtime: &RuntimeInner,
+    transfer_id: &str,
+    status: &str,
+    error: Option<String>,
+) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.status = status.to_string();
+            entry.error = error;
+            entry.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn mark_transfer_completed(runtime: &RuntimeInner, transfer_id: &str) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.transferred_bytes = entry.total_bytes;
+            entry.percent = 100;
+            entry.status = "completed".to_string();
+            entry.error = None;
+            entry.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn mark_transfer_failed(runtime: &RuntimeInner, transfer_id: &str, error: String) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        if let Some(entry) = guard.iter_mut().find(|entry| entry.id == transfer_id) {
+            entry.status = "failed".to_string();
+            entry.error = Some(error);
+            entry.updated_at_ms = now_ms();
+        }
+    }
+}
+
+fn prune_transfers(runtime: &RuntimeInner) {
+    let threshold = now_ms().saturating_sub(TRANSFER_RETENTION_MS);
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        guard.retain(|entry| {
+            matches!(entry.status.as_str(), "sending" | "receiving" | "queued" | "applying" | "retrying")
+                || entry.updated_at_ms >= threshold
+        });
+    }
+}
+
+fn find_receive_transfer_id(runtime: &RuntimeInner, item_id: &str) -> Option<String> {
+    runtime.transfers.lock().ok().and_then(|guard| {
+        guard
+            .iter()
+            .find(|entry| entry.direction == "receive" && entry.item_id == item_id)
+            .map(|entry| entry.id.clone())
+    })
+}
+
+fn canonical_receive_transfer_id(item: &ClipboardItem) -> String {
+    format!("recv:{}:{}", item.source_device_id, item.id)
+}
+
+fn adopt_receive_transfer(
+    runtime: &RuntimeInner,
+    transient_id: &str,
+    canonical_id: &str,
+    peer: &str,
+) {
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        let transient_index = guard.iter().position(|entry| entry.id == transient_id);
+        let canonical_index = guard.iter().position(|entry| entry.id == canonical_id);
+
+        match (transient_index, canonical_index) {
+            (Some(transient_index), Some(canonical_index)) if transient_index != canonical_index => {
+                let transient = guard[transient_index].clone();
+                if let Some(existing) = guard.get_mut(canonical_index) {
+                    existing.peer = peer.to_string();
+                    existing.transferred_bytes =
+                        existing.transferred_bytes.max(transient.transferred_bytes);
+                    existing.total_bytes = existing.total_bytes.max(transient.total_bytes);
+                    existing.percent = existing.percent.max(transient.percent);
+                    existing.updated_at_ms = now_ms();
+                    if existing.item_summary.is_empty() {
+                        existing.item_summary = transient.item_summary;
+                    }
+                }
+                guard.remove(transient_index);
+            }
+            (Some(transient_index), None) => {
+                if let Some(entry) = guard.get_mut(transient_index) {
+                    entry.id = canonical_id.to_string();
+                    entry.peer = peer.to_string();
+                    entry.updated_at_ms = now_ms();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn percent_for(transferred_bytes: u64, total_bytes: u64) -> u8 {
+    if total_bytes == 0 {
+        return 0;
+    }
+    ((transferred_bytes.saturating_mul(100) / total_bytes).min(100)) as u8
 }
 
 fn append_runtime_log_file(level: &str, message: &str) {

@@ -49,6 +49,22 @@ type RuntimeLog = {
   message: string;
 };
 
+type TransferProgress = {
+  id: string;
+  direction: string;
+  peer: string;
+  item_kind: string;
+  item_label: string;
+  item_summary: string;
+  item_id: string;
+  transferred_bytes: number;
+  total_bytes: number;
+  percent: number;
+  status: string;
+  updated_at_ms: number;
+  error?: string | null;
+};
+
 const getInput = (id: string): HTMLInputElement =>
   document.querySelector(`#${id}`) as HTMLInputElement;
 const getTextArea = (id: string): HTMLTextAreaElement =>
@@ -60,6 +76,7 @@ let settings: Settings;
 let lastDiscovered: DiscoveredDevice[] = [];
 let currentStatus: RuntimeStatus | null = null;
 let statusTimer: number | null = null;
+let transferTimer: number | null = null;
 let observedMemberCount = 1;
 let networkOptions: NetworkInterfaceOption[] = [];
 let membersExpanded = false;
@@ -353,6 +370,87 @@ async function refreshLogs(): Promise<void> {
   getText("runtime-logs").textContent = lines.join("\n");
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function transferStatusText(status: string): string {
+  switch (status) {
+    case "sending":
+      return "发送中";
+    case "receiving":
+      return "接收中";
+    case "queued":
+      return "等待写入";
+    case "applying":
+      return "写入剪贴板";
+    case "retrying":
+      return "重试中";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "received":
+      return "已接收";
+    default:
+      return status;
+  }
+}
+
+function transferDirectionText(direction: string): string {
+  return direction === "send" ? "发送到" : "接收自";
+}
+
+function renderTransferSummary(transfer: TransferProgress): string {
+  const summary = transfer.item_summary || `${transfer.item_label || "内容"}`;
+  if (transfer.item_label === "直接复制文字") {
+    return `<div class="transfer-preview"><span class="transfer-preview-label">文字内容</span><p>${escapeHtml(
+      summary,
+    )}</p></div>`;
+  }
+  return `<p class="transfer-title">${escapeHtml(summary)}</p>`;
+}
+
+function renderTransferProgress(transfers: TransferProgress[]): void {
+  const container = getText("transfer-progress-list");
+  if (!transfers.length) {
+    container.innerHTML = `<p class="empty-members">当前没有进行中的传输任务。</p>`;
+    return;
+  }
+
+  container.innerHTML = transfers
+    .map((transfer) => {
+      const error = transfer.error ? `<p class="transfer-error">${escapeHtml(transfer.error)}</p>` : "";
+      return `
+        <article class="transfer-card">
+          <div class="transfer-head">
+            <strong>${escapeHtml(`${transferDirectionText(transfer.direction)} ${transfer.peer}`)}</strong>
+            <span class="transfer-badge transfer-${escapeHtml(transfer.status)}">${escapeHtml(
+              transferStatusText(transfer.status),
+            )}</span>
+          </div>
+          ${renderTransferSummary(transfer)}
+          <p class="transfer-meta">${escapeHtml(
+            `${transfer.item_label || "内容"} · ${formatBytes(transfer.transferred_bytes)} / ${formatBytes(
+              transfer.total_bytes,
+            )}`,
+          )}</p>
+          <div class="transfer-bar"><span style="width: ${transfer.percent}%"></span></div>
+          <p class="transfer-meta">${escapeHtml(`${transfer.percent}%`)}</p>
+          ${error}
+        </article>
+      `;
+    })
+    .join("");
+}
+
+async function refreshTransferProgress(): Promise<void> {
+  const transfers = await invoke<TransferProgress[]>("get_transfer_progress");
+  renderTransferProgress(transfers);
+}
+
 async function clearLogs(): Promise<void> {
   await invoke("clear_runtime_logs");
   await refreshLogs();
@@ -363,6 +461,7 @@ async function boot(): Promise<void> {
   await loadSettings();
   observedMemberCount = 1;
   await refreshStatus();
+  await refreshTransferProgress();
   await refreshLogs();
   renderDevices(lastDiscovered);
   await startSync();
@@ -370,9 +469,15 @@ async function boot(): Promise<void> {
   if (statusTimer !== null) {
     window.clearInterval(statusTimer);
   }
+  if (transferTimer !== null) {
+    window.clearInterval(transferTimer);
+  }
   statusTimer = window.setInterval(() => {
-    void refreshStatus().then(refreshCachedDevices);
-  }, 1500);
+    void Promise.all([refreshStatus(), refreshCachedDevices()]);
+  }, 1200);
+  transferTimer = window.setInterval(() => {
+    void refreshTransferProgress();
+  }, 180);
 }
 
 window.addEventListener("DOMContentLoaded", () => {

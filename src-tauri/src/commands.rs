@@ -1,5 +1,7 @@
 use crate::clipboard;
-use crate::net::{self, DiscoveredDevice, NetworkInterfaceOption, RuntimeLog, RuntimeStatus};
+use crate::net::{
+    self, DiscoveredDevice, NetworkInterfaceOption, RuntimeLog, RuntimeStatus, TransferProgress,
+};
 use crate::protocol::ClipboardPayload;
 use crate::settings::Settings;
 use crate::state::AppState;
@@ -154,6 +156,11 @@ pub fn get_runtime_logs(
     limit: Option<usize>,
 ) -> Result<Vec<RuntimeLog>, String> {
     Ok(state.sync_engine.logs(limit.unwrap_or(250)))
+}
+
+#[tauri::command]
+pub fn get_transfer_progress(state: State<'_, AppState>) -> Result<Vec<TransferProgress>, String> {
+    Ok(state.sync_engine.transfers())
 }
 
 #[tauri::command]

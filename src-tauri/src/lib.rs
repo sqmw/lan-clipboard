@@ -36,6 +36,7 @@ pub fn run() {
             commands::cached_devices,
             commands::list_network_interfaces,
             commands::get_runtime_logs,
+            commands::get_transfer_progress,
             commands::clear_runtime_logs,
         ])
         .run(tauri::generate_context!())
