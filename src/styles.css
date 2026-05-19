@@ -217,6 +217,24 @@ body {
   margin-top: 4px;
 }
 
+.settings-subpanel {
+  padding: 0;
+  gap: 8px;
+}
+
+.compact-toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.compact-toggle-hint {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 400;
+}
+
 .device-row {
   display: flex;
   align-items: center;

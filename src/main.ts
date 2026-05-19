@@ -1,4 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  disable as disableAutostart,
+  enable as enableAutostart,
+  isEnabled as isAutostartEnabled,
+} from "@tauri-apps/plugin-autostart";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { setLocale, t } from "./i18n";
 
 type Settings = {
@@ -18,6 +24,7 @@ type Settings = {
   };
   ui: {
     language: string;
+    launch_at_login: boolean;
   };
 };
 
@@ -89,6 +96,23 @@ let transferPreviewIdleTimer: number | null = null;
 let networkRefreshTimer: number | null = null;
 let draftSelectedNetworkIp: string | null = null;
 let draftLanguage: string | null = null;
+let launchHideAttempted = false;
+
+function isTauriRuntime(): boolean {
+  return "__TAURI_INTERNALS__" in window;
+}
+
+async function hideWindowAfterLaunch(): Promise<void> {
+  if (launchHideAttempted || !isTauriRuntime()) {
+    return;
+  }
+  launchHideAttempted = true;
+  try {
+    await getCurrentWindow().hide();
+  } catch (error) {
+    console.warn("failed to hide launch window", error);
+  }
+}
 
 function getSelectedNetworkIp(): string {
   if (draftSelectedNetworkIp !== null) {
@@ -101,6 +125,7 @@ async function loadSettings(): Promise<void> {
   settings = await invoke<Settings>("get_settings");
   networkOptions = await invoke<NetworkInterfaceOption[]>("list_network_interfaces");
   getInput("encryption-enabled").checked = settings.security.encryption_enabled;
+  getInput("launch-at-login").checked = Boolean(settings.ui?.launch_at_login);
   getInput("shared-code").value = settings.sync.shared_code;
   const mb = Math.max(1, Math.round(settings.limits.max_item_bytes / (1024 * 1024)));
   getInput("max-item-mb").value = String(mb);
@@ -151,6 +176,9 @@ function applyI18nStatic(): void {
   setText("i18n-network-label", "app.settings.network");
   setText("i18n-max-mb-label", "app.settings.max_mb");
   setText("i18n-language-label", "app.settings.language");
+  setText("i18n-startup-title", "app.settings.startup");
+  setText("i18n-launch-at-login-label", "app.settings.launch_at_login");
+  setText("i18n-background-hint", "app.settings.background_hint");
   setText("i18n-settings-hint", "app.settings.hint");
   setText("config-feedback", "app.settings.initial_feedback");
   setText("i18n-advanced-summary", "app.advanced.summary");
@@ -273,6 +301,7 @@ function collectSettings(): Settings {
     ui: {
       ...settings.ui,
       language: (document.querySelector("#language") as HTMLSelectElement).value.trim() || "auto",
+      launch_at_login: getInput("launch-at-login").checked,
     },
   };
 }
@@ -295,6 +324,7 @@ async function saveSettings(): Promise<void> {
   settings = collectSettings();
   try {
     await invoke("set_settings", { next: settings });
+    await syncLaunchAtLogin(settings.ui.launch_at_login);
     await invoke("start_sync");
     draftSelectedNetworkIp = settings.sync.local_ip;
     draftLanguage = settings.ui.language;
@@ -312,6 +342,18 @@ async function saveSettings(): Promise<void> {
       button.disabled = false;
       button.textContent = t("app.settings.save");
     }
+  }
+}
+
+async function syncLaunchAtLogin(enabled: boolean): Promise<void> {
+  const active = await isAutostartEnabled();
+  if (enabled === active) {
+    return;
+  }
+  if (enabled) {
+    await enableAutostart();
+  } else {
+    await disableAutostart();
   }
 }
 
@@ -675,7 +717,18 @@ async function clearLogs(): Promise<void> {
 }
 
 async function boot(): Promise<void> {
+  if (isTauriRuntime()) {
+    await invoke("ensure_desktop_shell");
+  }
   await loadSettings();
+  await hideWindowAfterLaunch();
+  try {
+    await syncLaunchAtLogin(Boolean(settings.ui?.launch_at_login));
+  } catch (error) {
+    getText("config-feedback").textContent = t("app.settings.launch_at_login_failed", {
+      error: String(error),
+    });
+  }
   observedMemberCount = 1;
   await refreshStatus();
   await refreshTransferProgress();
@@ -732,6 +785,7 @@ window.addEventListener("DOMContentLoaded", () => {
     void refreshStatus();
   });
   getInput("encryption-enabled").addEventListener("change", markConfigDirty);
+  getInput("launch-at-login").addEventListener("change", markConfigDirty);
 
   boot().catch((error) => {
     getText("scan-feedback").textContent = t("app.boot.failed", { error: String(error) });

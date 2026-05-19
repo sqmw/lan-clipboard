@@ -70,6 +70,21 @@
             <input id="max-item-mb" type="number" min="1" max="1000" step="1" />
           </label>
         </div>
+        <div class="panel-sub settings-subpanel">
+          <h3 id="i18n-startup-title">后台与启动</h3>
+          <label class="compact-toggle-row">
+            <span class="compact-toggle-copy">
+              <span class="compact-toggle-label" id="i18n-launch-at-login-label">开机启动</span>
+              <span class="compact-toggle-hint" id="i18n-background-hint"
+                >应用启动后默认在后台运行；关闭窗口会保留在菜单栏 / 托盘。</span
+              >
+            </span>
+            <span class="switch">
+              <input id="launch-at-login" type="checkbox" />
+              <span class="switch-slider" aria-hidden="true"></span>
+            </span>
+          </label>
+        </div>
         <p class="hint" id="i18n-settings-hint">推荐家庭或小团队共用一个 6 位码；同网段内填写相同共享码的设备都会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。</p>
         <p class="save-feedback" id="config-feedback">修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。</p>
         <details class="advanced">

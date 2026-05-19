@@ -4,8 +4,9 @@ use base64::Engine;
 use image::imageops::FilterType as ResizeFilterType;
 use image::ImageEncoder;
 use image::RgbaImage;
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufWriter, Cursor, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -74,6 +75,19 @@ fn read_snapshot_once(limits: &SizeLimits) -> Result<ClipboardPayload, Clipboard
 
 pub fn write_item(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
     retry_clipboard_io(|| write_item_once(item, limits))
+}
+
+pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String, ClipboardError> {
+    match payload {
+        ClipboardPayload::Text { text } => Ok(hex_hash(text.as_bytes())),
+        ClipboardPayload::ImagePng { png_bytes } => Ok(hex_hash(png_bytes)),
+        ClipboardPayload::Html { html } => Ok(hex_hash(html.as_bytes())),
+        ClipboardPayload::Rtf { rtf } => Ok(hex_hash(rtf.as_bytes())),
+        ClipboardPayload::FileList { paths, .. } => hash_file_list(paths),
+        ClipboardPayload::FileBundle { archive_bytes, .. } => {
+            hash_file_bundle_archive(archive_bytes)
+        }
+    }
 }
 
 fn write_item_once(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
@@ -313,6 +327,175 @@ pub(crate) fn write_file_bundle_archive_to_path(
     file.metadata()
         .map(|metadata| metadata.len())
         .map_err(|e| ClipboardError::Backend(e.to_string()))
+}
+
+fn hash_file_list(file_paths: &[PathBuf]) -> Result<String, ClipboardError> {
+    let mut entries = file_paths
+        .iter()
+        .map(|path| {
+            let top_level_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    ClipboardError::Backend("clipboard file missing name".to_string())
+                })?;
+            Ok((top_level_name, path.clone()))
+        })
+        .collect::<Result<Vec<_>, ClipboardError>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut records = Vec::new();
+    for (name, path) in entries {
+        collect_path_hash_records(&path, Path::new(&name), &mut records)?;
+    }
+    Ok(finalize_hash_records(records))
+}
+
+fn collect_path_hash_records(
+    source: &Path,
+    relative_path: &Path,
+    records: &mut Vec<HashRecord>,
+) -> Result<(), ClipboardError> {
+    let metadata = fs::metadata(source).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    let normalized_path = normalize_hash_path(relative_path);
+    if metadata.is_dir() {
+        records.push(HashRecord {
+            kind: "dir".to_string(),
+            path: normalized_path,
+            size_bytes: 0,
+            content_hash: None,
+        });
+
+        let mut children = fs::read_dir(source)
+            .map_err(|e| ClipboardError::Backend(e.to_string()))?
+            .map(|child| child.map_err(|e| ClipboardError::Backend(e.to_string())))
+            .collect::<Result<Vec<_>, ClipboardError>>()?;
+        children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        for child in children {
+            let child_path = child.path();
+            let child_relative_path = relative_path.join(child.file_name());
+            collect_path_hash_records(&child_path, &child_relative_path, records)?;
+        }
+        return Ok(());
+    }
+
+    records.push(HashRecord {
+        kind: "file".to_string(),
+        path: normalized_path,
+        size_bytes: metadata.len(),
+        content_hash: Some(hash_file_contents(source)?),
+    });
+    Ok(())
+}
+
+fn hash_file_bundle_archive(archive_bytes: &[u8]) -> Result<String, ClipboardError> {
+    let cursor = Cursor::new(archive_bytes);
+    let mut archive = Archive::new(cursor);
+    let mut records = Vec::new();
+
+    let entries = archive
+        .entries()
+        .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| ClipboardError::Backend(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| ClipboardError::Backend(e.to_string()))?
+            .into_owned();
+        let normalized_path = normalize_hash_path(&path);
+        if entry.header().entry_type().is_dir() {
+            records.push(HashRecord {
+                kind: "dir".to_string(),
+                path: normalized_path,
+                size_bytes: 0,
+                content_hash: None,
+            });
+            continue;
+        }
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes = 0u64;
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let read_bytes = entry
+                .read(&mut buffer)
+                .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+            if read_bytes == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read_bytes]);
+            size_bytes = size_bytes.saturating_add(read_bytes as u64);
+        }
+        records.push(HashRecord {
+            kind: "file".to_string(),
+            path: normalized_path,
+            size_bytes,
+            content_hash: Some(format!("{:x}", hasher.finalize())),
+        });
+    }
+
+    Ok(finalize_hash_records(records))
+}
+
+#[derive(Debug)]
+struct HashRecord {
+    kind: String,
+    path: String,
+    size_bytes: u64,
+    content_hash: Option<String>,
+}
+
+fn finalize_hash_records(mut records: Vec<HashRecord>) -> String {
+    records.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+
+    let mut hasher = Sha256::new();
+    for record in records {
+        hasher.update(record.kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(record.path.as_bytes());
+        hasher.update([0]);
+        hasher.update(record.size_bytes.to_le_bytes());
+        hasher.update([0]);
+        if let Some(content_hash) = record.content_hash {
+            hasher.update(content_hash.as_bytes());
+        }
+        hasher.update([0xff]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn hash_file_contents(path: &Path) -> Result<String, ClipboardError> {
+    let file = File::open(path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read_bytes = reader
+            .read(&mut buffer)
+            .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+        if read_bytes == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read_bytes]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn normalize_hash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn hex_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn append_path_to_archive<W: Write>(

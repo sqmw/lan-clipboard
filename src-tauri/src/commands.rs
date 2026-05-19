@@ -1,4 +1,5 @@
 use crate::clipboard;
+use crate::desktop;
 use crate::net::{
     self, DiscoveredDevice, NetworkInterfaceOption, RuntimeLog, RuntimeStatus, TransferProgress,
 };
@@ -73,7 +74,9 @@ pub fn write_clipboard_item(
         .settings
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?;
-    let item = net::build_item(&payload, "local").ok_or_else(|| "empty payload".to_string())?;
+    let item = net::build_item(&payload, "local")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "empty payload".to_string())?;
     clipboard::write_item(&item, &guard.limits).map_err(|e| e.to_string())
 }
 
@@ -170,4 +173,9 @@ pub fn get_transfer_progress(state: State<'_, AppState>) -> Result<Vec<TransferP
 pub fn clear_runtime_logs(state: State<'_, AppState>) -> Result<(), String> {
     state.sync_engine.clear_logs();
     Ok(())
+}
+
+#[tauri::command]
+pub fn ensure_desktop_shell(app: AppHandle) -> Result<(), String> {
+    desktop::ensure_tray_icon(&app).map_err(|e| e.to_string())
 }

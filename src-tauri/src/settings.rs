@@ -82,12 +82,14 @@ pub struct Settings {
 pub struct UiConfig {
     /// UI language: "", "auto", "zh-CN", "en-US"
     pub language: String,
+    pub launch_at_login: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             language: "auto".to_string(),
+            launch_at_login: false,
         }
     }
 }

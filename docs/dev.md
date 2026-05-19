@@ -5,6 +5,8 @@
 - 安装依赖：`pnpm install`
 - 启动开发版：`pnpm tauri dev`
 - Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
+- 若代码是从 macOS 手动同步到 Windows，必须避免把 `._*` 资源副文件带过去；这类文件会污染 `src-tauri/capabilities/` 并导致 `tauri build` 在 Windows 上报 `stream did not contain valid UTF-8`
+- Windows 开发态如果出现 `WebView2 error ... 无效的窗口句柄`，优先确认当前版本是否仍在原生建窗阶段直接隐藏主窗口；当前实现已改为“前端启动完成后再隐藏窗口”
 
 ## 打包发行
 
@@ -34,9 +36,12 @@
 
 - macOS / Windows 都能启动
 - 同一端只保留一个实例
+- 启动后默认后台运行，不主动显示主窗口
+- 关闭主窗口后不会退出，只会隐藏到菜单栏 / 系统托盘
 - 修改共享码、网络、大小限制后，点击“保存配置”能生效并持久化
 - 多网卡时可手动选择正确局域网 IP
 - 可在设置里切换 UI 语言（中文 / English），保存后作为默认语言
+- 可在设置里切换“开机启动”，并在下次启动后保持一致
 
 ### 共享域与成员
 

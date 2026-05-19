@@ -1,11 +1,10 @@
 mod clipboard;
 mod commands;
+mod desktop;
 mod net;
 mod protocol;
 mod settings;
 mod state;
-
-use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -15,14 +14,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            desktop::show_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ))
         .manage(state::AppState::default())
+        .setup(|app| Ok(desktop::setup(app)?))
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,
@@ -37,6 +37,7 @@ pub fn run() {
             commands::get_runtime_logs,
             commands::get_transfer_progress,
             commands::clear_runtime_logs,
+            commands::ensure_desktop_shell,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

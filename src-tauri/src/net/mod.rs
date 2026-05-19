@@ -488,8 +488,16 @@ impl ClipboardHandler for ClipboardWatchHandler {
             }
         };
 
-        let Some(item) = build_item(&payload, &self.device_id) else {
-            return CallbackResult::Next;
+        let item = match build_item(&payload, &self.device_id) {
+            Ok(Some(item)) => item,
+            Ok(None) => return CallbackResult::Next,
+            Err(error) => {
+                set_error(
+                    &self.runtime,
+                    format!("clipboard watcher build item failed: {error}"),
+                );
+                return CallbackResult::Next;
+            }
         };
 
         if should_ignore_local_observation(&self.runtime, &item.content_hash) {
@@ -1807,9 +1815,13 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
     let selected_ipv4 = parse_selected_ipv4(effective_local_ip.as_deref())
         .ok()
         .flatten();
+    let self_device_id = settings.sync_device_id();
     let mut peer_by_ip = HashMap::new();
     if let Ok(guard) = runtime.discovered_devices.lock() {
         for device in guard.iter() {
+            if device.device_id == self_device_id {
+                continue;
+            }
             if let Some(selected_ipv4) = selected_ipv4 {
                 if let Ok(peer_ipv4) = device.addr.parse::<std::net::Ipv4Addr>() {
                     if !is_same_subnet(selected_ipv4, peer_ipv4) {
@@ -1819,6 +1831,9 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
             }
             let peer = format!("{}:{}", device.addr, device.port);
             if let Ok(socket_addr) = peer.parse::<SocketAddr>() {
+                if is_self_socket_addr(&socket_addr, effective_local_ip.as_deref()) {
+                    continue;
+                }
                 peer_by_ip.insert(socket_addr.ip().to_string(), peer);
             }
         }
@@ -1829,6 +1844,9 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
                 let normalized = normalize_peer(addr, settings.sync.listen_port);
                 if is_expected_listen_addr(&normalized, settings.sync.listen_port) {
                     if let Ok(socket_addr) = normalized.parse::<SocketAddr>() {
+                        if is_self_socket_addr(&socket_addr, effective_local_ip.as_deref()) {
+                            continue;
+                        }
                         if let Some(selected_ipv4) = selected_ipv4 {
                             if let std::net::IpAddr::V4(peer_ipv4) = socket_addr.ip() {
                                 if !is_same_subnet(selected_ipv4, peer_ipv4) {
@@ -1852,6 +1870,16 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
 fn is_expected_listen_addr(addr: &str, listen_port: u16) -> bool {
     addr.parse::<SocketAddr>()
         .map(|socket_addr| socket_addr.port() == listen_port)
+        .unwrap_or(false)
+}
+
+fn is_self_socket_addr(socket_addr: &SocketAddr, effective_local_ip: Option<&str>) -> bool {
+    if socket_addr.ip().is_loopback() {
+        return true;
+    }
+    effective_local_ip
+        .and_then(|ip| ip.parse::<IpAddr>().ok())
+        .map(|local_ip| socket_addr.ip() == local_ip)
         .unwrap_or(false)
 }
 
@@ -2018,45 +2046,36 @@ fn normalize_peer(peer: &str, fallback_port: u16) -> String {
     }
 }
 
-pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<ClipboardItem> {
-    let payload_bytes = match payload {
-        ClipboardPayload::Text { text } => text.as_bytes().to_vec(),
-        ClipboardPayload::ImagePng { png_bytes } => png_bytes.clone(),
-        ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.clone(),
-        ClipboardPayload::FileList {
-            paths,
-            top_level_names,
-            estimated_archive_bytes,
-        } => {
-            let marker = format!("{paths:?}:{top_level_names:?}:{estimated_archive_bytes}");
-            marker.into_bytes()
-        }
-        ClipboardPayload::Html { html } => html.as_bytes().to_vec(),
-        ClipboardPayload::Rtf { rtf } => rtf.as_bytes().to_vec(),
-    };
-
+pub fn build_item(
+    payload: &ClipboardPayload,
+    device_id: &str,
+) -> Result<Option<ClipboardItem>, crate::clipboard::ClipboardError> {
     let size_bytes = match payload {
         ClipboardPayload::FileList {
             estimated_archive_bytes,
             ..
         } => *estimated_archive_bytes,
-        _ => payload_bytes.len() as u64,
+        ClipboardPayload::Text { text } => text.as_bytes().len() as u64,
+        ClipboardPayload::ImagePng { png_bytes } => png_bytes.len() as u64,
+        ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.len() as u64,
+        ClipboardPayload::Html { html } => html.as_bytes().len() as u64,
+        ClipboardPayload::Rtf { rtf } => rtf.as_bytes().len() as u64,
     };
     if size_bytes == 0 {
-        return None;
+        return Ok(None);
     }
 
     let created_at_us = now_us();
-    let content_hash = payload_hash(&payload_bytes);
+    let content_hash = clipboard::payload_content_hash(payload)?;
 
-    Some(ClipboardItem {
+    Ok(Some(ClipboardItem {
         id: Uuid::new_v4().to_string(),
         content_hash,
         created_at_us,
         source_device_id: device_id.to_string(),
         size_bytes,
         payload: payload.clone(),
-    })
+    }))
 }
 
 fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Result<Vec<u8>> {
@@ -2308,12 +2327,6 @@ fn decrypt_bytes(nonce_bytes: [u8; 12], body: &[u8], key: &[u8; 32]) -> anyhow::
         .decrypt(nonce, body)
         .map_err(|_| anyhow::anyhow!("decrypt failed (shared code mismatch?)"))?;
     Ok(plain)
-}
-
-fn payload_hash(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -> bool {

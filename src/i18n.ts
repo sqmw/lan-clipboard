@@ -32,6 +32,9 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.network.active": "当前使用",
     "app.settings.max_mb": "最大发送大小（MB）",
     "app.settings.language": "语言",
+    "app.settings.startup": "后台与启动",
+    "app.settings.launch_at_login": "开机启动",
+    "app.settings.background_hint": "应用启动后默认在后台运行；关闭窗口会保留在菜单栏 / 托盘。",
     "app.settings.language.auto": "跟随系统",
     "app.settings.language.zh": "中文",
     "app.settings.language.en": "English",
@@ -42,6 +45,7 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.saving_feedback": "正在保存配置并应用全局设置...",
     "app.settings.saved_feedback": "配置已保存，并已按新配置重新应用。",
     "app.settings.save_failed": "保存失败：{error}",
+    "app.settings.launch_at_login_failed": "开机启动状态同步失败：{error}",
     "app.settings.code_invalid": "共享码必须是 6 位数字。",
     "app.settings.code_invalid_save": "共享码必须是 6 位数字，配置未保存。",
 
@@ -123,6 +127,10 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.network.active": "In use",
     "app.settings.max_mb": "Max send size (MB)",
     "app.settings.language": "Language",
+    "app.settings.startup": "Background & Startup",
+    "app.settings.launch_at_login": "Launch at login",
+    "app.settings.background_hint":
+      "The app starts in the background by default and stays in the tray / menu bar when the window is closed.",
     "app.settings.language.auto": "System",
     "app.settings.language.zh": "中文",
     "app.settings.language.en": "English",
@@ -133,6 +141,7 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.saving_feedback": "Saving settings and applying...",
     "app.settings.saved_feedback": "Saved and applied.",
     "app.settings.save_failed": "Save failed: {error}",
+    "app.settings.launch_at_login_failed": "Failed to sync launch-at-login state: {error}",
     "app.settings.code_invalid": "Shared code must be 6 digits.",
     "app.settings.code_invalid_save": "Shared code must be 6 digits. Not saved.",
 
