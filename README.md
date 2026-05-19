@@ -29,6 +29,12 @@
 
 ---
 
+<p align="center">
+  <img src="./docs/image/screenshot.png" width="920" alt="LAN Clipboard UI">
+</p>
+
+<p align="center"><i>简洁高效：只保留共享域、网络选择、大小限制和传输进度，降低心智负担。</i></p>
+
 ## ✨ 特性
 
 - **共享域模型**：同一局域网内填写相同 6 位共享码的设备自动加入同一共享域

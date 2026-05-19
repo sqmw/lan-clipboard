@@ -29,6 +29,12 @@
 
 ---
 
+<p align="center">
+  <img src="./docs/image/screenshot.png" width="920" alt="LAN Clipboard UI">
+</p>
+
+<p align="center"><i>Minimal and efficient: domain, network, size limit, and transfer progress — nothing more.</i></p>
+
 ## ✨ Features
 
 - **Shared-domain model**: devices with the same 6-digit shared code on the same LAN join one domain automatically
