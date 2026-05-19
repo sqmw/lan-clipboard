@@ -22,9 +22,8 @@ use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_lan-clipboard._tcp.local.";
 const LOG_LIMIT: usize = 800;
-const DISCOVERY_REFRESH_MS: u64 = 1_000;
+const DISCOVERY_REFRESH_MS: u64 = 3_000;
 const DISCOVERY_TIMEOUT_MS: u64 = 900;
-const STATUS_DISCOVERY_TIMEOUT_MS: u64 = 350;
 const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
 const UDP_DISCOVERY_PORT: u16 = 32911;
 const UDP_ANNOUNCE_MS: u64 = 500;
@@ -271,16 +270,6 @@ struct ClipboardWatchHandler {
 
 impl SyncEngine {
     pub fn status(&self, settings: &Settings, selected_local_ip: Option<&str>) -> RuntimeStatus {
-        if self.inner.running.load(Ordering::SeqCst) && cached_member_signal_count(&self.inner) == 0
-        {
-            refresh_discovered_devices(
-                &self.inner,
-                settings,
-                &settings.sync_device_id(),
-                selected_local_ip,
-                STATUS_DISCOVERY_TIMEOUT_MS,
-            );
-        }
         let error = self
             .inner
             .last_error
@@ -1913,21 +1902,6 @@ fn tune_stream_for_receive(stream: &TcpStream, payload_bytes: u64) {
     let socket = SockRef::from(stream);
     let _ = socket.set_send_buffer_size(TCP_BUFFER_BYTES);
     let _ = socket.set_recv_buffer_size(TCP_BUFFER_BYTES);
-}
-
-fn cached_member_signal_count(runtime: &RuntimeInner) -> usize {
-    prune_stale_discovered_devices(runtime);
-    let discovered = runtime
-        .discovered_devices
-        .lock()
-        .map(|guard| guard.len())
-        .unwrap_or(0);
-    let known = runtime
-        .known_members
-        .lock()
-        .map(|guard| guard.len())
-        .unwrap_or(0);
-    discovered + known
 }
 
 fn visible_member_count(runtime: &RuntimeInner, effective_local_ip: Option<&str>) -> usize {

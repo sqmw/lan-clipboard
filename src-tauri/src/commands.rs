@@ -7,6 +7,7 @@ use crate::protocol::ClipboardPayload;
 use crate::settings::Settings;
 use crate::state::AppState;
 use tauri::{AppHandle, Manager, State};
+use tokio::task;
 
 pub fn settings_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
     let dir = app.path().app_config_dir()?;
@@ -138,7 +139,7 @@ pub fn sync_status(
 }
 
 #[tauri::command]
-pub fn discover_devices(
+pub async fn discover_devices(
     state: State<'_, AppState>,
     selected_local_ip: Option<String>,
 ) -> Result<Vec<DiscoveredDevice>, String> {
@@ -147,19 +148,24 @@ pub fn discover_devices(
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
-    state
-        .presence_service
-        .ensure(settings.clone(), settings.sync_device_id())
-        .map_err(|e| e.to_string())?;
-    let devices = net::discover_devices(
-        &settings.sync_device_id(),
-        &settings.sync.shared_code,
-        selected_local_ip.as_deref(),
-        2200,
-    )
-    .map_err(|e| e.to_string())?;
-    state.sync_engine.merge_discovered_devices(devices);
-    Ok(state.sync_engine.devices(selected_local_ip.as_deref()))
+    let presence_service = state.presence_service.clone();
+    let sync_engine = state.sync_engine.clone();
+    let selected_local_ip = selected_local_ip.map(|value| value.trim().to_string());
+    let device_id = settings.sync_device_id();
+    let shared_code = settings.sync.shared_code.clone();
+
+    task::spawn_blocking(move || -> Result<Vec<DiscoveredDevice>, String> {
+        presence_service
+            .ensure(settings.clone(), device_id.clone())
+            .map_err(|e| e.to_string())?;
+        let devices =
+            net::discover_devices(&device_id, &shared_code, selected_local_ip.as_deref(), 2200)
+                .map_err(|e| e.to_string())?;
+        sync_engine.merge_discovered_devices(devices);
+        Ok(sync_engine.devices(selected_local_ip.as_deref()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

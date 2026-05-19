@@ -95,6 +95,13 @@ let transferPreviewIdleTimer: number | null = null;
 let networkRefreshTimer: number | null = null;
 let draftSelectedNetworkIp: string | null = null;
 let draftLanguage: string | null = null;
+let statusRefreshRunning = false;
+let transferRefreshRunning = false;
+let manualRefreshRunning = false;
+let lastStatusKey = "";
+let lastDevicesKey = "";
+let lastRenderedSelfKey = "";
+let lastTransfersKey = "";
 
 function getSelectedNetworkIp(): string {
   if (draftSelectedNetworkIp !== null) {
@@ -340,16 +347,32 @@ async function syncLaunchAtLogin(enabled: boolean): Promise<void> {
 }
 
 async function refreshStatus(): Promise<void> {
+  if (statusRefreshRunning) {
+    return;
+  }
+  statusRefreshRunning = true;
+  try {
   const status = await invoke<RuntimeStatus>("sync_status", {
     selectedLocalIp: getSelectedNetworkIp() || null,
   });
+  const nextStatusKey = JSON.stringify(status);
+  const previousLocalIp = currentStatus?.local_ip?.trim() ?? "";
+  const nextLocalIp = status.local_ip?.trim() ?? "";
   currentStatus = status;
-  renderNetworkOptions(getSelectedNetworkIp());
-  getText("status-running").textContent = `${t("app.status.label")}: ${
-    status.running ? t("app.status.running") : t("app.status.stopped")
-  }`;
-  observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
-  getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
+  if (lastStatusKey !== nextStatusKey) {
+    getText("status-running").textContent = `${t("app.status.label")}: ${
+      status.running ? t("app.status.running") : t("app.status.stopped")
+    }`;
+    observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
+    getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
+    lastStatusKey = nextStatusKey;
+  }
+  if (previousLocalIp !== nextLocalIp) {
+    renderNetworkOptions(getSelectedNetworkIp());
+  }
+  } finally {
+    statusRefreshRunning = false;
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -384,6 +407,18 @@ function renderDevices(devices: DiscoveredDevice[]): void {
   const selfName = currentStatus?.device_name || t("app.self.device");
   const selfIp = currentStatus?.local_ip?.trim();
   const selfMeta = selfIp ? `${t("app.self")} · ${selfIp}` : t("app.self");
+  const selfRenderKey = `${selfName}|${selfMeta}|${membersExpanded ? "1" : "0"}`;
+  const devicesKey = JSON.stringify(
+    devices.map((device) => [device.device_id, device.device_name, device.addr, device.port]),
+  );
+  if (lastDevicesKey === devicesKey && lastRenderedSelfKey === selfRenderKey) {
+    feedback.textContent = devices.length
+      ? t("app.domain.online_total", { count: devices.length + 1 })
+      : t("app.domain.only_self");
+    return;
+  }
+  lastDevicesKey = devicesKey;
+  lastRenderedSelfKey = selfRenderKey;
   const remoteRows = devices.length
     ? devices
         .map((device) =>
@@ -419,9 +454,13 @@ function renderDevices(devices: DiscoveredDevice[]): void {
 }
 
 async function scanDevices(): Promise<void> {
+  if (manualRefreshRunning) {
+    return;
+  }
   if (!validateSharedCode()) {
     return;
   }
+  manualRefreshRunning = true;
   const button = document.querySelector("#refresh-domain") as HTMLButtonElement | null;
   const feedback = getText("scan-feedback");
   if (button) {
@@ -442,6 +481,7 @@ async function scanDevices(): Promise<void> {
     feedback.textContent = t("app.scan.failed", { error: String(error) });
     throw error;
   } finally {
+    manualRefreshRunning = false;
     if (button) {
       button.disabled = false;
       button.textContent = t("app.domain.refresh");
@@ -680,11 +720,31 @@ function renderTransferProgress(transfers: TransferProgress[]): void {
 }
 
 async function refreshTransferProgress(): Promise<void> {
-  if (isTransferPreviewInteracting) {
+  if (isTransferPreviewInteracting || transferRefreshRunning) {
     return;
   }
-  const transfers = await invoke<TransferProgress[]>("get_transfer_progress");
-  renderTransferProgress(transfers);
+  transferRefreshRunning = true;
+  try {
+    const transfers = await invoke<TransferProgress[]>("get_transfer_progress");
+    const nextTransfersKey = JSON.stringify(
+      transfers.map((transfer) => [
+        transfer.id,
+        transfer.status,
+        transfer.percent,
+        transfer.transferred_bytes,
+        transfer.total_bytes,
+        transfer.item_summary,
+        transfer.error ?? "",
+      ]),
+    );
+    if (lastTransfersKey === nextTransfersKey) {
+      return;
+    }
+    lastTransfersKey = nextTransfersKey;
+    renderTransferProgress(transfers);
+  } finally {
+    transferRefreshRunning = false;
+  }
 }
 
 async function clearLogs(): Promise<void> {
@@ -715,11 +775,12 @@ async function boot(): Promise<void> {
     window.clearInterval(transferTimer);
   }
   statusTimer = window.setInterval(() => {
-    void Promise.all([refreshStatus(), refreshCachedDevices()]);
-  }, 1200);
+    void refreshStatus();
+    void refreshCachedDevices();
+  }, 1800);
   transferTimer = window.setInterval(() => {
     void refreshTransferProgress();
-  }, 180);
+  }, 500);
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -751,6 +812,10 @@ window.addEventListener("DOMContentLoaded", () => {
     setLocale(draftLanguage);
     renderLanguageOptions(draftLanguage);
     applyI18nStatic();
+    lastStatusKey = "";
+    lastDevicesKey = "";
+    lastRenderedSelfKey = "";
+    lastTransfersKey = "";
     markConfigDirty();
     renderDevices(lastDiscovered);
     void refreshTransferProgress();

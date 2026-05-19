@@ -10,6 +10,8 @@
 - 当前 `main` 窗口不再放在 `tauri.conf.json` 的 `app.windows` 里；要显示主界面，必须通过 Rust 侧 `WebviewWindowBuilder::new(...)` 手动创建
 - 由于主窗口默认不创建，后台同步初始化必须放在 Rust `setup()` 之后完成，不能再依赖前端 `boot()` 调 `start_sync`
 - 当前判断：Windows 启动误显主窗口的根因更接近“配置窗口仍被系统启动链路预创建”，而不是普通前端样式或一次 `hide()` 时机问题
+- Windows 拖动卡顿的当前根因更接近“前端高频空刷新 + `sync_status` 隐式扫描”，不是单纯线程数量不够；当前已把状态读取与设备发现拆开，并降低无变化时的重绘频率
+- 手动刷新成员时，`discover_devices` 当前通过后台阻塞任务执行，避免 `mdns` 扫描阶段把 WebView 交互线程一起拖住
 
 ## 打包发行
 
