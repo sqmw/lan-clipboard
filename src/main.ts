@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { setLocale, t } from "./i18n";
 
 type Settings = {
   limits: {
@@ -14,6 +15,9 @@ type Settings = {
   };
   security: {
     encryption_enabled: boolean;
+  };
+  ui: {
+    language: string;
   };
 };
 
@@ -84,6 +88,7 @@ let isTransferPreviewInteracting = false;
 let transferPreviewIdleTimer: number | null = null;
 let networkRefreshTimer: number | null = null;
 let draftSelectedNetworkIp: string | null = null;
+let draftLanguage: string | null = null;
 
 function getSelectedNetworkIp(): string {
   if (draftSelectedNetworkIp !== null) {
@@ -100,7 +105,62 @@ async function loadSettings(): Promise<void> {
   const mb = Math.max(1, Math.round(settings.limits.max_item_bytes / (1024 * 1024)));
   getInput("max-item-mb").value = String(mb);
   draftSelectedNetworkIp = settings.sync.local_ip;
+  draftLanguage = (settings.ui?.language || "auto").trim() || "auto";
+  setLocale(draftLanguage);
+  renderLanguageOptions(draftLanguage);
+  applyI18nStatic();
   renderNetworkOptions(draftSelectedNetworkIp);
+}
+
+function renderLanguageOptions(selected: string): void {
+  const select = document.querySelector("#language") as HTMLSelectElement;
+  const value = (selected || "auto").trim();
+  const options = [
+    `<option value="auto" ${value === "auto" ? "selected" : ""}>${escapeHtml(
+      t("app.settings.language.auto"),
+    )}</option>`,
+    `<option value="zh-CN" ${value === "zh-CN" ? "selected" : ""}>${escapeHtml(
+      t("app.settings.language.zh"),
+    )}</option>`,
+    `<option value="en-US" ${value === "en-US" ? "selected" : ""}>${escapeHtml(
+      t("app.settings.language.en"),
+    )}</option>`,
+  ];
+  select.innerHTML = options.join("");
+}
+
+function applyI18nStatic(): void {
+  const setText = (id: string, key: string) => {
+    const el = document.querySelector(`#${id}`) as HTMLElement | null;
+    if (el) el.textContent = t(key);
+  };
+
+  setText("i18n-domain-kicker", "app.domain.kicker");
+  setText("i18n-domain-title", "app.domain.title");
+  setText("refresh-domain", "app.domain.refresh");
+  setText("i18n-devices-label", "app.domain.devices");
+  setText("i18n-status-kicker", "app.status.kicker");
+  setText("i18n-status-title", "app.status.title");
+  setText("i18n-status-label", "app.status.label");
+  setText("i18n-members-label", "app.status.members");
+  setText("i18n-transfer-label", "app.transfer.title");
+  setText("i18n-settings-kicker", "app.settings.kicker");
+  setText("i18n-settings-title", "app.settings.title");
+  setText("save-settings", "app.settings.save");
+  setText("i18n-shared-code-label", "app.settings.shared_code");
+  setText("i18n-network-label", "app.settings.network");
+  setText("i18n-max-mb-label", "app.settings.max_mb");
+  setText("i18n-language-label", "app.settings.language");
+  setText("i18n-settings-hint", "app.settings.hint");
+  setText("config-feedback", "app.settings.initial_feedback");
+  setText("i18n-advanced-summary", "app.advanced.summary");
+  setText("i18n-security-title", "app.security.title");
+  setText("i18n-encrypt-label", "app.security.encrypt");
+  setText("i18n-logs-title", "app.logs.title");
+  setText("refresh-logs", "app.logs.refresh");
+  setText("clear-logs", "app.logs.clear");
+
+  getInput("shared-code").placeholder = t("app.settings.shared_code.placeholder");
 }
 
 function renderNetworkOptions(selectedIp: string): void {
@@ -113,11 +173,13 @@ function renderNetworkOptions(selectedIp: string): void {
     compareNetworkOptions(left, right, effectiveSelected, activeIp, recommendedIp),
   );
   const options = [
-    `<option value="" ${effectiveSelected ? "" : "selected"}>自动选择最合适的局域网网络</option>`,
+    `<option value="" ${effectiveSelected ? "" : "selected"}>${escapeHtml(
+      t("app.settings.network.auto"),
+    )}</option>`,
     ...orderedOptions.map((option) => {
       const suffix = [
-        option.ip === recommendedIp ? "推荐" : "",
-        option.ip === activeIp ? "当前使用" : "",
+        option.ip === recommendedIp ? t("app.settings.network.recommended") : "",
+        option.ip === activeIp ? t("app.settings.network.active") : "",
       ]
         .filter(Boolean)
         .join(" / ");
@@ -208,11 +270,15 @@ function collectSettings(): Settings {
       ...settings.security,
       encryption_enabled: getInput("encryption-enabled").checked,
     },
+    ui: {
+      ...settings.ui,
+      language: (document.querySelector("#language") as HTMLSelectElement).value.trim() || "auto",
+    },
   };
 }
 
 function markConfigDirty(): void {
-  getText("config-feedback").textContent = "有未保存修改，点击“保存配置”后才会生效。";
+  getText("config-feedback").textContent = t("app.settings.dirty");
 }
 
 async function saveSettings(): Promise<void> {
@@ -223,24 +289,28 @@ async function saveSettings(): Promise<void> {
   const feedback = getText("config-feedback");
   if (button) {
     button.disabled = true;
-    button.textContent = "保存中...";
+    button.textContent = t("app.settings.saving");
   }
-  feedback.textContent = "正在保存配置并应用全局设置...";
+  feedback.textContent = t("app.settings.saving_feedback");
   settings = collectSettings();
   try {
     await invoke("set_settings", { next: settings });
     await invoke("start_sync");
     draftSelectedNetworkIp = settings.sync.local_ip;
+    draftLanguage = settings.ui.language;
+    setLocale(draftLanguage);
+    renderLanguageOptions(draftLanguage);
+    applyI18nStatic();
     observedMemberCount = 1;
     await refreshDomain();
     await refreshLogs();
-    feedback.textContent = "配置已保存，并已按新配置重新应用。";
+    feedback.textContent = t("app.settings.saved_feedback");
   } catch (error) {
-    feedback.textContent = `保存失败：${String(error)}`;
+    feedback.textContent = t("app.settings.save_failed", { error: String(error) });
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = "保存配置";
+      button.textContent = t("app.settings.save");
     }
   }
 }
@@ -251,9 +321,11 @@ async function refreshStatus(): Promise<void> {
   });
   currentStatus = status;
   renderNetworkOptions(getSelectedNetworkIp());
-  getText("status-running").textContent = `状态: ${status.running ? "运行中" : "已停止"}`;
+  getText("status-running").textContent = `${t("app.status.label")}: ${
+    status.running ? t("app.status.running") : t("app.status.stopped")
+  }`;
   observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
-  getText("status-peer-count").textContent = `共享域成员（含本机）: ${observedMemberCount}`;
+  getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
 }
 
 async function startSync(): Promise<void> {
@@ -289,20 +361,24 @@ function renderDevices(devices: DiscoveredDevice[]): void {
   const feedback = getText("scan-feedback");
   lastDiscovered = devices;
   observedMemberCount = Math.max(1, devices.length + 1);
-  getText("status-peer-count").textContent = `共享域成员（含本机）: ${observedMemberCount}`;
-  const selfName = currentStatus?.device_name || "本机设备";
+  getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
+  const selfName = currentStatus?.device_name || t("app.self.device");
   const selfIp = currentStatus?.local_ip?.trim();
-  const selfMeta = selfIp ? `本机 · ${selfIp}` : "本机";
+  const selfMeta = selfIp ? `${t("app.self")} · ${selfIp}` : t("app.self");
   const remoteRows = devices.length
     ? devices
-        .map((device) => renderDeviceRow(device.device_name, device.addr, "共享域内"))
+        .map((device) =>
+          renderDeviceRow(device.device_name, device.addr, t("app.domain.member_tag")),
+        )
         .join("")
-    : `<p class="empty-members">当前没有发现其他共享域成员。</p>`;
+    : `<p class="empty-members">${escapeHtml(t("app.domain.empty"))}</p>`;
   container.innerHTML = `
     <details class="device-list-tree" ${membersExpanded ? "open" : ""}>
       <summary class="device-list-summary">
-        ${renderDeviceRow(selfName, selfMeta, "本机", "device-row-self")}
-        <span class="device-list-toggle" aria-hidden="true">${membersExpanded ? "收起" : "查看全部"}</span>
+        ${renderDeviceRow(selfName, selfMeta, t("app.domain.self_tag"), "device-row-self")}
+        <span class="device-list-toggle" aria-hidden="true">${escapeHtml(
+          membersExpanded ? t("app.domain.collapse") : t("app.domain.view_all"),
+        )}</span>
       </summary>
       <div class="device-list-children">${remoteRows}</div>
     </details>
@@ -313,14 +389,14 @@ function renderDevices(devices: DiscoveredDevice[]): void {
       membersExpanded = details.open;
       const toggle = details.querySelector(".device-list-toggle");
       if (toggle) {
-        toggle.textContent = details.open ? "收起" : "查看全部";
+        toggle.textContent = details.open ? t("app.domain.collapse") : t("app.domain.view_all");
       }
     });
   }
   renderNetworkOptions(getSelectedNetworkIp());
   feedback.textContent = devices.length
-    ? `当前共享域共有 ${devices.length + 1} 台设备在线，展开可查看全部设备。`
-    : "当前共享域只有本机在线。";
+    ? t("app.domain.online_total", { count: devices.length + 1 })
+    : t("app.domain.only_self");
 }
 
 async function scanDevices(): Promise<void> {
@@ -331,9 +407,9 @@ async function scanDevices(): Promise<void> {
   const feedback = getText("scan-feedback");
   if (button) {
     button.disabled = true;
-    button.textContent = "扫描中...";
+    button.textContent = t("app.domain.scanning");
   }
-  feedback.textContent = "正在扫描局域网设备...";
+  feedback.textContent = t("app.scan.scanning");
   try {
     const devices = await invoke<DiscoveredDevice[]>("discover_devices", {
       selectedLocalIp: getSelectedNetworkIp() || null,
@@ -341,15 +417,15 @@ async function scanDevices(): Promise<void> {
     renderDevices(devices);
     feedback.textContent =
       devices.length > 0
-        ? `扫描完成，发现 ${devices.length} 台其他共享域成员在线。`
-        : "扫描完成，当前只有本机在线。";
+        ? t("app.scan.done_found", { count: devices.length })
+        : t("app.scan.done_none");
   } catch (error) {
-    feedback.textContent = `扫描失败：${String(error)}`;
+    feedback.textContent = t("app.scan.failed", { error: String(error) });
     throw error;
   } finally {
     if (button) {
       button.disabled = false;
-      button.textContent = "刷新";
+      button.textContent = t("app.domain.refresh");
     }
   }
 }
@@ -370,11 +446,11 @@ function scheduleNetworkRefresh(): void {
   if (networkRefreshTimer !== null) {
     window.clearTimeout(networkRefreshTimer);
   }
-  getText("scan-feedback").textContent = "网络已切换，正在按当前选择刷新共享域...";
+  getText("scan-feedback").textContent = t("app.network.switched");
   networkRefreshTimer = window.setTimeout(() => {
     networkRefreshTimer = null;
     void refreshDomain().catch((error) => {
-      getText("scan-feedback").textContent = `刷新失败：${String(error)}`;
+      getText("scan-feedback").textContent = t("app.refresh.failed", { error: String(error) });
     });
   }, 180);
 }
@@ -382,8 +458,8 @@ function scheduleNetworkRefresh(): void {
 function validateSharedCode(): boolean {
   const code = getInput("shared-code").value.trim();
   if (!/^\d{6}$/.test(code)) {
-    getText("scan-feedback").textContent = "共享码必须是 6 位数字。";
-    getText("config-feedback").textContent = "共享码必须是 6 位数字，配置未保存。";
+    getText("scan-feedback").textContent = t("app.settings.code_invalid");
+    getText("config-feedback").textContent = t("app.settings.code_invalid_save");
     return false;
   }
   return true;
@@ -407,47 +483,66 @@ function formatBytes(bytes: number): string {
 function transferStatusText(status: string): string {
   switch (status) {
     case "sending":
-      return "发送中";
+      return t("transfer.status.sending");
     case "receiving":
-      return "接收中";
+      return t("transfer.status.receiving");
     case "queued":
-      return "等待写入";
+      return t("transfer.status.pending_apply");
     case "applying":
-      return "写入剪贴板";
+      return t("transfer.status.applying");
     case "retrying":
-      return "重试中";
+      return t("transfer.status.retrying");
     case "completed":
-      return "已完成";
+      return t("transfer.status.completed");
     case "failed":
-      return "失败";
+      return t("transfer.status.failed");
     case "received":
-      return "已接收";
+      return t("transfer.status.received");
     default:
       return status;
   }
 }
 
 function transferDirectionText(direction: string): string {
-  return direction === "send" ? "发送到" : "接收自";
+  return direction === "send" ? t("transfer.send") : t("transfer.recv");
+}
+
+function displayItemLabel(transfer: TransferProgress): string {
+  switch (transfer.item_kind) {
+    case "text":
+      return t("transfer.label.text");
+    case "html":
+      return t("transfer.label.html");
+    case "rtf":
+      return t("transfer.label.rtf");
+    case "image_png":
+      return t("transfer.label.image");
+    case "file_bundle":
+      return transfer.item_label === "文本文件"
+        ? t("transfer.label.text_file")
+        : t("transfer.label.file");
+    default:
+      return transfer.item_label || t("transfer.label.unknown");
+  }
 }
 
 function isTextPreviewTransfer(transfer: TransferProgress): boolean {
-  return ["直接复制文字", "HTML 富文本", "RTF 富文本"].includes(transfer.item_label);
+  return transfer.item_kind === "text" || transfer.item_kind === "html" || transfer.item_kind === "rtf";
 }
 
 function textPreviewLabel(transfer: TransferProgress): string {
-  switch (transfer.item_label) {
-    case "HTML 富文本":
-      return "HTML 内容";
-    case "RTF 富文本":
-      return "RTF 内容";
+  switch (transfer.item_kind) {
+    case "html":
+      return t("transfer.preview.html");
+    case "rtf":
+      return t("transfer.preview.rtf");
     default:
-      return "文字内容";
+      return t("transfer.preview.text");
   }
 }
 
 function renderTransferSummary(transfer: TransferProgress): string {
-  const summary = transfer.item_summary || `${transfer.item_label || "内容"}`;
+  const summary = transfer.item_summary || `${displayItemLabel(transfer)}`;
   if (isTextPreviewTransfer(transfer)) {
     const expanded = expandedTransferIds.has(transfer.id);
     const shouldToggle = summary.length > 180 || summary.includes("\n");
@@ -458,7 +553,7 @@ function renderTransferSummary(transfer: TransferProgress): string {
           shouldToggle
             ? `<button class="transfer-preview-toggle" type="button" data-transfer-id="${escapeHtml(
                 transfer.id,
-              )}">${expanded ? "收起" : "展开"}</button>`
+              )}">${expanded ? escapeHtml(t("app.transfer.collapse")) : escapeHtml(t("app.transfer.expand"))}</button>`
             : ""
         }
       </div>
@@ -496,7 +591,7 @@ function renderTransferProgress(transfers: TransferProgress[]): void {
     }
   });
   if (!transfers.length) {
-    container.innerHTML = `<p class="empty-members">当前没有进行中的传输任务。</p>`;
+    container.innerHTML = `<p class="empty-members">${escapeHtml(t("app.transfer.empty"))}</p>`;
     transferPreviewScrollTops.clear();
     return;
   }
@@ -525,7 +620,7 @@ function renderTransferProgress(transfers: TransferProgress[]): void {
           </div>
           ${renderTransferSummary(transfer)}
           <p class="transfer-meta">${escapeHtml(
-            `${transfer.item_label || "内容"} · ${formatBytes(transfer.transferred_bytes)} / ${formatBytes(
+            `${displayItemLabel(transfer)} · ${formatBytes(transfer.transferred_bytes)} / ${formatBytes(
               transfer.total_bytes,
             )}`,
           )}</p>
@@ -626,9 +721,19 @@ window.addEventListener("DOMContentLoaded", () => {
       scheduleNetworkRefresh();
     },
   );
+  (document.querySelector("#language") as HTMLSelectElement).addEventListener("change", (event) => {
+    draftLanguage = (event.currentTarget as HTMLSelectElement).value.trim() || "auto";
+    setLocale(draftLanguage);
+    renderLanguageOptions(draftLanguage);
+    applyI18nStatic();
+    markConfigDirty();
+    renderDevices(lastDiscovered);
+    void refreshTransferProgress();
+    void refreshStatus();
+  });
   getInput("encryption-enabled").addEventListener("change", markConfigDirty);
 
   boot().catch((error) => {
-    getText("scan-feedback").textContent = `启动错误: ${String(error)}`;
+    getText("scan-feedback").textContent = t("app.boot.failed", { error: String(error) });
   });
 });

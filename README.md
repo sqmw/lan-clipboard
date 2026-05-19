@@ -1,47 +1,60 @@
-# LAN Clipboard (Tauri)
+<p align="center">
+  <img src="./docs/image/lan-clipboard-logo.svg" width="128" alt="LAN Clipboard Logo">
+</p>
 
-同一局域网内的 macOS / Windows 设备共享剪贴板（Tauri UI + Rust Core）。
+<h1 align="center">lan-clipboard</h1>
 
-当前状态（2026-05-18）：
-- 已支持 Win / macOS 双端在同一局域网内同步剪贴板（文本/图片/文件/基础富文本走低延迟推送链路）
-- 已支持大小限制配置落盘、同步开关与运行状态
-- 已切换为“共享域”模型：同一局域网内、填写相同 6 位共享码的所有设备会自动加入同一个共享域并同步
-- 已支持共享域成员自动识别（mDNS + UDP 心跳），刷新按钮用于立即拉取当前缓存与补充扫描
-- 已收敛为纯共享域自动发现模型，不再支持手动填写兜底地址
-- 已切到“监听变化 + 二进制帧推送 + 队列同步”模型：本机剪贴板变化会入队并以原始 bytes 广播到当前共享域成员
-- 已补强可靠性：发现抖动或剪贴板暂时被系统占用时，会走队列重试，不再首个失败就直接丢弃
-- 已支持文件/目录复制：会把剪贴板中的文件列表打包传输到远端，再恢复成可粘贴的文件列表
-- 已支持基础富文本：`HTML / RTF` 会优先于纯文本参与同步
-- 已支持加密传输（AES-GCM-SIV），默认直接使用共享码派生密钥
-- 已优化主界面信息层级，突出设备连接、同步状态和常用操作
-- 已支持多网卡环境手动指定本机使用的网络 IP，避免 Windows 虚拟网卡影响共享域识别
-- 已支持文件发送单次打包、多 peer 复用，以及发送方中途下线时接收端直接丢弃未完成文件流
-- 当前版本仍未把局域网传输速度稳定优化到“吃满带宽”；大文件 / 大图片高吞吐场景仍属于后续优化方向
+<p align="center">
+  <b>同一局域网内的 macOS / Windows 共享剪贴板。</b><br>
+  Tauri UI · Rust Core · 共享域自动发现
+</p>
 
-## 目标与边界
+<p align="center">
+  <a href="https://github.com/sqmw/lan-clipboard/stargazers"><img src="https://img.shields.io/github/stars/sqmw/lan-clipboard?style=for-the-badge&color=f5c542" alt="stars"></a>
+  <a href="https://github.com/sqmw/lan-clipboard/releases/latest"><img src="https://img.shields.io/github/v/release/sqmw/lan-clipboard?style=for-the-badge&color=6c63ff" alt="release"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-brightgreen?style=for-the-badge" alt="license"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey?style=for-the-badge" alt="platform">
+</p>
 
-- 目标：共享剪贴板（优先常用格式），可配置大小限制
-- 安全：局域网默认不可信，配对后建立信任并加密传输（详见 `docs/security.md`）
-- “任何类型”：跨 OS 不承诺“任意格式完全等价”，以“跨平台支持的格式集合”为承诺边界（详见 `docs/protocol.md`）
+<p align="center">
+  <a href="./docs/README.md">📖 文档</a> ·
+  <a href="./docs/dev.md">🧰 开发/联调</a> ·
+  <a href="https://github.com/sqmw/lan-clipboard/issues">🐛 反馈</a> ·
+  <a href="https://github.com/sqmw/lan-clipboard">⭐ Star</a>
+</p>
 
-## 开发
+<p align="center">
+  <b>🇨🇳 中文</b> | <a href="README.en.md"><b>🇬🇧 English</b></a>
+</p>
 
-- 安装：`pnpm install`
-- 运行：`pnpm tauri dev`
+---
 
-## 共享域快速联调（Win + macOS）
+## ✨ 特性
 
-1. 所有待加入的设备连接同一局域网并启动应用。
-2. 在这些设备上填入同一个 6 位“共享码”。
-3. 应用启动后会自动加入已保存的共享域；所有可修改项都放在“同步配置”区域里，改完后点击“保存配置”才会生效。
-4. 界面会自动更新共享域成员；如需立即确认，可点击“刷新”触发一次补充扫描。
-5. 如果设备存在多个网卡或虚拟网卡，在“同步配置”的“使用网络”中手动选择实际局域网 IP，再点击“保存配置”。
-6. 默认启用加密传输，并直接使用共享码作为密钥。
-7. 在共享域内任一设备复制文本、图片、文件/目录或基础富文本，事件会进入发送队列并通过长度前缀二进制帧顺序广播到其他在线成员；如果某一轮发现为空或系统剪贴板正忙，会在短时间内自动重试。
+- **共享域模型**：同一局域网内填写相同 6 位共享码的设备自动加入同一共享域
+- **自动发现**：`mDNS + UDP 心跳` 维护成员缓存；点击“刷新”可立即补充扫描
+- **事件驱动同步**：剪贴板变化入队后以 TCP 二进制帧推送到共享域成员
+- **常用类型**：文本 / 图片(PNG) / 文件与目录 / 基础富文本(HTML/RTF)
+- **加密传输**：可开关，默认使用共享码派生密钥
+- **多网卡支持**：可选择本机使用网络，避免虚拟网卡影响发现
+- **调试友好**：发送/接收进度、类型与预览展示；日志入口收纳在“高级/日志”
 
-## 文档入口
+## 🚀 快速开始（Win + macOS）
+
+1. 两台设备连接同一局域网并启动应用。
+2. 在两端设置相同的 6 位共享码，点击“保存配置”。
+3. 如遇多网卡/虚拟网卡，先在“使用网络”选择实际局域网 IP，再保存。
+4. 点击“刷新”确认成员列表出现对端设备。
+5. 在任意一端复制文本/图片/文件(目录)或富文本，对端可直接粘贴。
+
+## 📚 文档入口
 
 - `docs/README.md`：文档总入口
-- `docs/status.md`：当前支持、边界、关键参数
+- `docs/status.md`：当前支持、边界、关键参数（含吞吐说明）
 - `docs/dev.md`：开发 / 联调 / 排障
 - `docs/todo.md`：里程碑与待办
+
+## ⚠️ 当前边界
+
+- “任何类型”不等于“任意私有剪贴板格式完全等价”；以跨平台支持的格式集合为边界（见 `docs/protocol.md`）
+- 当前版本仍未把局域网传输速度稳定优化到“吃满带宽”；对大文件/大图片高吞吐场景仍需继续优化（见 `docs/status.md` 的“吞吐说明”）

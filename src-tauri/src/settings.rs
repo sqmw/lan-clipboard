@@ -73,6 +73,23 @@ pub struct Settings {
     pub sync: SyncConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// UI language: "", "auto", "zh-CN", "en-US"
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: "auto".to_string(),
+        }
+    }
 }
 
 impl Settings {
