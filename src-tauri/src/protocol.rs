@@ -44,7 +44,8 @@ impl ClipboardPayload {
 pub struct ClipboardItem {
     pub id: String,
     pub content_hash: String,
-    pub created_at_ms: u64,
+    #[serde(alias = "created_at_ms")]
+    pub created_at_us: u64,
     pub source_device_id: String,
     pub size_bytes: u64,
     pub payload: ClipboardPayload,

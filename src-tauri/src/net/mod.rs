@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,9 +25,6 @@ const LOG_LIMIT: usize = 800;
 const DISCOVERY_REFRESH_MS: u64 = 1_000;
 const DISCOVERY_TIMEOUT_MS: u64 = 900;
 const STATUS_DISCOVERY_TIMEOUT_MS: u64 = 350;
-const APPLY_MUTE_MS: u64 = 1_200;
-const APPLY_RICH_TEXT_MUTE_MS: u64 = 2_500;
-const APPLY_FILE_MUTE_MS: u64 = 5_000;
 const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
 const UDP_DISCOVERY_PORT: u16 = 32911;
 const UDP_ANNOUNCE_MS: u64 = 500;
@@ -126,7 +123,7 @@ enum WireBody {
 struct FileStreamStart {
     item_id: String,
     content_hash: String,
-    created_at_ms: u64,
+    created_at_us: u64,
     source_device_id: String,
     size_bytes: u64,
     top_level_names: Vec<String>,
@@ -163,7 +160,6 @@ struct RuntimeInner {
     worker: Mutex<Option<JoinHandle<()>>>,
     last_error: Mutex<Option<String>>,
     active_local_ip: Mutex<Option<String>>,
-    suppress_until_ms: AtomicU64,
     outbound_queue: Mutex<VecDeque<QueueEntry>>,
     inbound_queue: Mutex<VecDeque<QueueEntry>>,
     latest_item: Mutex<Option<ItemMarker>>,
@@ -186,7 +182,6 @@ impl Default for RuntimeInner {
             worker: Mutex::new(None),
             last_error: Mutex::new(None),
             active_local_ip: Mutex::new(None),
-            suppress_until_ms: AtomicU64::new(0),
             outbound_queue: Mutex::new(VecDeque::new()),
             inbound_queue: Mutex::new(VecDeque::new()),
             latest_item: Mutex::new(None),
@@ -242,7 +237,7 @@ struct PresenceConfig {
 #[derive(Debug, Clone)]
 struct ItemMarker {
     id: String,
-    created_at_ms: u64,
+    created_at_us: u64,
     source_device_id: String,
 }
 
@@ -481,10 +476,6 @@ impl Drop for PresenceService {
 
 impl ClipboardHandler for ClipboardWatchHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        if is_clipboard_suppressed(&self.runtime) {
-            return CallbackResult::Next;
-        }
-
         let payload = match clipboard::read_snapshot(&self.limits) {
             Ok(payload) => payload,
             Err(clipboard::ClipboardError::Unsupported) => return CallbackResult::Next,
@@ -872,11 +863,7 @@ fn handle_incoming(
     let mut stream = stream;
     let mut incoming_files: HashMap<String, IncomingFileStream> = HashMap::new();
     loop {
-        let Some((transfer_id, frame_bytes)) = (match read_wire_frame(
-            runtime,
-            &mut stream,
-            remote_addr.as_deref().unwrap_or("未知来源"),
-        ) {
+        let Some(frame_bytes) = (match read_wire_frame(&mut stream) {
             Ok(frame) => Ok(frame),
             Err(error) => {
                 discard_incomplete_incoming_files(
@@ -901,7 +888,6 @@ fn handle_incoming(
             WireBody::ClipboardItem(item) => {
                 handle_incoming_item(
                     runtime,
-                    &transfer_id,
                     remote_addr.as_deref().unwrap_or("未知来源"),
                     item,
                     device_id,
@@ -910,21 +896,44 @@ fn handle_incoming(
             WireBody::FileStreamStart(meta) => {
                 let canonical_transfer_id =
                     format!("recv:{}:{}", meta.source_device_id, meta.item_id);
-                adopt_receive_transfer(
+                upsert_transfer(
                     runtime,
-                    &transfer_id,
-                    &canonical_transfer_id,
-                    remote_addr.as_deref().unwrap_or("未知来源"),
+                    TransferProgress {
+                        id: canonical_transfer_id.clone(),
+                        direction: "receive".to_string(),
+                        peer: remote_addr.as_deref().unwrap_or("未知来源").to_string(),
+                        item_kind: "file_bundle".to_string(),
+                        item_label: file_stream_label(&meta.top_level_names),
+                        item_summary: file_stream_summary(&meta.top_level_names),
+                        item_id: meta.item_id.clone(),
+                        transferred_bytes: 0,
+                        total_bytes: meta.size_bytes,
+                        percent: 0,
+                        status: "receiving".to_string(),
+                        updated_at_ms: now_ms(),
+                        error: None,
+                    },
                 );
-                update_transfer_metadata(
-                    runtime,
-                    &canonical_transfer_id,
-                    "file_bundle",
-                    &file_stream_label(&meta.top_level_names),
-                    &file_stream_summary(&meta.top_level_names),
-                    &meta.item_id,
-                    "receiving",
-                );
+                let marker = file_stream_marker(&meta);
+                if is_stale_marker(runtime, &marker) {
+                    mark_transfer_failed(
+                        runtime,
+                        &canonical_transfer_id,
+                        "已被更新内容替代".to_string(),
+                    );
+                    push_log(
+                        runtime,
+                        "DEBUG",
+                        &format!(
+                            "drop stale inbound file stream start item={} source_device_id={}",
+                            meta.item_id, meta.source_device_id
+                        ),
+                    );
+                    continue;
+                }
+                if update_latest_marker(runtime, marker) {
+                    prune_stale_queue_entries(runtime);
+                }
                 incoming_files.insert(
                     meta.item_id.clone(),
                     IncomingFileStream {
@@ -935,15 +944,27 @@ fn handle_incoming(
                 );
             }
             WireBody::FileStreamChunk { item_id, bytes } => {
+                let should_drop = incoming_files
+                    .get(&item_id)
+                    .map(|file_stream| {
+                        is_stale_marker(runtime, &file_stream_marker(&file_stream.meta))
+                    })
+                    .unwrap_or(false);
+                if should_drop {
+                    if let Some(file_stream) = incoming_files.remove(&item_id) {
+                        let canonical_transfer_id =
+                            format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
+                        mark_transfer_failed(
+                            runtime,
+                            &canonical_transfer_id,
+                            "已被更新内容替代".to_string(),
+                        );
+                    }
+                    continue;
+                }
                 if let Some(file_stream) = incoming_files.get_mut(&item_id) {
                     let canonical_transfer_id =
                         format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
-                    adopt_receive_transfer(
-                        runtime,
-                        &transfer_id,
-                        &canonical_transfer_id,
-                        remote_addr.as_deref().unwrap_or("未知来源"),
-                    );
                     file_stream.archive_bytes.extend_from_slice(&bytes);
                     update_transfer_progress(
                         runtime,
@@ -955,18 +976,20 @@ fn handle_incoming(
             }
             WireBody::FileStreamEnd { item_id } => {
                 if let Some(file_stream) = incoming_files.remove(&item_id) {
-                    let canonical_transfer_id =
-                        format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
-                    adopt_receive_transfer(
-                        runtime,
-                        &transfer_id,
-                        &canonical_transfer_id,
-                        remote_addr.as_deref().unwrap_or("未知来源"),
-                    );
+                    if is_stale_marker(runtime, &file_stream_marker(&file_stream.meta)) {
+                        let canonical_transfer_id =
+                            format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
+                        mark_transfer_failed(
+                            runtime,
+                            &canonical_transfer_id,
+                            "已被更新内容替代".to_string(),
+                        );
+                        continue;
+                    }
                     let item = ClipboardItem {
                         id: file_stream.meta.item_id,
                         content_hash: file_stream.meta.content_hash,
-                        created_at_ms: file_stream.meta.created_at_ms,
+                        created_at_us: file_stream.meta.created_at_us,
                         source_device_id: file_stream.meta.source_device_id,
                         size_bytes: file_stream.archive_bytes.len() as u64,
                         payload: ClipboardPayload::FileBundle {
@@ -974,23 +997,7 @@ fn handle_incoming(
                             top_level_names: file_stream.meta.top_level_names,
                         },
                     };
-                    let canonical_transfer_id = canonical_receive_transfer_id(&item);
-                    update_transfer_metadata(
-                        runtime,
-                        &canonical_transfer_id,
-                        item.payload.kind(),
-                        &payload_label(&item.payload),
-                        &payload_summary(&item.payload),
-                        &item.id,
-                        "received",
-                    );
-                    handle_incoming_item(
-                        runtime,
-                        &canonical_transfer_id,
-                        &file_stream.peer,
-                        item,
-                        device_id,
-                    );
+                    handle_incoming_item(runtime, &file_stream.peer, item, device_id);
                 }
             }
         }
@@ -1024,27 +1031,8 @@ fn discard_incomplete_incoming_files(
     }
 }
 
-fn handle_incoming_item(
-    runtime: &RuntimeInner,
-    transfer_id: &str,
-    peer: &str,
-    item: ClipboardItem,
-    device_id: &str,
-) {
+fn handle_incoming_item(runtime: &RuntimeInner, peer: &str, item: ClipboardItem, device_id: &str) {
     let canonical_transfer_id = canonical_receive_transfer_id(&item);
-    if transfer_id != canonical_transfer_id {
-        adopt_receive_transfer(runtime, transfer_id, &canonical_transfer_id, peer);
-    }
-    update_transfer_metadata(
-        runtime,
-        &canonical_transfer_id,
-        item.payload.kind(),
-        &payload_label(&item.payload),
-        &payload_summary(&item.payload),
-        &item.id,
-        "received",
-    );
-
     if item.source_device_id == device_id {
         return;
     }
@@ -1052,6 +1040,24 @@ fn handle_incoming_item(
     if should_skip_remote_item(runtime, &item) {
         return;
     }
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: canonical_transfer_id.clone(),
+            direction: "receive".to_string(),
+            peer: peer.to_string(),
+            item_kind: item.payload.kind().to_string(),
+            item_label: payload_label(&item.payload),
+            item_summary: payload_summary(&item.payload),
+            item_id: item.id.clone(),
+            transferred_bytes: item.size_bytes,
+            total_bytes: item.size_bytes,
+            percent: 100,
+            status: "received".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
     push_log(
         runtime,
         "INFO",
@@ -1066,11 +1072,7 @@ fn handle_incoming_item(
     enqueue_inbound_item(runtime, item, &canonical_transfer_id, peer);
 }
 
-fn read_wire_frame(
-    runtime: &RuntimeInner,
-    stream: &mut TcpStream,
-    peer: &str,
-) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+fn read_wire_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     match stream.read_exact(&mut len_bytes) {
         Ok(()) => {}
@@ -1084,30 +1086,9 @@ fn read_wire_frame(
         return Err(anyhow::anyhow!("invalid wire frame length: {frame_len}"));
     }
 
-    let transfer_id = format!("recv:{}:{}", peer, now_ms());
-    let total_bytes = frame_len as u64 + 4;
-    upsert_transfer(
-        runtime,
-        TransferProgress {
-            id: transfer_id.clone(),
-            direction: "receive".to_string(),
-            peer: peer.to_string(),
-            item_kind: "识别中".to_string(),
-            item_label: "识别中".to_string(),
-            item_summary: "正在解析内容".to_string(),
-            item_id: String::new(),
-            transferred_bytes: 4,
-            total_bytes,
-            percent: percent_for(4, total_bytes),
-            status: "receiving".to_string(),
-            updated_at_ms: now_ms(),
-            error: None,
-        },
-    );
-
     let mut frame = vec![0u8; frame_len];
-    read_exact_with_progress(runtime, stream, &mut frame, &transfer_id, total_bytes, 4)?;
-    Ok(Some((transfer_id, frame)))
+    read_exact_with_progress(stream, &mut frame)?;
+    Ok(Some(frame))
 }
 
 struct BroadcastReport {
@@ -1343,7 +1324,7 @@ fn send_file_list_to_peer(
     let start = WireBody::FileStreamStart(FileStreamStart {
         item_id: item.id.clone(),
         content_hash: item.content_hash.clone(),
-        created_at_ms: item.created_at_ms,
+        created_at_us: item.created_at_us,
         source_device_id: item.source_device_id.clone(),
         size_bytes: prepared.size_bytes,
         top_level_names: prepared.top_level_names.clone(),
@@ -1363,6 +1344,7 @@ fn send_file_list_to_peer(
         settings,
         &mut stream,
         prepared,
+        item,
         &item.id,
         &transfer_id,
     ) {
@@ -1469,6 +1451,7 @@ fn stream_prepared_archive_to_peer(
     settings: &Settings,
     stream: &mut TcpStream,
     prepared: &PreparedFileArchive,
+    item: &ClipboardItem,
     item_id: &str,
     transfer_id: &str,
 ) -> anyhow::Result<()> {
@@ -1477,6 +1460,9 @@ fn stream_prepared_archive_to_peer(
     let mut sent_archive_bytes = 0u64;
 
     loop {
+        if is_stale_marker(runtime, &item_marker(item)) {
+            return Err(anyhow::anyhow!("superseded by newer clipboard item"));
+        }
         let read_bytes = file.read(&mut buffer)?;
         if read_bytes == 0 {
             break;
@@ -1517,24 +1503,12 @@ fn write_wire_body_to_stream(
     Ok(())
 }
 
-fn read_exact_with_progress(
-    runtime: &RuntimeInner,
-    stream: &mut TcpStream,
-    buffer: &mut [u8],
-    transfer_id: &str,
-    total_bytes: u64,
-    initial_bytes: u64,
-) -> anyhow::Result<()> {
+fn read_exact_with_progress(stream: &mut TcpStream, buffer: &mut [u8]) -> anyhow::Result<()> {
     let mut offset = 0usize;
     while offset < buffer.len() {
         let end = (offset + TRANSFER_CHUNK_BYTES).min(buffer.len());
-        if let Err(error) = stream.read_exact(&mut buffer[offset..end]) {
-            mark_transfer_failed(runtime, transfer_id, error.to_string());
-            return Err(error.into());
-        }
+        stream.read_exact(&mut buffer[offset..end])?;
         offset = end;
-        let transferred_bytes = initial_bytes + offset as u64;
-        update_transfer_progress(runtime, transfer_id, transferred_bytes, total_bytes);
     }
     Ok(())
 }
@@ -1564,9 +1538,14 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
         let Some(mut entry) = pop_ready_queue_entry(&runtime.inbound_queue) else {
             break;
         };
+        if is_stale_marker(runtime, &item_marker(&entry.item)) {
+            if let Some(transfer_id) = find_receive_transfer_id(runtime, &entry.item.id) {
+                mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
+            }
+            continue;
+        }
 
         register_ignored_local_hash(runtime, &entry.item.content_hash);
-        set_clipboard_suppressed(runtime, apply_mute_duration_ms(&entry.item));
         let transfer_id = find_receive_transfer_id(runtime, &entry.item.id);
         if let Some(transfer_id) = transfer_id.as_deref() {
             update_transfer_metadata(
@@ -1650,15 +1629,19 @@ fn process_outbound_queue(
     settings: &Settings,
     allowed_lanes: &[QueueLane],
 ) {
-    if is_clipboard_suppressed(runtime) {
-        return;
-    }
-
     loop {
         let Some(mut entry) = pop_ready_outbound_entry(&runtime.outbound_queue, allowed_lanes)
         else {
             break;
         };
+        if is_stale_marker(runtime, &item_marker(&entry.item)) {
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("drop stale outbound item {}", entry.item.id),
+            );
+            continue;
+        }
 
         let report = send_to_all_peers(runtime, settings, &entry.item);
         if report.attempted == 0 {
@@ -1765,7 +1748,7 @@ fn compare_outbound_entries(left: &QueueEntry, right: &QueueEntry) -> std::cmp::
         .cmp(&outbound_phase_rank(right))
         .reverse()
         .then_with(|| outbound_lane(left).cmp(&outbound_lane(right)).reverse())
-        .then_with(|| left.item.created_at_ms.cmp(&right.item.created_at_ms))
+        .then_with(|| left.item.created_at_us.cmp(&right.item.created_at_us))
         .then_with(|| right.attempts.cmp(&left.attempts))
         .then_with(|| left.queued_at_ms.cmp(&right.queued_at_ms))
 }
@@ -1815,9 +1798,25 @@ fn new_queue_entry(item: ClipboardItem) -> QueueEntry {
 
 fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<String> {
     prune_stale_discovered_devices(runtime);
+    let active_local_ip = runtime
+        .active_local_ip
+        .lock()
+        .ok()
+        .and_then(|guard| (*guard).clone());
+    let effective_local_ip = selected_or_active_local_ip(settings, None, active_local_ip);
+    let selected_ipv4 = parse_selected_ipv4(effective_local_ip.as_deref())
+        .ok()
+        .flatten();
     let mut peer_by_ip = HashMap::new();
     if let Ok(guard) = runtime.discovered_devices.lock() {
         for device in guard.iter() {
+            if let Some(selected_ipv4) = selected_ipv4 {
+                if let Ok(peer_ipv4) = device.addr.parse::<std::net::Ipv4Addr>() {
+                    if !is_same_subnet(selected_ipv4, peer_ipv4) {
+                        continue;
+                    }
+                }
+            }
             let peer = format!("{}:{}", device.addr, device.port);
             if let Ok(socket_addr) = peer.parse::<SocketAddr>() {
                 peer_by_ip.insert(socket_addr.ip().to_string(), peer);
@@ -1830,6 +1829,13 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
                 let normalized = normalize_peer(addr, settings.sync.listen_port);
                 if is_expected_listen_addr(&normalized, settings.sync.listen_port) {
                     if let Ok(socket_addr) = normalized.parse::<SocketAddr>() {
+                        if let Some(selected_ipv4) = selected_ipv4 {
+                            if let std::net::IpAddr::V4(peer_ipv4) = socket_addr.ip() {
+                                if !is_same_subnet(selected_ipv4, peer_ipv4) {
+                                    continue;
+                                }
+                            }
+                        }
                         peer_by_ip
                             .entry(socket_addr.ip().to_string())
                             .or_insert(normalized);
@@ -1950,7 +1956,6 @@ fn clear_member_cache(runtime: &RuntimeInner) {
         }
         guard.clear();
     }
-    runtime.suppress_until_ms.store(0, Ordering::SeqCst);
 }
 
 fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevice>) {
@@ -2041,13 +2046,13 @@ pub fn build_item(payload: &ClipboardPayload, device_id: &str) -> Option<Clipboa
         return None;
     }
 
-    let created_at_ms = now_ms();
+    let created_at_us = now_us();
     let content_hash = payload_hash(&payload_bytes);
 
     Some(ClipboardItem {
         id: Uuid::new_v4().to_string(),
         content_hash,
-        created_at_ms,
+        created_at_us,
         source_device_id: device_id.to_string(),
         size_bytes,
         payload: payload.clone(),
@@ -2311,16 +2316,6 @@ fn payload_hash(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn is_clipboard_suppressed(runtime: &RuntimeInner) -> bool {
-    runtime.suppress_until_ms.load(Ordering::SeqCst) > now_ms()
-}
-
-fn set_clipboard_suppressed(runtime: &RuntimeInner, duration_ms: u64) {
-    runtime
-        .suppress_until_ms
-        .store(now_ms().saturating_add(duration_ms), Ordering::SeqCst);
-}
-
 fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -> bool {
     if recent_applied_hash_seen(runtime, content_hash) {
         return true;
@@ -2365,16 +2360,6 @@ fn prune_ignored_local_hashes(runtime: &RuntimeInner) {
     }
 }
 
-fn apply_mute_duration_ms(item: &ClipboardItem) -> u64 {
-    match &item.payload {
-        ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => {
-            APPLY_FILE_MUTE_MS
-        }
-        ClipboardPayload::Html { .. } | ClipboardPayload::Rtf { .. } => APPLY_RICH_TEXT_MUTE_MS,
-        _ => APPLY_MUTE_MS,
-    }
-}
-
 fn recent_event_seen(runtime: &RuntimeInner, event_id: &str) -> bool {
     runtime
         .recent_event_ids
@@ -2414,21 +2399,28 @@ fn prune_prepared_archives(runtime: &RuntimeInner) {
 fn item_marker(item: &ClipboardItem) -> ItemMarker {
     ItemMarker {
         id: item.id.clone(),
-        created_at_ms: item.created_at_ms,
+        created_at_us: item.created_at_us,
         source_device_id: item.source_device_id.clone(),
     }
 }
 
+fn file_stream_marker(meta: &FileStreamStart) -> ItemMarker {
+    ItemMarker {
+        id: meta.item_id.clone(),
+        created_at_us: meta.created_at_us,
+        source_device_id: meta.source_device_id.clone(),
+    }
+}
+
 fn compare_markers(left: &ItemMarker, right: &ItemMarker) -> std::cmp::Ordering {
-    left.created_at_ms
-        .cmp(&right.created_at_ms)
+    left.created_at_us
+        .cmp(&right.created_at_us)
         .then_with(|| left.source_device_id.cmp(&right.source_device_id))
         .then_with(|| left.id.cmp(&right.id))
 }
 
-fn update_latest_item(runtime: &RuntimeInner, item: &ClipboardItem) {
+fn update_latest_marker(runtime: &RuntimeInner, marker: ItemMarker) -> bool {
     if let Ok(mut guard) = runtime.latest_item.lock() {
-        let marker = item_marker(item);
         let replace = guard
             .as_ref()
             .map(|current| compare_markers(&marker, current).is_gt())
@@ -2436,6 +2428,66 @@ fn update_latest_item(runtime: &RuntimeInner, item: &ClipboardItem) {
         if replace {
             *guard = Some(marker);
         }
+        return replace;
+    }
+    false
+}
+
+fn update_latest_item(runtime: &RuntimeInner, item: &ClipboardItem) -> bool {
+    update_latest_marker(runtime, item_marker(item))
+}
+
+fn is_stale_marker(runtime: &RuntimeInner, marker: &ItemMarker) -> bool {
+    runtime
+        .latest_item
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|current| compare_markers(marker, &current).is_lt())
+        .unwrap_or(false)
+}
+
+fn prune_stale_queue_entries(runtime: &RuntimeInner) {
+    let latest = runtime
+        .latest_item
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let Some(latest) = latest else {
+        return;
+    };
+
+    let mut dropped_outbound = 0usize;
+    if let Ok(mut guard) = runtime.outbound_queue.lock() {
+        guard.retain(|entry| {
+            let keep = !compare_markers(&item_marker(&entry.item), &latest).is_lt();
+            if !keep {
+                dropped_outbound += 1;
+            }
+            keep
+        });
+    }
+
+    let mut dropped_inbound = 0usize;
+    if let Ok(mut guard) = runtime.inbound_queue.lock() {
+        guard.retain(|entry| {
+            let keep = !compare_markers(&item_marker(&entry.item), &latest).is_lt();
+            if !keep {
+                dropped_inbound += 1;
+            }
+            keep
+        });
+    }
+
+    if dropped_outbound > 0 || dropped_inbound > 0 {
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!(
+                "pruned stale queue entries outbound={} inbound={}",
+                dropped_outbound, dropped_inbound
+            ),
+        );
     }
 }
 
@@ -2445,24 +2497,23 @@ fn should_skip_remote_item(runtime: &RuntimeInner, item: &ClipboardItem) -> bool
     }
 
     let marker = item_marker(item);
-    let should_skip = runtime
-        .latest_item
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .map(|current| compare_markers(&marker, &current).is_lt())
-        .unwrap_or(false);
+    let should_skip = is_stale_marker(runtime, &marker);
 
     if should_skip {
         return true;
     }
 
     register_recent_event(runtime, &item.id);
-    update_latest_item(runtime, item);
+    if update_latest_item(runtime, item) {
+        prune_stale_queue_entries(runtime);
+    }
     false
 }
 
 fn enqueue_outbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
+    if update_latest_item(runtime, &item) {
+        prune_stale_queue_entries(runtime);
+    }
     let item_id = item.id.clone();
     let kind = item.payload.kind();
     let size_bytes = item.size_bytes;
@@ -2480,6 +2531,9 @@ fn enqueue_inbound_item(
     transfer_id: &str,
     peer: &str,
 ) {
+    if update_latest_item(runtime, &item) {
+        prune_stale_queue_entries(runtime);
+    }
     let item_id = item.id.clone();
     let source = item.source_device_id.clone();
     let kind = item.payload.kind();
@@ -2658,46 +2712,6 @@ fn canonical_receive_transfer_id(item: &ClipboardItem) -> String {
     format!("recv:{}:{}", item.source_device_id, item.id)
 }
 
-fn adopt_receive_transfer(
-    runtime: &RuntimeInner,
-    transient_id: &str,
-    canonical_id: &str,
-    peer: &str,
-) {
-    if let Ok(mut guard) = runtime.transfers.lock() {
-        let transient_index = guard.iter().position(|entry| entry.id == transient_id);
-        let canonical_index = guard.iter().position(|entry| entry.id == canonical_id);
-
-        match (transient_index, canonical_index) {
-            (Some(transient_index), Some(canonical_index))
-                if transient_index != canonical_index =>
-            {
-                let transient = guard[transient_index].clone();
-                if let Some(existing) = guard.get_mut(canonical_index) {
-                    existing.peer = peer.to_string();
-                    existing.transferred_bytes =
-                        existing.transferred_bytes.max(transient.transferred_bytes);
-                    existing.total_bytes = existing.total_bytes.max(transient.total_bytes);
-                    existing.percent = existing.percent.max(transient.percent);
-                    existing.updated_at_ms = now_ms();
-                    if existing.item_summary.is_empty() {
-                        existing.item_summary = transient.item_summary;
-                    }
-                }
-                guard.remove(transient_index);
-            }
-            (Some(transient_index), None) => {
-                if let Some(entry) = guard.get_mut(transient_index) {
-                    entry.id = canonical_id.to_string();
-                    entry.peer = peer.to_string();
-                    entry.updated_at_ms = now_ms();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn percent_for(transferred_bytes: u64, total_bytes: u64) -> u8 {
     if total_bytes == 0 {
         return 0;
@@ -2752,6 +2766,14 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_micros() as u64)
         .unwrap_or(0)
 }
 
