@@ -5,7 +5,7 @@ use image::imageops::FilterType as ResizeFilterType;
 use image::ImageEncoder;
 use image::RgbaImage;
 use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -291,6 +291,27 @@ pub(crate) fn stream_file_bundle_archive<W: Write>(
     }
     builder
         .finish()
+        .map_err(|e| ClipboardError::Backend(e.to_string()))
+}
+
+pub(crate) fn write_file_bundle_archive_to_path(
+    file_paths: &[PathBuf],
+    archive_path: &Path,
+) -> Result<u64, ClipboardError> {
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    }
+    let file = File::create(archive_path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    stream_file_bundle_archive(file_paths, &mut writer)?;
+    writer
+        .flush()
+        .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    let file = writer
+        .into_inner()
+        .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    file.metadata()
+        .map(|metadata| metadata.len())
         .map_err(|e| ClipboardError::Backend(e.to_string()))
 }
 

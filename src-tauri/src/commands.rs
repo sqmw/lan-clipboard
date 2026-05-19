@@ -22,9 +22,6 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
 
     if let Ok(Some(mut loaded)) = Settings::load(&path) {
         loaded.ensure_sync_identifiers();
-        if loaded.sync.peers.is_empty() {
-            loaded.sync.peers = Vec::new();
-        }
         let _ = loaded.save(&path);
         *guard = loaded;
     }
@@ -104,26 +101,25 @@ pub fn stop_sync(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn sync_status(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+pub fn sync_status(
+    state: State<'_, AppState>,
+    selected_local_ip: Option<String>,
+) -> Result<RuntimeStatus, String> {
     let settings = state
         .settings
         .lock()
         .map_err(|_| "settings lock poisoned".to_string())?
         .clone();
-    Ok(state.sync_engine.status(&settings))
+    Ok(state
+        .sync_engine
+        .status(&settings, selected_local_ip.as_deref()))
 }
 
 #[tauri::command]
-pub fn list_devices(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let settings = state
-        .settings
-        .lock()
-        .map_err(|_| "settings lock poisoned".to_string())?;
-    Ok(settings.sync.peers.clone())
-}
-
-#[tauri::command]
-pub fn discover_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevice>, String> {
+pub fn discover_devices(
+    state: State<'_, AppState>,
+    selected_local_ip: Option<String>,
+) -> Result<Vec<DiscoveredDevice>, String> {
     let settings = state
         .settings
         .lock()
@@ -133,16 +129,23 @@ pub fn discover_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevi
         .presence_service
         .ensure(settings.clone(), settings.sync_device_id())
         .map_err(|e| e.to_string())?;
-    let devices =
-        net::discover_devices(&settings.sync_device_id(), &settings.sync.shared_code, 2200)
-            .map_err(|e| e.to_string())?;
+    let devices = net::discover_devices(
+        &settings.sync_device_id(),
+        &settings.sync.shared_code,
+        selected_local_ip.as_deref(),
+        2200,
+    )
+    .map_err(|e| e.to_string())?;
     state.sync_engine.merge_discovered_devices(devices);
-    Ok(state.sync_engine.devices())
+    Ok(state.sync_engine.devices(selected_local_ip.as_deref()))
 }
 
 #[tauri::command]
-pub fn cached_devices(state: State<'_, AppState>) -> Result<Vec<DiscoveredDevice>, String> {
-    Ok(state.sync_engine.devices())
+pub fn cached_devices(
+    state: State<'_, AppState>,
+    selected_local_ip: Option<String>,
+) -> Result<Vec<DiscoveredDevice>, String> {
+    Ok(state.sync_engine.devices(selected_local_ip.as_deref()))
 }
 
 #[tauri::command]

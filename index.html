@@ -71,21 +71,13 @@
         <details class="advanced">
           <summary>高级 / 日志</summary>
           <div class="panel-sub">
-            <h3>兜底地址</h3>
-            <label>
-              手动添加共享域补充地址（每行一个 ip 或 ip:port）
-              <textarea id="peers" rows="3"></textarea>
-            </label>
-          </div>
-          <div class="panel-sub">
             <h3>高级加密</h3>
             <label class="compact-toggle-row">
-              <span>加密传输</span>
-              <input id="encryption-enabled" type="checkbox" />
-            </label>
-            <label>
-              自定义配对码（留空时默认使用共享码）
-              <input id="pairing-code" type="password" placeholder="可选：为共享码再叠加一层密钥" />
+              <span class="compact-toggle-label">加密传输</span>
+              <span class="switch">
+                <input id="encryption-enabled" type="checkbox" />
+                <span class="switch-slider" aria-hidden="true"></span>
+              </span>
             </label>
           </div>
           <div class="panel-sub">

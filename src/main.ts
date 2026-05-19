@@ -10,12 +10,10 @@ type Settings = {
     enabled: boolean;
     local_ip: string;
     listen_port: number;
-    peers: string[];
     poll_interval_ms: number;
   };
   security: {
     encryption_enabled: boolean;
-    pairing_code: string;
   };
 };
 
@@ -67,8 +65,6 @@ type TransferProgress = {
 
 const getInput = (id: string): HTMLInputElement =>
   document.querySelector(`#${id}`) as HTMLInputElement;
-const getTextArea = (id: string): HTMLTextAreaElement =>
-  document.querySelector(`#${id}`) as HTMLTextAreaElement;
 const getText = (id: string): HTMLElement =>
   document.querySelector(`#${id}`) as HTMLElement;
 const MIN_MAX_ITEM_MB = 1;
@@ -86,17 +82,25 @@ const expandedTransferIds = new Set<string>();
 const transferPreviewScrollTops = new Map<string, number>();
 let isTransferPreviewInteracting = false;
 let transferPreviewIdleTimer: number | null = null;
+let networkRefreshTimer: number | null = null;
+let draftSelectedNetworkIp: string | null = null;
+
+function getSelectedNetworkIp(): string {
+  if (draftSelectedNetworkIp !== null) {
+    return draftSelectedNetworkIp;
+  }
+  return (document.querySelector("#network-ip") as HTMLSelectElement | null)?.value.trim() ?? "";
+}
 
 async function loadSettings(): Promise<void> {
   settings = await invoke<Settings>("get_settings");
   networkOptions = await invoke<NetworkInterfaceOption[]>("list_network_interfaces");
-  getTextArea("peers").value = settings.sync.peers.join("\n");
   getInput("encryption-enabled").checked = settings.security.encryption_enabled;
-  getInput("pairing-code").value = settings.security.pairing_code;
   getInput("shared-code").value = settings.sync.shared_code;
   const mb = Math.max(1, Math.round(settings.limits.max_item_bytes / (1024 * 1024)));
   getInput("max-item-mb").value = String(mb);
-  renderNetworkOptions(settings.sync.local_ip);
+  draftSelectedNetworkIp = settings.sync.local_ip;
+  renderNetworkOptions(draftSelectedNetworkIp);
 }
 
 function renderNetworkOptions(selectedIp: string): void {
@@ -181,11 +185,6 @@ function isPrivateIpv4(ip: string): boolean {
 }
 
 function collectSettings(): Settings {
-  const peers = getTextArea("peers")
-    .value.split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
   const mb = Number(getInput("max-item-mb").value);
   const normalizedMb = Math.max(
     MIN_MAX_ITEM_MB,
@@ -204,12 +203,10 @@ function collectSettings(): Settings {
       shared_code: getInput("shared-code").value.trim(),
       enabled: true,
       local_ip: (document.querySelector("#network-ip") as HTMLSelectElement).value.trim(),
-      peers,
     },
     security: {
       ...settings.security,
       encryption_enabled: getInput("encryption-enabled").checked,
-      pairing_code: getInput("pairing-code").value.trim(),
     },
   };
 }
@@ -233,6 +230,7 @@ async function saveSettings(): Promise<void> {
   try {
     await invoke("set_settings", { next: settings });
     await invoke("start_sync");
+    draftSelectedNetworkIp = settings.sync.local_ip;
     observedMemberCount = 1;
     await refreshDomain();
     await refreshLogs();
@@ -248,9 +246,11 @@ async function saveSettings(): Promise<void> {
 }
 
 async function refreshStatus(): Promise<void> {
-  const status = await invoke<RuntimeStatus>("sync_status");
+  const status = await invoke<RuntimeStatus>("sync_status", {
+    selectedLocalIp: getSelectedNetworkIp() || null,
+  });
   currentStatus = status;
-  renderNetworkOptions(settings.sync.local_ip);
+  renderNetworkOptions(getSelectedNetworkIp());
   getText("status-running").textContent = `状态: ${status.running ? "运行中" : "已停止"}`;
   observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
   getText("status-peer-count").textContent = `共享域成员（含本机）: ${observedMemberCount}`;
@@ -317,7 +317,7 @@ function renderDevices(devices: DiscoveredDevice[]): void {
       }
     });
   }
-  renderNetworkOptions(settings.sync.local_ip);
+  renderNetworkOptions(getSelectedNetworkIp());
   feedback.textContent = devices.length
     ? `当前共享域共有 ${devices.length + 1} 台设备在线，展开可查看全部设备。`
     : "当前共享域只有本机在线。";
@@ -335,7 +335,9 @@ async function scanDevices(): Promise<void> {
   }
   feedback.textContent = "正在扫描局域网设备...";
   try {
-    const devices = await invoke<DiscoveredDevice[]>("discover_devices");
+    const devices = await invoke<DiscoveredDevice[]>("discover_devices", {
+      selectedLocalIp: getSelectedNetworkIp() || null,
+    });
     renderDevices(devices);
     feedback.textContent =
       devices.length > 0
@@ -353,13 +355,28 @@ async function scanDevices(): Promise<void> {
 }
 
 async function refreshCachedDevices(): Promise<void> {
-  const devices = await invoke<DiscoveredDevice[]>("cached_devices");
+  const devices = await invoke<DiscoveredDevice[]>("cached_devices", {
+    selectedLocalIp: getSelectedNetworkIp() || null,
+  });
   renderDevices(devices);
 }
 
 async function refreshDomain(): Promise<void> {
   await scanDevices();
   await refreshStatus();
+}
+
+function scheduleNetworkRefresh(): void {
+  if (networkRefreshTimer !== null) {
+    window.clearTimeout(networkRefreshTimer);
+  }
+  getText("scan-feedback").textContent = "网络已切换，正在按当前选择刷新共享域...";
+  networkRefreshTimer = window.setTimeout(() => {
+    networkRefreshTimer = null;
+    void refreshDomain().catch((error) => {
+      getText("scan-feedback").textContent = `刷新失败：${String(error)}`;
+    });
+  }, 180);
 }
 
 function validateSharedCode(): boolean {
@@ -598,16 +615,18 @@ window.addEventListener("DOMContentLoaded", () => {
   [
     "shared-code",
     "max-item-mb",
-    "pairing-code",
   ].forEach((id) => {
     getInput(id).addEventListener("input", markConfigDirty);
   });
   (document.querySelector("#network-ip") as HTMLSelectElement).addEventListener(
     "change",
-    markConfigDirty,
+    (event) => {
+      draftSelectedNetworkIp = (event.currentTarget as HTMLSelectElement).value.trim();
+      markConfigDirty();
+      scheduleNetworkRefresh();
+    },
   );
   getInput("encryption-enabled").addEventListener("change", markConfigDirty);
-  getTextArea("peers").addEventListener("input", markConfigDirty);
 
   boot().catch((error) => {
     getText("scan-feedback").textContent = `启动错误: ${String(error)}`;

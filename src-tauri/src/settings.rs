@@ -35,7 +35,6 @@ pub struct SyncConfig {
     pub enabled: bool,
     pub local_ip: String,
     pub listen_port: u16,
-    pub peers: Vec<String>,
     pub poll_interval_ms: u64,
 }
 
@@ -47,7 +46,6 @@ impl Default for SyncConfig {
             enabled: true,
             local_ip: String::new(),
             listen_port: 32910,
-            peers: Vec::new(),
             poll_interval_ms: 900,
         }
     }
@@ -57,16 +55,12 @@ impl Default for SyncConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub encryption_enabled: bool,
-    pub require_pairing_code: bool,
-    pub pairing_code: String,
 }
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             encryption_enabled: true,
-            require_pairing_code: false,
-            pairing_code: String::new(),
         }
     }
 }

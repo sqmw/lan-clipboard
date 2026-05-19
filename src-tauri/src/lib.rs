@@ -31,7 +31,6 @@ pub fn run() {
             commands::start_sync,
             commands::stop_sync,
             commands::sync_status,
-            commands::list_devices,
             commands::discover_devices,
             commands::cached_devices,
             commands::list_network_interfaces,

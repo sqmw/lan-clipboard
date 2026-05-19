@@ -8,9 +8,12 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -44,8 +47,12 @@ const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 50;
 const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const FILE_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
+const HIGH_PRIORITY_YIELD_MS: u64 = 12;
+const PREPARED_ARCHIVE_TTL_MS: u64 = 120_000;
+const TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
@@ -131,6 +138,14 @@ struct IncomingFileStream {
     peer: String,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedFileArchive {
+    path: PathBuf,
+    size_bytes: u64,
+    top_level_names: Vec<String>,
+    prepared_at: Instant,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscoveryAnnouncement {
     pub v: u8,
@@ -160,6 +175,7 @@ struct RuntimeInner {
     discovered_devices: Mutex<Vec<DiscoveredDevice>>,
     discovered_seen_at: Mutex<HashMap<String, Instant>>,
     known_members: Mutex<HashSet<String>>,
+    prepared_archives: Mutex<HashMap<String, PreparedFileArchive>>,
 }
 
 impl Default for RuntimeInner {
@@ -182,6 +198,7 @@ impl Default for RuntimeInner {
             discovered_devices: Mutex::new(Vec::new()),
             discovered_seen_at: Mutex::new(HashMap::new()),
             known_members: Mutex::new(HashSet::new()),
+            prepared_archives: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -243,6 +260,13 @@ struct QueueEntry {
     next_attempt_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum QueueLane {
+    Realtime,
+    Visual,
+    Bulk,
+}
+
 struct ClipboardWatchHandler {
     runtime: Arc<RuntimeInner>,
     limits: crate::settings::SizeLimits,
@@ -251,13 +275,14 @@ struct ClipboardWatchHandler {
 }
 
 impl SyncEngine {
-    pub fn status(&self, settings: &Settings) -> RuntimeStatus {
+    pub fn status(&self, settings: &Settings, selected_local_ip: Option<&str>) -> RuntimeStatus {
         if self.inner.running.load(Ordering::SeqCst) && cached_member_signal_count(&self.inner) == 0
         {
             refresh_discovered_devices(
                 &self.inner,
                 settings,
                 &settings.sync_device_id(),
+                selected_local_ip,
                 STATUS_DISCOVERY_TIMEOUT_MS,
             );
         }
@@ -274,12 +299,14 @@ impl SyncEngine {
             .ok()
             .and_then(|guard| (*guard).clone());
         let recent_log_count = self.inner.logs.lock().map(|guard| guard.len()).unwrap_or(0);
-        let peer_count = current_member_count(&self.inner, settings);
+        let effective_local_ip =
+            selected_or_active_local_ip(settings, selected_local_ip, active_local_ip.clone());
+        let peer_count = visible_member_count(&self.inner, effective_local_ip.as_deref());
         RuntimeStatus {
             running: self.inner.running.load(Ordering::SeqCst),
             device_id: settings.sync_device_id(),
             device_name: local_device_name(),
-            local_ip: selected_or_active_local_ip(settings, active_local_ip),
+            local_ip: effective_local_ip,
             shared_code: settings.sync.shared_code.clone(),
             last_error: error,
             recent_log_count,
@@ -318,13 +345,15 @@ impl SyncEngine {
             .unwrap_or_default()
     }
 
-    pub fn devices(&self) -> Vec<DiscoveredDevice> {
+    pub fn devices(&self, selected_local_ip: Option<&str>) -> Vec<DiscoveredDevice> {
         prune_stale_discovered_devices(&self.inner);
-        self.inner
+        let devices = self
+            .inner
             .discovered_devices
             .lock()
             .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        filter_devices_for_local_ip(devices, selected_local_ip)
     }
 
     pub fn merge_discovered_devices(&self, devices: Vec<DiscoveredDevice>) {
@@ -352,10 +381,8 @@ impl SyncEngine {
         self.log(
             "INFO",
             &format!(
-                "sync starting shared_code={} port={} static_peers={}",
-                settings.sync.shared_code,
-                settings.sync.listen_port,
-                settings.sync.peers.len()
+                "sync starting shared_code={} port={}",
+                settings.sync.shared_code, settings.sync.listen_port
             ),
         );
 
@@ -596,6 +623,39 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
         })
         .ok();
 
+    let inbound_runtime = Arc::clone(&runtime);
+    let inbound_settings = settings.clone();
+    let inbound_worker = std::thread::Builder::new()
+        .name("lan-clipboard-inbound-apply".to_string())
+        .spawn(move || run_inbound_apply_loop(inbound_runtime, inbound_settings))
+        .ok();
+
+    let priority_outbound_runtime = Arc::clone(&runtime);
+    let priority_outbound_settings = settings.clone();
+    let priority_outbound_worker = std::thread::Builder::new()
+        .name("lan-clipboard-outbound-priority".to_string())
+        .spawn(move || {
+            run_outbound_dispatch_loop(
+                priority_outbound_runtime,
+                priority_outbound_settings,
+                &[QueueLane::Realtime, QueueLane::Visual],
+            )
+        })
+        .ok();
+
+    let bulk_outbound_runtime = Arc::clone(&runtime);
+    let bulk_outbound_settings = settings.clone();
+    let bulk_outbound_worker = std::thread::Builder::new()
+        .name("lan-clipboard-outbound-bulk".to_string())
+        .spawn(move || {
+            run_outbound_dispatch_loop(
+                bulk_outbound_runtime,
+                bulk_outbound_settings,
+                &[QueueLane::Bulk],
+            )
+        })
+        .ok();
+
     while !runtime.stop_flag.load(Ordering::SeqCst) {
         if let Some(socket) = udp_socket.as_ref() {
             receive_udp_announcements(&runtime, &settings, &device_id, socket);
@@ -607,7 +667,13 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
         if last_discovery.elapsed() >= Duration::from_millis(DISCOVERY_REFRESH_MS) {
             if !has_active_transfers(&runtime) {
-                refresh_discovered_devices(&runtime, &settings, &device_id, DISCOVERY_TIMEOUT_MS);
+                refresh_discovered_devices(
+                    &runtime,
+                    &settings,
+                    &device_id,
+                    Some(settings.sync.local_ip.as_str()),
+                    DISCOVERY_TIMEOUT_MS,
+                );
             }
             last_discovery = Instant::now();
         }
@@ -615,21 +681,21 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                let _ = stream.set_nodelay(true);
-                let _ = stream
-                    .set_read_timeout(Some(write_timeout_for_payload(MAX_WIRE_FRAME_BYTES as u64)));
-                if let Err(error) = handle_incoming(&runtime, &settings, stream, &device_id) {
-                    set_error(&runtime, format!("incoming handler failed: {error}"));
-                }
+                tune_stream_for_receive(&stream, MAX_WIRE_FRAME_BYTES as u64);
+                spawn_incoming_connection_worker(
+                    Arc::clone(&runtime),
+                    settings.clone(),
+                    device_id.clone(),
+                    stream,
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => set_error(&runtime, format!("listener accept failed: {error}")),
         }
 
-        process_inbound_queue(&runtime, &settings);
-        process_outbound_queue(&runtime, &settings);
         prune_ignored_local_hashes(&runtime);
         prune_recent_event_ids(&runtime);
+        prune_prepared_archives(&runtime);
 
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -637,7 +703,49 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     if let Some(handle) = watcher {
         let _ = handle.join();
     }
+    if let Some(handle) = inbound_worker {
+        let _ = handle.join();
+    }
+    if let Some(handle) = priority_outbound_worker {
+        let _ = handle.join();
+    }
+    if let Some(handle) = bulk_outbound_worker {
+        let _ = handle.join();
+    }
     runtime.running.store(false, Ordering::SeqCst);
+}
+
+fn run_inbound_apply_loop(runtime: Arc<RuntimeInner>, settings: Settings) {
+    while !runtime.stop_flag.load(Ordering::SeqCst) {
+        process_inbound_queue(&runtime, &settings);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_outbound_dispatch_loop(
+    runtime: Arc<RuntimeInner>,
+    settings: Settings,
+    allowed_lanes: &'static [QueueLane],
+) {
+    while !runtime.stop_flag.load(Ordering::SeqCst) {
+        process_outbound_queue(&runtime, &settings, allowed_lanes);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_incoming_connection_worker(
+    runtime: Arc<RuntimeInner>,
+    settings: Settings,
+    device_id: String,
+    stream: TcpStream,
+) {
+    let _ = std::thread::Builder::new()
+        .name("lan-clipboard-incoming".to_string())
+        .spawn(move || {
+            if let Err(error) = handle_incoming(&runtime, &settings, stream, &device_id) {
+                set_error(&runtime, format!("incoming handler failed: {error}"));
+            }
+        });
 }
 
 fn send_udp_announcement(
@@ -734,9 +842,15 @@ fn refresh_discovered_devices(
     runtime: &RuntimeInner,
     settings: &Settings,
     device_id: &str,
+    selected_local_ip: Option<&str>,
     timeout_ms: u64,
 ) {
-    match discover_devices(device_id, &settings.sync.shared_code, timeout_ms) {
+    match discover_devices(
+        device_id,
+        &settings.sync.shared_code,
+        selected_local_ip,
+        timeout_ms,
+    ) {
         Ok(devices) => {
             merge_discovered_devices(runtime, devices);
             prune_stale_discovered_devices(runtime);
@@ -757,11 +871,30 @@ fn handle_incoming(
     }
     let mut stream = stream;
     let mut incoming_files: HashMap<String, IncomingFileStream> = HashMap::new();
-    while let Some((transfer_id, frame_bytes)) = read_wire_frame(
-        runtime,
-        &mut stream,
-        remote_addr.as_deref().unwrap_or("未知来源"),
-    )? {
+    loop {
+        let Some((transfer_id, frame_bytes)) = (match read_wire_frame(
+            runtime,
+            &mut stream,
+            remote_addr.as_deref().unwrap_or("未知来源"),
+        ) {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                discard_incomplete_incoming_files(
+                    runtime,
+                    &mut incoming_files,
+                    "发送方连接中断，已丢弃未完成传输",
+                );
+                Err(error)
+            }
+        })?
+        else {
+            discard_incomplete_incoming_files(
+                runtime,
+                &mut incoming_files,
+                "发送方已下线，已丢弃未完成传输",
+            );
+            break;
+        };
         let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
         let body = decode_wire_body(&frame, settings)?;
         match body {
@@ -865,6 +998,32 @@ fn handle_incoming(
     Ok(())
 }
 
+fn discard_incomplete_incoming_files(
+    runtime: &RuntimeInner,
+    incoming_files: &mut HashMap<String, IncomingFileStream>,
+    reason: &str,
+) {
+    for (_, file_stream) in incoming_files.drain() {
+        let transfer_id = format!(
+            "recv:{}:{}",
+            file_stream.meta.source_device_id, file_stream.meta.item_id
+        );
+        mark_transfer_failed(runtime, &transfer_id, reason.to_string());
+        push_log(
+            runtime,
+            "WARN",
+            &format!(
+                "discard incomplete inbound file item={} received_bytes={} expected_bytes={} peer={} reason={}",
+                file_stream.meta.item_id,
+                file_stream.archive_bytes.len(),
+                file_stream.meta.size_bytes,
+                file_stream.peer,
+                reason
+            ),
+        );
+    }
+}
+
 fn handle_incoming_item(
     runtime: &RuntimeInner,
     transfer_id: &str,
@@ -951,86 +1110,47 @@ fn read_wire_frame(
     Ok(Some((transfer_id, frame)))
 }
 
-fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &ClipboardItem) -> usize {
+struct BroadcastReport {
+    attempted: usize,
+    delivered: usize,
+}
+
+fn send_to_all_peers(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    item: &ClipboardItem,
+) -> BroadcastReport {
+    let peers = collect_peer_targets(runtime, settings);
     if matches!(item.payload, ClipboardPayload::FileList { .. }) {
-        return send_file_list_to_all_peers(runtime, settings, item);
+        return send_file_list_to_all_peers(runtime, settings, item, peers);
     }
 
     let payload = match encode_wire_message(item, settings) {
         Ok(payload) => payload,
         Err(error) => {
             set_error(runtime, format!("encode payload failed: {error}"));
-            return 0;
+            return BroadcastReport {
+                attempted: 0,
+                delivered: 0,
+            };
         }
     };
 
-    let mut delivered = 0usize;
-    for peer in collect_peer_targets(runtime, settings) {
-        let connect_timeout = Duration::from_millis(CONNECT_TIMEOUT_MS);
-        let write_timeout = write_timeout_for_payload(payload.len() as u64);
-        let stream = TcpStream::connect_timeout(
-            &match peer.parse() {
-                Ok(socket_addr) => socket_addr,
-                Err(_) => {
-                    push_log(runtime, "WARN", &format!("skip bad peer addr: {}", peer));
-                    continue;
-                }
-            },
-            connect_timeout,
-        );
+    let attempted = peers.len();
+    let delivered = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(peers.len());
+        let payload_ref = &payload;
+        for peer in peers {
+            handles
+                .push(scope.spawn(move || send_payload_to_peer(runtime, item, payload_ref, peer)));
+        }
 
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                push_log(
-                    runtime,
-                    "DEBUG",
-                    &format!("connect peer failed peer={peer} error={error}"),
-                );
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        if let Ok(local_addr) = stream.local_addr() {
-            remember_active_local_ip(runtime, local_addr.ip());
-        }
-        let _ = stream.set_write_timeout(Some(write_timeout));
-        let transfer_id = send_transfer_id(&peer, item);
-        upsert_transfer(
-            runtime,
-            TransferProgress {
-                id: transfer_id.clone(),
-                direction: "send".to_string(),
-                peer: peer.clone(),
-                item_kind: item.payload.kind().to_string(),
-                item_label: payload_label(&item.payload),
-                item_summary: payload_summary(&item.payload),
-                item_id: item.id.clone(),
-                transferred_bytes: 0,
-                total_bytes: payload.len() as u64,
-                percent: 0,
-                status: "sending".to_string(),
-                updated_at_ms: now_ms(),
-                error: None,
-            },
-        );
-        if write_all_with_progress(runtime, &mut stream, &payload, &transfer_id).is_ok() {
-            mark_transfer_completed(runtime, &transfer_id);
-            mark_known_member(runtime, "addr", &peer);
-            delivered += 1;
-        } else {
-            mark_transfer_failed(runtime, &transfer_id, "发送失败".to_string());
-            push_log(
-                runtime,
-                "DEBUG",
-                &format!(
-                    "write peer failed peer={peer} payload_bytes={} timeout_ms={}",
-                    payload.len(),
-                    write_timeout.as_millis()
-                ),
-            );
-        }
-    }
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter(|delivered| *delivered)
+            .count()
+    });
 
     if delivered > 0 {
         push_log(
@@ -1039,70 +1159,183 @@ fn send_to_all_peers(runtime: &RuntimeInner, settings: &Settings, item: &Clipboa
             &format!("broadcast delivered={}", delivered),
         );
     }
-    delivered
+    BroadcastReport {
+        attempted,
+        delivered,
+    }
 }
 
 fn send_file_list_to_all_peers(
     runtime: &RuntimeInner,
     settings: &Settings,
     item: &ClipboardItem,
-) -> usize {
-    let mut delivered = 0usize;
-    for peer in collect_peer_targets(runtime, settings) {
-        let transfer_id = send_transfer_id(&peer, item);
-        upsert_transfer(
-            runtime,
-            TransferProgress {
-                id: transfer_id.clone(),
-                direction: "send".to_string(),
-                peer: peer.clone(),
-                item_kind: item.payload.kind().to_string(),
-                item_label: payload_label(&item.payload),
-                item_summary: payload_summary(&item.payload),
-                item_id: item.id.clone(),
-                transferred_bytes: 0,
-                total_bytes: item.size_bytes,
-                percent: 0,
-                status: "sending".to_string(),
-                updated_at_ms: now_ms(),
-                error: None,
-            },
-        );
-
-        match send_file_list_to_peer(runtime, settings, item, &peer, &transfer_id) {
-            Ok(()) => {
-                mark_transfer_completed(runtime, &transfer_id);
-                mark_known_member(runtime, "addr", &peer);
-                delivered += 1;
-            }
-            Err(error) => {
-                mark_transfer_failed(runtime, &transfer_id, error.to_string());
-                push_log(
-                    runtime,
-                    "DEBUG",
-                    &format!("stream file peer failed peer={peer} error={error}"),
-                );
-            }
+    peers: Vec<String>,
+) -> BroadcastReport {
+    let prepared = match prepare_file_list_archive(runtime, item) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            set_error(
+                runtime,
+                format!(
+                    "prepare file archive failed: item={} error={error}",
+                    item.id
+                ),
+            );
+            push_log(
+                runtime,
+                "WARN",
+                &format!("prepare file archive failed item={} error={error}", item.id),
+            );
+            return BroadcastReport {
+                attempted: peers.len(),
+                delivered: 0,
+            };
         }
+    };
+    let attempted = peers.len();
+    let delivered = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let prepared_ref = &prepared;
+            handles.push(scope.spawn(move || {
+                send_file_list_to_peer(runtime, settings, item, prepared_ref, &peer)
+            }));
+        }
+
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .filter(|delivered| *delivered)
+            .count()
+    });
+
+    BroadcastReport {
+        attempted,
+        delivered,
     }
-    delivered
+}
+
+fn send_payload_to_peer(
+    runtime: &RuntimeInner,
+    item: &ClipboardItem,
+    payload: &[u8],
+    peer: String,
+) -> bool {
+    let connect_timeout = Duration::from_millis(CONNECT_TIMEOUT_MS);
+    let socket_addr = match peer.parse::<SocketAddr>() {
+        Ok(socket_addr) => socket_addr,
+        Err(_) => {
+            push_log(runtime, "WARN", &format!("skip bad peer addr: {}", peer));
+            return false;
+        }
+    };
+    let transfer_id = send_transfer_id(&peer, item);
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "send".to_string(),
+            peer: peer.clone(),
+            item_kind: item.payload.kind().to_string(),
+            item_label: payload_label(&item.payload),
+            item_summary: payload_summary(&item.payload),
+            item_id: item.id.clone(),
+            transferred_bytes: 0,
+            total_bytes: payload.len() as u64,
+            percent: 0,
+            status: "sending".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
+    let stream = TcpStream::connect_timeout(&socket_addr, connect_timeout);
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("connect peer failed peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    tune_stream_for_send(&stream, payload.len() as u64);
+    if let Ok(local_addr) = stream.local_addr() {
+        remember_active_local_ip(runtime, local_addr.ip());
+    }
+    if write_all_with_progress(runtime, &mut stream, payload, &transfer_id).is_ok() {
+        mark_transfer_completed(runtime, &transfer_id);
+        mark_known_member(runtime, "addr", &peer);
+        true
+    } else {
+        mark_transfer_failed(runtime, &transfer_id, "发送失败".to_string());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!(
+                "write peer failed peer={peer} payload_bytes={} timeout_ms={}",
+                payload.len(),
+                write_timeout_for_payload(payload.len() as u64).as_millis()
+            ),
+        );
+        false
+    }
 }
 
 fn send_file_list_to_peer(
     runtime: &RuntimeInner,
     settings: &Settings,
     item: &ClipboardItem,
+    prepared: &PreparedFileArchive,
     peer: &str,
-    transfer_id: &str,
-) -> anyhow::Result<()> {
-    let ClipboardPayload::FileList { paths, .. } = &item.payload else {
-        return Err(anyhow::anyhow!("expected file list payload"));
+) -> bool {
+    let ClipboardPayload::FileList { .. } = &item.payload else {
+        return false;
     };
-    let socket_addr: SocketAddr = peer.parse()?;
+    let socket_addr: SocketAddr = match peer.parse() {
+        Ok(socket_addr) => socket_addr,
+        Err(error) => {
+            push_log(
+                runtime,
+                "WARN",
+                &format!("skip bad file peer addr peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    let transfer_id = send_transfer_id(peer, item);
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "send".to_string(),
+            peer: peer.to_string(),
+            item_kind: item.payload.kind().to_string(),
+            item_label: payload_label(&item.payload),
+            item_summary: payload_summary(&item.payload),
+            item_id: item.id.clone(),
+            transferred_bytes: 0,
+            total_bytes: prepared.size_bytes,
+            percent: 0,
+            status: "sending".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
     let mut stream =
-        TcpStream::connect_timeout(&socket_addr, Duration::from_millis(CONNECT_TIMEOUT_MS))?;
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(write_timeout_for_payload(item.size_bytes)));
+        match TcpStream::connect_timeout(&socket_addr, Duration::from_millis(CONNECT_TIMEOUT_MS)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                push_log(
+                    runtime,
+                    "DEBUG",
+                    &format!("connect file peer failed peer={peer} error={error}"),
+                );
+                return false;
+            }
+        };
+    tune_stream_for_send(&stream, prepared.size_bytes);
     if let Ok(local_addr) = stream.local_addr() {
         remember_active_local_ip(runtime, local_addr.ip());
     }
@@ -1112,103 +1345,166 @@ fn send_file_list_to_peer(
         content_hash: item.content_hash.clone(),
         created_at_ms: item.created_at_ms,
         source_device_id: item.source_device_id.clone(),
-        size_bytes: item.size_bytes,
-        top_level_names: match &item.payload {
-            ClipboardPayload::FileList {
-                top_level_names, ..
-            } => top_level_names.clone(),
-            _ => Vec::new(),
-        },
+        size_bytes: prepared.size_bytes,
+        top_level_names: prepared.top_level_names.clone(),
     });
-    write_wire_body_to_stream(&mut stream, settings, &start)?;
-
-    {
-        let mut writer = FileStreamWriter {
+    if let Err(error) = write_wire_body_to_stream(&mut stream, settings, &start) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        push_log(
             runtime,
-            settings,
-            stream: &mut stream,
-            item_id: item.id.clone(),
-            transfer_id: transfer_id.to_string(),
-            buffer: Vec::with_capacity(TRANSFER_CHUNK_BYTES),
-            sent_archive_bytes: 0,
-            total_archive_bytes: item.size_bytes,
-        };
-        clipboard::stream_file_bundle_archive(paths, &mut writer)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        writer.finish()?;
+            "DEBUG",
+            &format!("stream file start failed peer={peer} error={error}"),
+        );
+        return false;
     }
 
-    write_wire_body_to_stream(
+    if let Err(error) = stream_prepared_archive_to_peer(
+        runtime,
+        settings,
+        &mut stream,
+        prepared,
+        &item.id,
+        &transfer_id,
+    ) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!("stream prepared archive failed peer={peer} error={error}"),
+        );
+        return false;
+    }
+
+    if let Err(error) = write_wire_body_to_stream(
         &mut stream,
         settings,
         &WireBody::FileStreamEnd {
             item_id: item.id.clone(),
         },
-    )?;
-    Ok(())
+    ) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!("stream file end failed peer={peer} error={error}"),
+        );
+        return false;
+    }
+    mark_transfer_completed(runtime, &transfer_id);
+    mark_known_member(runtime, "addr", peer);
+    true
 }
 
-struct FileStreamWriter<'a> {
-    runtime: &'a RuntimeInner,
-    settings: &'a Settings,
-    stream: &'a mut TcpStream,
-    item_id: String,
-    transfer_id: String,
-    buffer: Vec<u8>,
-    sent_archive_bytes: u64,
-    total_archive_bytes: u64,
-}
+fn prepare_file_list_archive(
+    runtime: &RuntimeInner,
+    item: &ClipboardItem,
+) -> anyhow::Result<PreparedFileArchive> {
+    let ClipboardPayload::FileList {
+        paths,
+        top_level_names,
+        ..
+    } = &item.payload
+    else {
+        return Err(anyhow::anyhow!("clipboard item is not a file list"));
+    };
 
-impl FileStreamWriter<'_> {
-    fn finish(&mut self) -> anyhow::Result<()> {
-        self.flush_chunk()
+    if let Some(cached) = load_prepared_archive(runtime, &item.id) {
+        return Ok(cached);
     }
 
-    fn flush_chunk(&mut self) -> anyhow::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
+    let cache_dir = std::env::temp_dir()
+        .join("lan-clipboard")
+        .join("outbound-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+    let final_path = cache_dir.join(format!("{}.tar", item.id));
+    let partial_path = cache_dir.join(format!("{}.partial", item.id));
+    let _ = std::fs::remove_file(&partial_path);
+    let _ = std::fs::remove_file(&final_path);
+
+    let prepare_started_at = Instant::now();
+    let size_bytes = clipboard::write_file_bundle_archive_to_path(paths, &partial_path)?;
+    std::fs::rename(&partial_path, &final_path)?;
+    let prepared = PreparedFileArchive {
+        path: final_path,
+        size_bytes,
+        top_level_names: top_level_names.clone(),
+        prepared_at: Instant::now(),
+    };
+    store_prepared_archive(runtime, &item.id, prepared.clone());
+    push_log(
+        runtime,
+        "DEBUG",
+        &format!(
+            "prepared file archive item={} size_bytes={} elapsed_ms={}",
+            item.id,
+            size_bytes,
+            prepare_started_at.elapsed().as_millis()
+        ),
+    );
+    Ok(prepared)
+}
+
+fn load_prepared_archive(runtime: &RuntimeInner, item_id: &str) -> Option<PreparedFileArchive> {
+    runtime.prepared_archives.lock().ok().and_then(|mut guard| {
+        let archive = guard.get_mut(item_id)?;
+        if !archive.path.exists() {
+            guard.remove(item_id);
+            return None;
         }
-        let bytes = std::mem::take(&mut self.buffer);
-        let archive_bytes = bytes.len() as u64;
+        archive.prepared_at = Instant::now();
+        Some(archive.clone())
+    })
+}
+
+fn store_prepared_archive(runtime: &RuntimeInner, item_id: &str, archive: PreparedFileArchive) {
+    if let Ok(mut guard) = runtime.prepared_archives.lock() {
+        if let Some(previous) = guard.insert(item_id.to_string(), archive) {
+            let _ = std::fs::remove_file(previous.path);
+        }
+    }
+}
+
+fn stream_prepared_archive_to_peer(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    stream: &mut TcpStream,
+    prepared: &PreparedFileArchive,
+    item_id: &str,
+    transfer_id: &str,
+) -> anyhow::Result<()> {
+    let mut file = File::open(&prepared.path)?;
+    let mut buffer = vec![0u8; FILE_STREAM_CHUNK_BYTES];
+    let mut sent_archive_bytes = 0u64;
+
+    loop {
+        let read_bytes = file.read(&mut buffer)?;
+        if read_bytes == 0 {
+            break;
+        }
+
         write_wire_body_to_stream(
-            self.stream,
-            self.settings,
+            stream,
+            settings,
             &WireBody::FileStreamChunk {
-                item_id: self.item_id.clone(),
-                bytes,
+                item_id: item_id.to_string(),
+                bytes: buffer[..read_bytes].to_vec(),
             },
         )?;
-        self.sent_archive_bytes = self.sent_archive_bytes.saturating_add(archive_bytes);
+
+        sent_archive_bytes = sent_archive_bytes.saturating_add(read_bytes as u64);
         update_transfer_progress(
-            self.runtime,
-            &self.transfer_id,
-            self.sent_archive_bytes,
-            self.total_archive_bytes,
+            runtime,
+            transfer_id,
+            sent_archive_bytes,
+            prepared.size_bytes,
         );
-        Ok(())
-    }
-}
 
-impl Write for FileStreamWriter<'_> {
-    fn write(&mut self, mut input: &[u8]) -> std::io::Result<usize> {
-        let original_len = input.len();
-        while !input.is_empty() {
-            let remaining = TRANSFER_CHUNK_BYTES.saturating_sub(self.buffer.len());
-            let take = remaining.min(input.len());
-            self.buffer.extend_from_slice(&input[..take]);
-            input = &input[take..];
-            if self.buffer.len() >= TRANSFER_CHUNK_BYTES {
-                self.flush_chunk()
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            }
+        if has_ready_outbound_lane(runtime, &[QueueLane::Realtime, QueueLane::Visual]) {
+            std::thread::sleep(Duration::from_millis(HIGH_PRIORITY_YIELD_MS));
         }
-        Ok(original_len)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.flush_chunk()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
-    }
+    Ok(())
 }
 
 fn write_wire_body_to_stream(
@@ -1349,26 +1645,44 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
     }
 }
 
-fn process_outbound_queue(runtime: &RuntimeInner, settings: &Settings) {
+fn process_outbound_queue(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    allowed_lanes: &[QueueLane],
+) {
     if is_clipboard_suppressed(runtime) {
         return;
     }
 
     loop {
-        let Some(mut entry) = pop_ready_queue_entry(&runtime.outbound_queue) else {
+        let Some(mut entry) = pop_ready_outbound_entry(&runtime.outbound_queue, allowed_lanes)
+        else {
             break;
         };
 
-        let attempted = collect_peer_targets(runtime, settings).len();
-        let delivered = send_to_all_peers(runtime, settings, &entry.item);
-        if attempted == 0 || delivered < attempted {
+        let report = send_to_all_peers(runtime, settings, &entry.item);
+        if report.attempted == 0 {
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!(
+                    "drop outbound item {} because shared domain only contains self",
+                    entry.item.id
+                ),
+            );
+            continue;
+        }
+        if report.delivered < report.attempted {
             if schedule_retry(&mut entry) {
                 push_log(
                     runtime,
                     "DEBUG",
                     &format!(
                         "outbound item {} pending peers delivered={delivered} attempted={attempted} retry={}",
-                        entry.item.id, entry.attempts
+                        entry.item.id,
+                        entry.attempts,
+                        delivered = report.delivered,
+                        attempted = report.attempted
                     ),
                 );
                 push_queue_entry(&runtime.outbound_queue, entry);
@@ -1379,7 +1693,9 @@ fn process_outbound_queue(runtime: &RuntimeInner, settings: &Settings) {
                 "WARN",
                 &format!(
                     "drop outbound item {} after retries delivered={delivered} attempted={attempted}",
-                    entry.item.id
+                    entry.item.id,
+                    delivered = report.delivered,
+                    attempted = report.attempted
                 ),
             );
             continue;
@@ -1390,7 +1706,9 @@ fn process_outbound_queue(runtime: &RuntimeInner, settings: &Settings) {
             "DEBUG",
             &format!(
                 "outbound item {} completed delivered={delivered} attempted={attempted}",
-                entry.item.id
+                entry.item.id,
+                delivered = report.delivered,
+                attempted = report.attempted
             ),
         );
     }
@@ -1406,9 +1724,67 @@ fn pop_ready_queue_entry(queue: &Mutex<VecDeque<QueueEntry>>) -> Option<QueueEnt
     })
 }
 
+fn pop_ready_outbound_entry(
+    queue: &Mutex<VecDeque<QueueEntry>>,
+    allowed_lanes: &[QueueLane],
+) -> Option<QueueEntry> {
+    let now = now_ms();
+    queue.lock().ok().and_then(|mut guard| {
+        let position = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.next_attempt_at_ms <= now)
+            .filter(|(_, entry)| allowed_lanes.contains(&outbound_lane(entry)))
+            .max_by(|(_, left), (_, right)| compare_outbound_entries(left, right))?
+            .0;
+        guard.remove(position)
+    })
+}
+
+fn has_ready_outbound_lane(runtime: &RuntimeInner, lanes: &[QueueLane]) -> bool {
+    let now = now_ms();
+    runtime
+        .outbound_queue
+        .lock()
+        .map(|guard| {
+            guard.iter().any(|entry| {
+                entry.next_attempt_at_ms <= now && lanes.contains(&outbound_lane(entry))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn push_queue_entry(queue: &Mutex<VecDeque<QueueEntry>>, entry: QueueEntry) {
     if let Ok(mut guard) = queue.lock() {
         guard.push_back(entry);
+    }
+}
+
+fn compare_outbound_entries(left: &QueueEntry, right: &QueueEntry) -> std::cmp::Ordering {
+    outbound_phase_rank(left)
+        .cmp(&outbound_phase_rank(right))
+        .reverse()
+        .then_with(|| outbound_lane(left).cmp(&outbound_lane(right)).reverse())
+        .then_with(|| left.item.created_at_ms.cmp(&right.item.created_at_ms))
+        .then_with(|| right.attempts.cmp(&left.attempts))
+        .then_with(|| left.queued_at_ms.cmp(&right.queued_at_ms))
+}
+
+fn outbound_phase_rank(entry: &QueueEntry) -> u8 {
+    if entry.attempts == 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn outbound_lane(entry: &QueueEntry) -> QueueLane {
+    match &entry.item.payload {
+        ClipboardPayload::Text { .. }
+        | ClipboardPayload::Html { .. }
+        | ClipboardPayload::Rtf { .. } => QueueLane::Realtime,
+        ClipboardPayload::ImagePng { .. } => QueueLane::Visual,
+        ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => QueueLane::Bulk,
     }
 }
 
@@ -1448,16 +1824,6 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
             }
         }
     }
-    for peer in &settings.sync.peers {
-        let addr = normalize_peer(peer, settings.sync.listen_port);
-        if !addr.is_empty() {
-            if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-                peer_by_ip
-                    .entry(socket_addr.ip().to_string())
-                    .or_insert(addr);
-            }
-        }
-    }
     if let Ok(guard) = runtime.known_members.lock() {
         for member in guard.iter() {
             if let Some(addr) = member.strip_prefix("addr:") {
@@ -1472,7 +1838,9 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
             }
         }
     }
-    peer_by_ip.into_values().collect()
+    let mut peers = peer_by_ip.into_values().collect::<Vec<_>>();
+    peers.sort();
+    peers
 }
 
 fn is_expected_listen_addr(addr: &str, listen_port: u16) -> bool {
@@ -1497,6 +1865,22 @@ fn write_timeout_for_payload(payload_bytes: u64) -> Duration {
     Duration::from_millis(estimated_ms.clamp(MIN_WRITE_TIMEOUT_MS, MAX_WRITE_TIMEOUT_MS))
 }
 
+fn tune_stream_for_send(stream: &TcpStream, payload_bytes: u64) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(write_timeout_for_payload(payload_bytes)));
+    let socket = SockRef::from(stream);
+    let _ = socket.set_send_buffer_size(TCP_BUFFER_BYTES);
+    let _ = socket.set_recv_buffer_size(TCP_BUFFER_BYTES);
+}
+
+fn tune_stream_for_receive(stream: &TcpStream, payload_bytes: u64) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(write_timeout_for_payload(payload_bytes)));
+    let socket = SockRef::from(stream);
+    let _ = socket.set_send_buffer_size(TCP_BUFFER_BYTES);
+    let _ = socket.set_recv_buffer_size(TCP_BUFFER_BYTES);
+}
+
 fn cached_member_signal_count(runtime: &RuntimeInner) -> usize {
     prune_stale_discovered_devices(runtime);
     let discovered = runtime
@@ -1512,47 +1896,14 @@ fn cached_member_signal_count(runtime: &RuntimeInner) -> usize {
     discovered + known
 }
 
-fn current_member_count(runtime: &RuntimeInner, settings: &Settings) -> usize {
-    prune_stale_discovered_devices(runtime);
-    let self_device_id = settings.sync_device_id();
-    if self_device_id.trim().is_empty() {
-        return 0;
-    }
-
-    let configured_addrs = settings
-        .sync
-        .peers
-        .iter()
-        .map(|peer| normalize_peer(peer, settings.sync.listen_port))
-        .filter(|peer| !peer.is_empty())
-        .collect::<HashSet<_>>();
-
-    let mut discovered_ids = HashSet::new();
-    if let Ok(guard) = runtime.discovered_devices.lock() {
-        for device in guard.iter() {
-            discovered_ids.insert(device.device_id.clone());
-        }
-    }
-
-    let mut known_device_ids = HashSet::new();
-    let mut known_addrs = HashSet::new();
-    if let Ok(guard) = runtime.known_members.lock() {
-        for member in guard.iter() {
-            if let Some(value) = member.strip_prefix("device:") {
-                known_device_ids.insert(value.to_string());
-            } else if let Some(value) = member.strip_prefix("addr:") {
-                known_addrs.insert(value.to_string());
-            }
-        }
-    }
-
-    let remote_count = discovered_ids
-        .len()
-        .max(known_device_ids.len())
-        .max(known_addrs.len())
-        .max(configured_addrs.len());
-
-    remote_count + 1
+fn visible_member_count(runtime: &RuntimeInner, effective_local_ip: Option<&str>) -> usize {
+    let devices = runtime
+        .discovered_devices
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let filtered = filter_devices_for_local_ip(devices, effective_local_ip);
+    filtered.len().saturating_add(1)
 }
 
 fn mark_known_member(runtime: &RuntimeInner, kind: &str, member: &str) {
@@ -1591,6 +1942,12 @@ fn clear_member_cache(runtime: &RuntimeInner) {
         guard.clear();
     }
     if let Ok(mut guard) = runtime.recent_event_ids.lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = runtime.prepared_archives.lock() {
+        for archive in guard.values() {
+            let _ = std::fs::remove_file(&archive.path);
+        }
         guard.clear();
     }
     runtime.suppress_until_ms.store(0, Ordering::SeqCst);
@@ -1916,10 +2273,6 @@ fn decode_wire_body(frame: &WireMessage, settings: &Settings) -> anyhow::Result<
 }
 
 fn effective_secret(settings: &Settings) -> String {
-    let pairing_code = settings.security.pairing_code.trim();
-    if !pairing_code.is_empty() {
-        return pairing_code.to_string();
-    }
     settings.sync.shared_code.trim().to_string()
 }
 
@@ -1948,7 +2301,7 @@ fn decrypt_bytes(nonce_bytes: [u8; 12], body: &[u8], key: &[u8; 32]) -> anyhow::
     let nonce = Nonce::from_slice(&nonce_bytes);
     let plain = cipher
         .decrypt(nonce, body)
-        .map_err(|_| anyhow::anyhow!("decrypt failed (shared code or pairing code mismatch?)"))?;
+        .map_err(|_| anyhow::anyhow!("decrypt failed (shared code mismatch?)"))?;
     Ok(plain)
 }
 
@@ -2041,6 +2394,20 @@ fn register_recent_event(runtime: &RuntimeInner, event_id: &str) {
 fn prune_recent_event_ids(runtime: &RuntimeInner) {
     if let Ok(mut guard) = runtime.recent_event_ids.lock() {
         guard.retain(|_, seen_at| seen_at.elapsed() < Duration::from_millis(RECENT_EVENT_TTL_MS));
+    }
+}
+
+fn prune_prepared_archives(runtime: &RuntimeInner) {
+    if let Ok(mut guard) = runtime.prepared_archives.lock() {
+        guard.retain(|_, archive| {
+            let keep = archive.prepared_at.elapsed()
+                < Duration::from_millis(PREPARED_ARCHIVE_TTL_MS)
+                && archive.path.exists();
+            if !keep {
+                let _ = std::fs::remove_file(&archive.path);
+            }
+            keep
+        });
     }
 }
 
@@ -2395,6 +2762,7 @@ pub fn new_device_id() -> String {
 pub fn discover_devices(
     device_id: &str,
     shared_code: &str,
+    selected_local_ip: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<Vec<DiscoveredDevice>> {
     let mdns = ServiceDaemon::new()?;
@@ -2402,6 +2770,7 @@ pub fn discover_devices(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut devices = Vec::new();
     let mut seen = HashSet::new();
+    let selected_ipv4 = parse_selected_ipv4(selected_local_ip)?;
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2410,7 +2779,7 @@ pub fn discover_devices(
             Err(_) => break,
         };
         if let ServiceEvent::ServiceResolved(info) = event {
-            if let Some(found) = info_to_device(&info, device_id, shared_code) {
+            if let Some(found) = info_to_device(&info, device_id, shared_code, selected_ipv4) {
                 let dedupe_key = format!("{}:{}:{}", found.device_id, found.addr, found.port);
                 if seen.insert(dedupe_key) {
                     devices.push(found);
@@ -2480,6 +2849,7 @@ fn info_to_device(
     info: &ServiceInfo,
     self_device_id: &str,
     shared_code: &str,
+    selected_local_ip: Option<std::net::Ipv4Addr>,
 ) -> Option<DiscoveredDevice> {
     let device_id = info.get_fullname().split('.').next()?.to_string();
     if device_id == self_device_id {
@@ -2495,6 +2865,12 @@ fn info_to_device(
     }
 
     let addr = pick_ipv4(info.get_addresses())?;
+    if let Some(selected_ipv4) = selected_local_ip {
+        let addr_ipv4: std::net::Ipv4Addr = addr.parse().ok()?;
+        if !is_same_subnet(selected_ipv4, addr_ipv4) {
+            return None;
+        }
+    }
     let device_name = info
         .get_properties()
         .get_property_val_str("device_name")
@@ -2530,14 +2906,25 @@ fn pick_local_ip() -> anyhow::Result<IpAddr> {
 
 fn selected_or_active_local_ip(
     settings: &Settings,
+    selected_local_ip: Option<&str>,
     active_local_ip: Option<String>,
 ) -> Option<String> {
-    resolve_local_ip_override(&settings.sync.local_ip)
+    resolve_local_ip_override(selected_local_ip.unwrap_or(settings.sync.local_ip.as_str()))
         .ok()
         .flatten()
         .map(|ip| ip.to_string())
         .or(active_local_ip)
         .or_else(|| pick_local_ip().ok().map(|ip| ip.to_string()))
+}
+
+fn parse_selected_ipv4(
+    selected_local_ip: Option<&str>,
+) -> anyhow::Result<Option<std::net::Ipv4Addr>> {
+    match resolve_local_ip_override(selected_local_ip.unwrap_or_default())? {
+        Some(IpAddr::V4(ipv4)) => Ok(Some(ipv4)),
+        Some(IpAddr::V6(_)) => Ok(None),
+        None => Ok(None),
+    }
 }
 
 fn resolve_local_ip_override(value: &str) -> anyhow::Result<Option<IpAddr>> {
@@ -2618,6 +3005,32 @@ fn is_benchmark_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
 fn is_multicast_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
     let [a, _, _, _] = ipv4.octets();
     (224..=239).contains(&a)
+}
+
+fn is_same_subnet(left: std::net::Ipv4Addr, right: std::net::Ipv4Addr) -> bool {
+    let left = left.octets();
+    let right = right.octets();
+    left[0] == right[0] && left[1] == right[1] && left[2] == right[2]
+}
+
+fn filter_devices_for_local_ip(
+    devices: Vec<DiscoveredDevice>,
+    selected_local_ip: Option<&str>,
+) -> Vec<DiscoveredDevice> {
+    let Ok(Some(selected_ipv4)) = parse_selected_ipv4(selected_local_ip) else {
+        return devices;
+    };
+
+    devices
+        .into_iter()
+        .filter(|device| {
+            device
+                .addr
+                .parse::<std::net::Ipv4Addr>()
+                .map(|ipv4| is_same_subnet(selected_ipv4, ipv4))
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn udp_broadcast_targets(selected_local_ip: &str) -> Vec<SocketAddr> {
