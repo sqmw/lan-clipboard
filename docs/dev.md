@@ -6,6 +6,22 @@
 - 启动开发版：`pnpm tauri dev`
 - Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
 
+## 打包发行
+
+- 打包命令：`pnpm tauri build`
+- 发行配置入口：`src-tauri/tauri.conf.json`
+  - `productName`：应用名
+  - `version`：发行版本号
+  - `identifier`：应用标识（macOS bundle id / Windows 标识）
+  - `bundle.icon`：打包图标
+  - `build.beforeBuildCommand` / `build.frontendDist`：前端构建与产物目录
+
+建议对齐：
+
+- `src-tauri/tauri.conf.json` 的 `version`
+- `src-tauri/Cargo.toml` 的 `version`
+- `package.json` 的 `version`
+
 ## 开发前先看
 
 - 当前能力边界：`docs/status.md`
