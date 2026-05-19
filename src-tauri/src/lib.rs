@@ -6,6 +6,8 @@ mod protocol;
 mod settings;
 mod state;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -14,7 +16,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            desktop::show_main_window(app);
+            let _ = desktop::ensure_tray_icon(app);
+            desktop::hide_main_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -22,7 +25,12 @@ pub fn run() {
             None::<Vec<&str>>,
         ))
         .manage(state::AppState::default())
-        .setup(|app| Ok(desktop::setup(app)?))
+        .setup(|app| {
+            desktop::setup(app)?;
+            let state = app.state::<state::AppState>();
+            commands::initialize_runtime(app.handle(), &state)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,

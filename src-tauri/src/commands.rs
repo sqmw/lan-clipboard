@@ -8,14 +8,13 @@ use crate::settings::Settings;
 use crate::state::AppState;
 use tauri::{AppHandle, Manager, State};
 
-fn settings_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
+pub fn settings_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
     let dir = app.path().app_config_dir()?;
     Ok(dir.join("settings.json"))
 }
 
-#[tauri::command]
-pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
-    let path = settings_path(&app).map_err(|e| e.to_string())?;
+pub fn initialize_runtime(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let path = settings_path(app).map_err(|e| e.to_string())?;
     let mut guard = state
         .settings
         .lock()
@@ -25,14 +24,34 @@ pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settin
         loaded.ensure_sync_identifiers();
         let _ = loaded.save(&path);
         *guard = loaded;
+    } else {
+        let current = guard.clone();
+        let _ = current.save(&path);
     }
+
     let settings = guard.clone();
     drop(guard);
     state
         .presence_service
         .ensure(settings.clone(), settings.sync_device_id())
         .map_err(|e| e.to_string())?;
-    Ok(settings)
+    if settings.sync.enabled {
+        state
+            .sync_engine
+            .start(settings.clone(), settings.sync_device_id())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_settings(app: AppHandle, state: State<'_, AppState>) -> Result<Settings, String> {
+    initialize_runtime(&app, &state)?;
+    state
+        .settings
+        .lock()
+        .map_err(|_| "settings lock poisoned".to_string())
+        .map(|guard| guard.clone())
 }
 
 #[tauri::command]

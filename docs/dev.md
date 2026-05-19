@@ -6,7 +6,10 @@
 - 启动开发版：`pnpm tauri dev`
 - Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
 - 若代码是从 macOS 手动同步到 Windows，必须避免把 `._*` 资源副文件带过去；这类文件会污染 `src-tauri/capabilities/` 并导致 `tauri build` 在 Windows 上报 `stream did not contain valid UTF-8`
-- Windows 开发态如果出现 `WebView2 error ... 无效的窗口句柄`，优先确认当前版本是否仍在原生建窗阶段直接隐藏主窗口；当前实现已改为“前端启动完成后再隐藏窗口”
+- Windows 安装版若要保证“启动直接进后台”，不要让 `tauri.conf.json` 在启动阶段预创建主窗口；当前实现是启动时仅创建托盘，主界面由 Rust 侧手动按需创建
+- 当前 `main` 窗口不再放在 `tauri.conf.json` 的 `app.windows` 里；要显示主界面，必须通过 Rust 侧 `WebviewWindowBuilder::new(...)` 手动创建
+- 由于主窗口默认不创建，后台同步初始化必须放在 Rust `setup()` 之后完成，不能再依赖前端 `boot()` 调 `start_sync`
+- 当前判断：Windows 启动误显主窗口的根因更接近“配置窗口仍被系统启动链路预创建”，而不是普通前端样式或一次 `hide()` 时机问题
 
 ## 打包发行
 

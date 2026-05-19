@@ -4,7 +4,6 @@ import {
   enable as enableAutostart,
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { setLocale, t } from "./i18n";
 
 type Settings = {
@@ -96,23 +95,6 @@ let transferPreviewIdleTimer: number | null = null;
 let networkRefreshTimer: number | null = null;
 let draftSelectedNetworkIp: string | null = null;
 let draftLanguage: string | null = null;
-let launchHideAttempted = false;
-
-function isTauriRuntime(): boolean {
-  return "__TAURI_INTERNALS__" in window;
-}
-
-async function hideWindowAfterLaunch(): Promise<void> {
-  if (launchHideAttempted || !isTauriRuntime()) {
-    return;
-  }
-  launchHideAttempted = true;
-  try {
-    await getCurrentWindow().hide();
-  } catch (error) {
-    console.warn("failed to hide launch window", error);
-  }
-}
 
 function getSelectedNetworkIp(): string {
   if (draftSelectedNetworkIp !== null) {
@@ -368,11 +350,6 @@ async function refreshStatus(): Promise<void> {
   }`;
   observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
   getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
-}
-
-async function startSync(): Promise<void> {
-  await invoke("start_sync");
-  await refreshStatus();
 }
 
 function escapeHtml(value: string): string {
@@ -717,11 +694,7 @@ async function clearLogs(): Promise<void> {
 }
 
 async function boot(): Promise<void> {
-  if (isTauriRuntime()) {
-    await invoke("ensure_desktop_shell");
-  }
   await loadSettings();
-  await hideWindowAfterLaunch();
   try {
     await syncLaunchAtLogin(Boolean(settings.ui?.launch_at_login));
   } catch (error) {
@@ -734,7 +707,6 @@ async function boot(): Promise<void> {
   await refreshTransferProgress();
   await refreshLogs();
   renderDevices(lastDiscovered);
-  await startSync();
   await refreshDomain();
   if (statusTimer !== null) {
     window.clearInterval(statusTimer);

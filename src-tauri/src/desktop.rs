@@ -1,6 +1,8 @@
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Runtime, WindowEvent};
+use tauri::{
+    App, AppHandle, Manager, Runtime, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+};
 
 const MENU_SHOW_WINDOW: &str = "show-window";
 const MENU_QUIT_APP: &str = "quit-app";
@@ -12,14 +14,26 @@ pub fn setup<R: Runtime>(app: &mut App<R>) -> tauri::Result<()> {
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
     register_main_window_behavior(app)?;
+    ensure_tray_icon(app.handle())?;
     Ok(())
 }
 
 pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    let Some(window) = ensure_main_window(app) else {
+        return;
+    };
+    #[cfg(target_os = "windows")]
+    let _ = window.set_skip_taskbar(false);
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        #[cfg(target_os = "windows")]
+        let _ = window.set_skip_taskbar(true);
+        let _ = window.hide();
     }
 }
 
@@ -27,14 +41,34 @@ fn register_main_window_behavior<R: Runtime>(app: &App<R>) -> tauri::Result<()> 
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
     };
+    attach_main_window_behavior(window);
+    Ok(())
+}
+
+fn ensure_main_window<R: Runtime>(app: &AppHandle<R>) -> Option<WebviewWindow<R>> {
+    if let Some(window) = app.get_webview_window("main") {
+        return Some(window);
+    }
+    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+        .title("lan-clipboard")
+        .inner_size(800.0, 600.0)
+        .visible(false)
+        .build()
+        .ok()?;
+    attach_main_window_behavior(window.clone());
+    Some(window)
+}
+
+fn attach_main_window_behavior<R: Runtime>(window: WebviewWindow<R>) {
     let window_for_close = window.clone();
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
+            #[cfg(target_os = "windows")]
+            let _ = window_for_close.set_skip_taskbar(true);
             let _ = window_for_close.hide();
         }
     });
-    Ok(())
 }
 
 pub fn ensure_tray_icon<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
