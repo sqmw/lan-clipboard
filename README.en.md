@@ -29,6 +29,20 @@
 
 ---
 
+## 🖼️ UI Screenshot
+
+<p align="center">
+  <img src="./docs/image/screen-shot.png" width="920" alt="LAN Clipboard UI Screenshot">
+</p>
+
+<p align="center"><i>Built around shared-domain status, transfer visibility, and only the configuration users actually need.</i></p>
+
+## 🎯 Design Principles
+
+- **Minimal first**: the UI keeps only the pieces that matter in daily use, such as domain members, network selection, size limit, and transfer progress
+- **Efficiency first**: the app is designed around “open, join by shared code, copy, sync” instead of exposing a complex connection flow
+- **Debuggable without clutter**: logs, progress, and member state stay available, but the main screen remains quiet and focused
+
 ## ✨ Features
 
 - **Shared-domain model**: devices with the same 6-digit shared code on the same LAN join one domain automatically
