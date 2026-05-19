@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="./docs/README.md">📖 文档</a> ·
+  <a href="./docs/README.zh-CN.md">📖 文档</a> ·
   <a href="./docs/dev.md">🧰 开发/联调</a> ·
   <a href="https://github.com/sqmw/lan-clipboard/issues">🐛 反馈</a> ·
   <a href="https://github.com/sqmw/lan-clipboard">⭐ Star</a>
@@ -49,7 +49,7 @@
 
 ## 📚 文档入口
 
-- `docs/README.md`：文档总入口
+- `docs/README.zh-CN.md`：文档总入口
 - `docs/status.md`：当前支持、边界、关键参数（含吞吐说明）
 - `docs/dev.md`：开发 / 联调 / 排障
 - `docs/todo.md`：里程碑与待办
