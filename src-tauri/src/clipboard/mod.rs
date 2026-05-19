@@ -703,7 +703,7 @@ fn read_bitmap_payload_windows(
 
 #[cfg(target_os = "windows")]
 fn write_image_payload_windows(png_bytes: &[u8]) -> Result<(), ClipboardError> {
-    use clipboard_win::{formats, Clipboard, Setter};
+    use clipboard_win::{formats, raw, Clipboard, Setter};
 
     let image = image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)
         .map_err(|e| ClipboardError::Backend(format!("decode png for windows image write: {e}")))?;
@@ -719,13 +719,36 @@ fn write_image_payload_windows(png_bytes: &[u8]) -> Result<(), ClipboardError> {
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|e| ClipboardError::Backend(format!("encode windows bitmap: {e}")))?;
+    let dib_bytes = bmp_bytes_to_dib_bytes(&bmp_bytes)?;
 
     let _clip = Clipboard::new_attempts(CLIPBOARD_IO_RETRIES).map_err(|e| {
         ClipboardError::Backend(format!("open windows clipboard for image write: {e}"))
     })?;
-    formats::Bitmap
-        .write_clipboard(&bmp_bytes)
-        .map_err(|e| ClipboardError::Backend(format!("write windows bitmap: {e}")))
+    raw::empty().map_err(|e| ClipboardError::Backend(format!("clear windows clipboard: {e}")))?;
+    if let Some(png_format) = clipboard_win::register_format("PNG") {
+        formats::RawData(png_format.get())
+            .write_clipboard(&png_bytes)
+            .map_err(|e| ClipboardError::Backend(format!("write windows png: {e}")))?;
+    }
+    formats::RawData(formats::CF_DIB)
+        .write_clipboard(&dib_bytes)
+        .map_err(|e| ClipboardError::Backend(format!("write windows dib: {e}")))
+}
+
+#[cfg(target_os = "windows")]
+fn bmp_bytes_to_dib_bytes(bmp_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
+    const BMP_FILE_HEADER_LEN: usize = 14;
+    if bmp_bytes.len() <= BMP_FILE_HEADER_LEN {
+        return Err(ClipboardError::Backend(
+            "encoded windows bmp is missing file header".to_string(),
+        ));
+    }
+    if &bmp_bytes[..2] != b"BM" {
+        return Err(ClipboardError::Backend(
+            "encoded windows bmp has invalid signature".to_string(),
+        ));
+    }
+    Ok(bmp_bytes[BMP_FILE_HEADER_LEN..].to_vec())
 }
 
 #[cfg(target_os = "windows")]
