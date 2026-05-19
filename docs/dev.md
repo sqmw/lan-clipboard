@@ -126,3 +126,7 @@
 2. 再测图片
 3. 再测小文件
 4. 最后测大文件与断链场景
+
+## 资源
+
+- App 图标源文件：`docs/image/lan-clipboard-logo.svg`

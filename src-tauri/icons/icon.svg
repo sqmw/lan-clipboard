@@ -1,0 +1,49 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="58" y1="44" x2="446" y2="468" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1224"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+
+    <linearGradient id="accent" x1="106" y1="156" x2="414" y2="364" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.52" stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#A78BFA"/>
+    </linearGradient>
+
+    <linearGradient id="paper" x1="176" y1="145" x2="342" y2="370" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC" stop-opacity="0.98"/>
+      <stop offset="1" stop-color="#E2E8F0" stop-opacity="0.92"/>
+    </linearGradient>
+
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="
+        0 0 0 0 0.20
+        0 0 0 0 0.65
+        0 0 0 0 1.00
+        0 0 0 1 0" result="blueBlur"/>
+      <feMerge>
+        <feMergeNode in="blueBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="58" y="44" width="396" height="424" rx="96" fill="url(#bg)"/>
+
+  <g filter="url(#glow)">
+    <path d="M168 168C168 155.85 177.85 146 190 146H318C330.15 146 340 155.85 340 168V358C340 370.15 330.15 380 318 380H206C193.85 380 184 370.15 184 358V188C184 175.85 174.15 166 162 166H168Z" fill="url(#paper)"/>
+    <path d="M188 186C188 173.85 197.85 164 210 164H326C338.15 164 348 173.85 348 186V352C348 364.15 338.15 374 326 374H210C197.85 374 188 364.15 188 352V186Z" fill="url(#paper)" opacity="0.92"/>
+  </g>
+
+  <path d="M214 244C214 237.373 219.373 232 226 232H358C364.627 232 370 237.373 370 244V286C370 292.627 364.627 298 358 298H226C219.373 298 214 292.627 214 286V244Z" fill="url(#accent)" opacity="0.95"/>
+
+  <path d="M248 264C248 258.477 252.477 254 258 254H326C331.523 254 336 258.477 336 264C336 269.523 331.523 274 326 274H258C252.477 274 248 269.523 248 264Z" fill="#0B1224" opacity="0.8"/>
+
+  <path d="M192 214C192 209.582 195.582 206 200 206H286C290.418 206 294 209.582 294 214C294 218.418 290.418 222 286 222H200C195.582 222 192 218.418 192 214Z" fill="#94A3B8" opacity="0.7"/>
+  <path d="M192 316C192 311.582 195.582 308 200 308H318C322.418 308 326 311.582 326 316C326 320.418 322.418 324 318 324H200C195.582 324 192 320.418 192 316Z" fill="#94A3B8" opacity="0.65"/>
+
+  <path d="M138 254C138 240.745 148.745 230 162 230H174C187.255 230 198 240.745 198 254V258C198 271.255 187.255 282 174 282H162C148.745 282 138 271.255 138 258V254Z" fill="url(#accent)" opacity="0.85"/>
+  <path d="M156 254C156 250.686 158.686 248 162 248H174C177.314 248 180 250.686 180 254V258C180 261.314 177.314 264 174 264H162C158.686 264 156 261.314 156 258V254Z" fill="#0B1224" opacity="0.75"/>
+</svg>
