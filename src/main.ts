@@ -1,4 +1,4 @@
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { setLocale, t } from "./i18n";
 
 type Settings = {
@@ -90,75 +90,6 @@ let networkRefreshTimer: number | null = null;
 let draftSelectedNetworkIp: string | null = null;
 let draftLanguage: string | null = null;
 
-async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (isTauri()) {
-    return invoke<T>(command, args);
-  }
-  return mockInvoke<T>(command, args);
-}
-
-function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const selectedLocalIp =
-    typeof args?.selectedLocalIp === "string" ? (args.selectedLocalIp as string) : "192.168.0.107";
-
-  switch (command) {
-    case "get_settings":
-      return Promise.resolve({
-        limits: { max_item_bytes: 100 * 1024 * 1024 },
-        sync: {
-          device_id: "mock-device",
-          shared_code: "666666",
-          enabled: true,
-          local_ip: selectedLocalIp,
-          listen_port: 32910,
-          poll_interval_ms: 900,
-        },
-        security: { encryption_enabled: true },
-        ui: { language: "zh-CN" },
-      } as T);
-    case "list_network_interfaces":
-      return Promise.resolve(
-        [
-          { name: "en0", ip: "192.168.0.107", label: "en0 (192.168.0.107)" },
-          { name: "Wi-Fi", ip: "192.168.0.101", label: "Wi-Fi (192.168.0.101)" },
-        ] as T,
-      );
-    case "sync_status":
-      return Promise.resolve({
-        running: true,
-        device_id: "mock-device",
-        device_name: "This Mac (Preview)",
-        local_ip: selectedLocalIp,
-        shared_code: "666666",
-        last_error: null,
-        recent_log_count: 0,
-        peer_count: 2,
-      } as T);
-    case "cached_devices":
-    case "discover_devices":
-      return Promise.resolve(
-        [
-          {
-            device_id: "mock-peer-1",
-            device_name: "DESKTOP-OIUVLC2",
-            addr: "192.168.0.105",
-            port: 32910,
-          },
-        ] as T,
-      );
-    case "get_transfer_progress":
-      return Promise.resolve([] as unknown as T);
-    case "get_runtime_logs":
-      return Promise.resolve([] as unknown as T);
-    case "set_settings":
-    case "start_sync":
-    case "clear_runtime_logs":
-      return Promise.resolve(undefined as T);
-    default:
-      return Promise.reject(new Error(`Not available outside Tauri: ${command}`));
-  }
-}
-
 function getSelectedNetworkIp(): string {
   if (draftSelectedNetworkIp !== null) {
     return draftSelectedNetworkIp;
@@ -167,8 +98,8 @@ function getSelectedNetworkIp(): string {
 }
 
 async function loadSettings(): Promise<void> {
-  settings = await tauriInvoke<Settings>("get_settings");
-  networkOptions = await tauriInvoke<NetworkInterfaceOption[]>("list_network_interfaces");
+  settings = await invoke<Settings>("get_settings");
+  networkOptions = await invoke<NetworkInterfaceOption[]>("list_network_interfaces");
   getInput("encryption-enabled").checked = settings.security.encryption_enabled;
   getInput("shared-code").value = settings.sync.shared_code;
   const mb = Math.max(1, Math.round(settings.limits.max_item_bytes / (1024 * 1024)));
@@ -363,8 +294,8 @@ async function saveSettings(): Promise<void> {
   feedback.textContent = t("app.settings.saving_feedback");
   settings = collectSettings();
   try {
-    await tauriInvoke("set_settings", { next: settings });
-    await tauriInvoke("start_sync");
+    await invoke("set_settings", { next: settings });
+    await invoke("start_sync");
     draftSelectedNetworkIp = settings.sync.local_ip;
     draftLanguage = settings.ui.language;
     setLocale(draftLanguage);
@@ -385,7 +316,7 @@ async function saveSettings(): Promise<void> {
 }
 
 async function refreshStatus(): Promise<void> {
-  const status = await tauriInvoke<RuntimeStatus>("sync_status", {
+  const status = await invoke<RuntimeStatus>("sync_status", {
     selectedLocalIp: getSelectedNetworkIp() || null,
   });
   currentStatus = status;
@@ -398,7 +329,7 @@ async function refreshStatus(): Promise<void> {
 }
 
 async function startSync(): Promise<void> {
-  await tauriInvoke("start_sync");
+  await invoke("start_sync");
   await refreshStatus();
 }
 
@@ -480,7 +411,7 @@ async function scanDevices(): Promise<void> {
   }
   feedback.textContent = t("app.scan.scanning");
   try {
-    const devices = await tauriInvoke<DiscoveredDevice[]>("discover_devices", {
+    const devices = await invoke<DiscoveredDevice[]>("discover_devices", {
       selectedLocalIp: getSelectedNetworkIp() || null,
     });
     renderDevices(devices);
@@ -500,7 +431,7 @@ async function scanDevices(): Promise<void> {
 }
 
 async function refreshCachedDevices(): Promise<void> {
-  const devices = await tauriInvoke<DiscoveredDevice[]>("cached_devices", {
+  const devices = await invoke<DiscoveredDevice[]>("cached_devices", {
     selectedLocalIp: getSelectedNetworkIp() || null,
   });
   renderDevices(devices);
@@ -535,7 +466,7 @@ function validateSharedCode(): boolean {
 }
 
 async function refreshLogs(): Promise<void> {
-  const logs = await tauriInvoke<RuntimeLog[]>("get_runtime_logs", { limit: 300 });
+  const logs = await invoke<RuntimeLog[]>("get_runtime_logs", { limit: 300 });
   const lines = logs.map((log) => {
     const stamp = new Date(log.ts_ms).toLocaleTimeString();
     return `[${stamp}] [${log.level}] ${log.message}`;
@@ -733,12 +664,12 @@ async function refreshTransferProgress(): Promise<void> {
   if (isTransferPreviewInteracting) {
     return;
   }
-  const transfers = await tauriInvoke<TransferProgress[]>("get_transfer_progress");
+  const transfers = await invoke<TransferProgress[]>("get_transfer_progress");
   renderTransferProgress(transfers);
 }
 
 async function clearLogs(): Promise<void> {
-  await tauriInvoke("clear_runtime_logs");
+  await invoke("clear_runtime_logs");
   await refreshLogs();
   await refreshStatus();
 }

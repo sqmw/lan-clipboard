@@ -6,18 +6,6 @@
 - 启动开发版：`pnpm tauri dev`
 - Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
 
-## Web UI 预览（用于截图/样式调整）
-
-当你只想快速看 UI（不启动 Tauri / 不需要系统剪贴板能力）时，可以用浏览器预览：
-
-- 启动：`pnpm dev`
-- 打开：`http://localhost:1420/`
-
-说明：
-
-- 该模式会使用 mock 数据渲染页面，按钮行为会被降级或禁用
-- 仅用于 README 截图、布局调试和文本检查，不代表真实同步链路
-
 ## 开发前先看
 
 - 当前能力边界：`docs/status.md`
