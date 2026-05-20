@@ -821,13 +821,34 @@ let pasteboard = NSPasteboard.general
 pasteboard.clearContents()
 
 let type: NSPasteboard.PasteboardType
+let documentType: NSAttributedString.DocumentType
 switch format {
 case "html":
     type = .html
+    documentType = .html
 case "rtf":
     type = .rtf
+    documentType = .rtf
 default:
     fputs("unsupported rich text format\n", stderr)
+    exit(1)
+}
+
+let plainText: String
+do {
+    let attributed = try NSAttributedString(
+        data: data,
+        options: [.documentType: documentType],
+        documentAttributes: nil
+    )
+    plainText = attributed.string
+} catch {
+    fputs("failed to extract plain text fallback\n", stderr)
+    exit(1)
+}
+
+if !pasteboard.setString(plainText, forType: .string) {
+    fputs("failed to write plain text fallback\n", stderr)
     exit(1)
 }
 
@@ -1189,20 +1210,28 @@ fn read_html_payload_windows(
 
 #[cfg(target_os = "windows")]
 fn write_rich_text_payload_windows(format: &str, value: &str) -> Result<(), ClipboardError> {
-    if format == "html" {
-        return write_html_payload_windows(value);
-    }
-
     let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
 $format = $env:LAN_CLIPBOARD_FORMAT
 $raw = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:LAN_CLIPBOARD_RICH_TEXT))
 $dataObject = New-Object System.Windows.Forms.DataObject
+$plainText = ""
 switch ($format) {
-  "html" { $dataObject.SetData([System.Windows.Forms.DataFormats]::Html, $raw) }
-  "rtf" { $dataObject.SetData([System.Windows.Forms.DataFormats]::Rtf, $raw) }
+  "html" {
+    $dataObject.SetData([System.Windows.Forms.DataFormats]::Html, $raw)
+    $plainText = [System.Net.WebUtility]::HtmlDecode(([regex]::Replace($raw, "<[^>]+>", " "))).Trim()
+  }
+  "rtf" {
+    $dataObject.SetData([System.Windows.Forms.DataFormats]::Rtf, $raw)
+    $box = New-Object System.Windows.Forms.RichTextBox
+    $box.Rtf = $raw
+    $plainText = $box.Text
+    $box.Dispose()
+  }
   default { throw "unsupported rich text format" }
 }
+$dataObject.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $plainText)
+[System.Windows.Forms.Clipboard]::SetText($plainText)
 [System.Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
 "#;
     let mut command = Command::new("powershell");
@@ -1225,23 +1254,6 @@ switch ($format) {
     Err(ClipboardError::Backend(
         String::from_utf8_lossy(&output.stderr).trim().to_string(),
     ))
-}
-
-#[cfg(target_os = "windows")]
-fn write_html_payload_windows(value: &str) -> Result<(), ClipboardError> {
-    use clipboard_win::{formats, Clipboard, Setter};
-
-    let Some(format) = formats::Html::new() else {
-        return Err(ClipboardError::Backend(
-            "register windows html clipboard format failed".to_string(),
-        ));
-    };
-    let _clip = Clipboard::new_attempts(CLIPBOARD_IO_RETRIES).map_err(|e| {
-        ClipboardError::Backend(format!("open windows clipboard for html write: {e}"))
-    })?;
-    format
-        .write_clipboard(&value)
-        .map_err(|e| ClipboardError::Backend(format!("write windows html: {e}")))
 }
 
 fn parse_rich_text_output(
