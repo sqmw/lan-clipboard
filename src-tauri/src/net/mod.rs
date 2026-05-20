@@ -3,7 +3,7 @@ use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
@@ -164,6 +164,8 @@ struct RuntimeInner {
     outbound_queue: Mutex<VecDeque<QueueEntry>>,
     inbound_queue: Mutex<VecDeque<QueueEntry>>,
     latest_item: Mutex<Option<ItemMarker>>,
+    shared_content_fingerprint: Mutex<Option<String>>,
+    inflight_content_fingerprints: Mutex<HashSet<String>>,
     last_local_observed: Mutex<Option<ObservedClipboard>>,
     ignored_local_hashes: Mutex<HashMap<String, Instant>>,
     recent_event_ids: Mutex<HashMap<String, Instant>>,
@@ -186,6 +188,8 @@ impl Default for RuntimeInner {
             outbound_queue: Mutex::new(VecDeque::new()),
             inbound_queue: Mutex::new(VecDeque::new()),
             latest_item: Mutex::new(None),
+            shared_content_fingerprint: Mutex::new(None),
+            inflight_content_fingerprints: Mutex::new(HashSet::new()),
             last_local_observed: Mutex::new(None),
             ignored_local_hashes: Mutex::new(HashMap::new()),
             recent_event_ids: Mutex::new(HashMap::new()),
@@ -263,7 +267,7 @@ enum QueueLane {
     Bulk,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 struct ClipboardWatchHandler {
     runtime: Arc<RuntimeInner>,
     limits: crate::settings::SizeLimits,
@@ -482,7 +486,7 @@ impl Drop for PresenceService {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 impl ClipboardHandler for ClipboardWatchHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
         process_local_clipboard_observation(&self.runtime, &self.limits, &self.device_id);
@@ -508,6 +512,19 @@ fn process_local_clipboard_observation(
         }
     };
 
+    if clipboard::is_internal_file_payload(&payload) {
+        if let Ok(content_hash) = clipboard::payload_content_hash(&payload) {
+            remember_local_observation(runtime, &content_hash, now_ms());
+            register_ignored_local_hash(runtime, &content_hash);
+        }
+        push_log(
+            runtime,
+            "DEBUG",
+            "drop local observation from internal clipboard file payload",
+        );
+        return;
+    }
+
     let item = match build_item(&payload, device_id) {
         Ok(Some(item)) => item,
         Ok(None) => return,
@@ -520,7 +537,7 @@ fn process_local_clipboard_observation(
         }
     };
 
-    if should_ignore_local_observation(runtime, &item.content_hash) {
+    if should_ignore_local_observation(runtime, &item) {
         return;
     }
 
@@ -539,7 +556,7 @@ fn process_local_clipboard_observation(
     enqueue_outbound_item(runtime, item);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn seed_local_clipboard_baseline(runtime: &RuntimeInner, limits: &crate::settings::SizeLimits) {
     let Ok(payload) = clipboard::read_snapshot(limits) else {
         return;
@@ -555,7 +572,7 @@ fn seed_local_clipboard_baseline(runtime: &RuntimeInner, limits: &crate::setting
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn run_clipboard_watch_poll_loop(
     runtime: Arc<RuntimeInner>,
     limits: crate::settings::SizeLimits,
@@ -641,7 +658,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     let mut last_udp_announce = Instant::now() - Duration::from_millis(UDP_ANNOUNCE_MS);
     let device_name = local_device_name();
     let watcher_runtime = Arc::clone(&runtime);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let watcher_stop_runtime = Arc::clone(&runtime);
     let watcher_limits = settings.limits.clone();
     let watcher_device_id = device_id.clone();
@@ -649,7 +666,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     let watcher = std::thread::Builder::new()
         .name("lan-clipboard-watch".to_string())
         .spawn(move || {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 run_clipboard_watch_poll_loop(
                     watcher_runtime,
@@ -659,7 +676,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
                 );
                 return;
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             {
                 let handler = ClipboardWatchHandler {
                     runtime: watcher_runtime,
@@ -1638,7 +1655,12 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
             );
         }
         match clipboard::write_item(&entry.item, &settings.limits) {
-            Ok(()) => {
+            Ok(applied) => {
+                mark_shared_fingerprint(runtime, &entry.item.content_hash);
+                if let Some(local_content_hash) = applied.content_hash.as_deref() {
+                    register_ignored_local_hash(runtime, &local_content_hash);
+                    mark_shared_fingerprint(runtime, local_content_hash);
+                }
                 if let Some(transfer_id) = transfer_id.as_deref() {
                     mark_transfer_completed(runtime, transfer_id);
                 }
@@ -1714,6 +1736,7 @@ fn process_outbound_queue(
             break;
         };
         if is_stale_marker(runtime, &item_marker(&entry.item)) {
+            clear_content_inflight(runtime, &entry.item.content_hash);
             push_log(
                 runtime,
                 "DEBUG",
@@ -1724,6 +1747,7 @@ fn process_outbound_queue(
 
         let report = send_to_all_peers(runtime, settings, &entry.item);
         if report.attempted == 0 {
+            clear_content_inflight(runtime, &entry.item.content_hash);
             push_log(
                 runtime,
                 "DEBUG",
@@ -1760,9 +1784,12 @@ fn process_outbound_queue(
                     attempted = report.attempted
                 ),
             );
+            clear_content_inflight(runtime, &entry.item.content_hash);
             continue;
         }
 
+        mark_shared_fingerprint(runtime, &entry.item.content_hash);
+        clear_content_inflight(runtime, &entry.item.content_hash);
         push_log(
             runtime,
             "DEBUG",
@@ -2027,6 +2054,12 @@ fn clear_member_cache(runtime: &RuntimeInner) {
     }
     if let Ok(mut guard) = runtime.latest_item.lock() {
         guard.take();
+    }
+    if let Ok(mut guard) = runtime.shared_content_fingerprint.lock() {
+        guard.take();
+    }
+    if let Ok(mut guard) = runtime.inflight_content_fingerprints.lock() {
+        guard.clear();
     }
     if let Ok(mut guard) = runtime.last_local_observed.lock() {
         guard.take();
@@ -2454,12 +2487,21 @@ fn decrypt_bytes(nonce_bytes: [u8; 12], body: &[u8], key: &[u8; 32]) -> anyhow::
     Ok(plain)
 }
 
-fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -> bool {
-    if recent_applied_hash_seen(runtime, content_hash) {
+fn should_ignore_local_observation(runtime: &RuntimeInner, item: &ClipboardItem) -> bool {
+    let observed_at_ms = now_ms();
+    let content_hash = item.content_hash.as_str();
+    if shared_fingerprint_seen(runtime, content_hash)
+        || inflight_fingerprint_seen(runtime, content_hash)
+    {
+        remember_local_observation(runtime, content_hash, observed_at_ms);
         return true;
     }
 
-    let observed_at_ms = now_ms();
+    if recent_applied_hash_seen(runtime, content_hash) {
+        remember_local_observation(runtime, content_hash, observed_at_ms);
+        return true;
+    }
+
     if let Ok(mut guard) = runtime.last_local_observed.lock() {
         if let Some(previous) = guard.as_mut() {
             if previous.content_hash == content_hash {
@@ -2473,6 +2515,57 @@ fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -
         });
     }
     false
+}
+
+fn remember_local_observation(runtime: &RuntimeInner, content_hash: &str, observed_at_ms: u64) {
+    if let Ok(mut guard) = runtime.last_local_observed.lock() {
+        *guard = Some(ObservedClipboard {
+            content_hash: content_hash.to_string(),
+            observed_at_ms,
+        });
+    }
+}
+
+fn should_drop_duplicate_outbound(runtime: &RuntimeInner, item: &ClipboardItem) -> bool {
+    shared_fingerprint_seen(runtime, &item.content_hash)
+        || inflight_fingerprint_seen(runtime, &item.content_hash)
+        || recent_applied_hash_seen(runtime, &item.content_hash)
+}
+
+fn shared_fingerprint_seen(runtime: &RuntimeInner, content_hash: &str) -> bool {
+    runtime
+        .shared_content_fingerprint
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .map(|fingerprint| fingerprint == content_hash)
+        .unwrap_or(false)
+}
+
+fn inflight_fingerprint_seen(runtime: &RuntimeInner, content_hash: &str) -> bool {
+    runtime
+        .inflight_content_fingerprints
+        .lock()
+        .map(|guard| guard.contains(content_hash))
+        .unwrap_or(false)
+}
+
+fn mark_content_inflight(runtime: &RuntimeInner, content_hash: &str) {
+    if let Ok(mut guard) = runtime.inflight_content_fingerprints.lock() {
+        guard.insert(content_hash.to_string());
+    }
+}
+
+fn clear_content_inflight(runtime: &RuntimeInner, content_hash: &str) {
+    if let Ok(mut guard) = runtime.inflight_content_fingerprints.lock() {
+        guard.remove(content_hash);
+    }
+}
+
+fn mark_shared_fingerprint(runtime: &RuntimeInner, content_hash: &str) {
+    if let Ok(mut guard) = runtime.shared_content_fingerprint.lock() {
+        *guard = Some(content_hash.to_string());
+    }
 }
 
 fn register_ignored_local_hash(runtime: &RuntimeInner, content_hash: &str) {
@@ -2600,6 +2693,7 @@ fn prune_stale_queue_entries(runtime: &RuntimeInner) {
             let keep = !compare_markers(&item_marker(&entry.item), &latest).is_lt();
             if !keep {
                 dropped_outbound += 1;
+                clear_content_inflight(runtime, &entry.item.content_hash);
             }
             keep
         });
@@ -2648,12 +2742,28 @@ fn should_skip_remote_item(runtime: &RuntimeInner, item: &ClipboardItem) -> bool
 }
 
 fn enqueue_outbound_item(runtime: &RuntimeInner, item: ClipboardItem) {
+    if should_drop_duplicate_outbound(runtime, &item) {
+        remember_local_observation(runtime, &item.content_hash, now_ms());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!(
+                "drop duplicate outbound item {} kind={} fingerprint={}",
+                item.id,
+                item.payload.kind(),
+                item.content_hash
+            ),
+        );
+        return;
+    }
+
     if update_latest_item(runtime, &item) {
         prune_stale_queue_entries(runtime);
     }
     let item_id = item.id.clone();
     let kind = item.payload.kind();
     let size_bytes = item.size_bytes;
+    mark_content_inflight(runtime, &item.content_hash);
     push_queue_entry(&runtime.outbound_queue, new_queue_entry(item));
     push_log(
         runtime,

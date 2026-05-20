@@ -99,7 +99,9 @@ pub fn write_clipboard_item(
     let item = net::build_item(&payload, "local")
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "empty payload".to_string())?;
-    clipboard::write_item(&item, &guard.limits).map_err(|e| e.to_string())
+    clipboard::write_item(&item, &guard.limits)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

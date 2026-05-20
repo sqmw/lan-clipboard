@@ -6,7 +6,7 @@ use image::ImageEncoder;
 use image::RgbaImage;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -18,6 +18,7 @@ const CLIPBOARD_IO_RETRIES: usize = 10;
 const CLIPBOARD_IO_DELAY_MS: u64 = 40;
 const IMAGE_SCALE_NUMERATOR: u32 = 85;
 const IMAGE_SCALE_DENOMINATOR: u32 = 100;
+const FILE_HASH_SAMPLE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Error)]
 pub enum ClipboardError {
     #[error("clipboard backend error: {0}")]
@@ -73,8 +74,16 @@ fn read_snapshot_once(limits: &SizeLimits) -> Result<ClipboardPayload, Clipboard
     Err(ClipboardError::Unsupported)
 }
 
-pub fn write_item(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
+pub fn write_item(
+    item: &ClipboardItem,
+    limits: &SizeLimits,
+) -> Result<AppliedClipboardWrite, ClipboardError> {
     retry_clipboard_io(|| write_item_once(item, limits))
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AppliedClipboardWrite {
+    pub content_hash: Option<String>,
 }
 
 pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String, ClipboardError> {
@@ -90,7 +99,38 @@ pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String,
     }
 }
 
-fn write_item_once(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), ClipboardError> {
+pub(crate) fn is_internal_file_payload(payload: &ClipboardPayload) -> bool {
+    let ClipboardPayload::FileList { paths, .. } = payload else {
+        return false;
+    };
+    if paths.is_empty() {
+        return false;
+    }
+    let internal_root = normalize_internal_path(&internal_clipboard_root());
+    paths
+        .iter()
+        .all(|path| normalize_internal_path(path).starts_with(&internal_root))
+}
+
+fn normalize_internal_path(path: &Path) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        path.as_os_str()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.as_os_str().to_string_lossy().into_owned()
+    }
+}
+
+fn write_item_once(
+    item: &ClipboardItem,
+    limits: &SizeLimits,
+) -> Result<AppliedClipboardWrite, ClipboardError> {
     if item.size_bytes > limits.max_item_bytes {
         return Err(ClipboardError::TooLarge {
             size_bytes: item.size_bytes,
@@ -104,16 +144,26 @@ fn write_item_once(item: &ClipboardItem, limits: &SizeLimits) -> Result<(), Clip
                 arboard::Clipboard::new().map_err(|e| ClipboardError::Backend(e.to_string()))?;
             clipboard
                 .set_text(text.clone())
-                .map_err(|e| ClipboardError::Backend(e.to_string()))
+                .map_err(|e| ClipboardError::Backend(e.to_string()))?;
+            Ok(AppliedClipboardWrite::default())
         }
-        ClipboardPayload::ImagePng { png_bytes } => write_image_payload(png_bytes, limits),
+        ClipboardPayload::ImagePng { png_bytes } => {
+            write_image_payload(png_bytes, limits)?;
+            Ok(AppliedClipboardWrite::default())
+        }
         ClipboardPayload::FileBundle {
             archive_bytes,
             top_level_names,
         } => write_file_bundle(item, archive_bytes, top_level_names, limits),
         ClipboardPayload::FileList { .. } => Err(ClipboardError::Unsupported),
-        ClipboardPayload::Html { html } => write_rich_text_payload("html", html),
-        ClipboardPayload::Rtf { rtf } => write_rich_text_payload("rtf", rtf),
+        ClipboardPayload::Html { html } => {
+            write_rich_text_payload("html", html)?;
+            Ok(AppliedClipboardWrite::default())
+        }
+        ClipboardPayload::Rtf { rtf } => {
+            write_rich_text_payload("rtf", rtf)?;
+            Ok(AppliedClipboardWrite::default())
+        }
     }
 }
 
@@ -363,7 +413,7 @@ fn collect_path_hash_records(
             kind: "dir".to_string(),
             path: normalized_path,
             size_bytes: 0,
-            content_hash: None,
+            sample_hash: None,
         });
 
         let mut children = fs::read_dir(source)
@@ -383,7 +433,7 @@ fn collect_path_hash_records(
         kind: "file".to_string(),
         path: normalized_path,
         size_bytes: metadata.len(),
-        content_hash: Some(hash_file_contents(source)?),
+        sample_hash: Some(sample_file_prefix_hash(source)?),
     });
     Ok(())
 }
@@ -408,29 +458,17 @@ fn hash_file_bundle_archive(archive_bytes: &[u8]) -> Result<String, ClipboardErr
                 kind: "dir".to_string(),
                 path: normalized_path,
                 size_bytes: 0,
-                content_hash: None,
+                sample_hash: None,
             });
             continue;
         }
 
-        let mut hasher = Sha256::new();
-        let mut size_bytes = 0u64;
-        let mut buffer = [0u8; 1024 * 1024];
-        loop {
-            let read_bytes = entry
-                .read(&mut buffer)
-                .map_err(|e| ClipboardError::Backend(e.to_string()))?;
-            if read_bytes == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read_bytes]);
-            size_bytes = size_bytes.saturating_add(read_bytes as u64);
-        }
+        let size_bytes = entry.header().size().unwrap_or(0);
         records.push(HashRecord {
             kind: "file".to_string(),
             path: normalized_path,
             size_bytes,
-            content_hash: Some(format!("{:x}", hasher.finalize())),
+            sample_hash: Some(sample_reader_prefix_hash(&mut entry)?),
         });
     }
 
@@ -442,7 +480,7 @@ struct HashRecord {
     kind: String,
     path: String,
     size_bytes: u64,
-    content_hash: Option<String>,
+    sample_hash: Option<String>,
 }
 
 fn finalize_hash_records(mut records: Vec<HashRecord>) -> String {
@@ -460,28 +498,36 @@ fn finalize_hash_records(mut records: Vec<HashRecord>) -> String {
         hasher.update([0]);
         hasher.update(record.size_bytes.to_le_bytes());
         hasher.update([0]);
-        if let Some(content_hash) = record.content_hash {
-            hasher.update(content_hash.as_bytes());
+        if let Some(sample_hash) = record.sample_hash {
+            hasher.update(sample_hash.as_bytes());
         }
         hasher.update([0xff]);
     }
     format!("{:x}", hasher.finalize())
 }
 
-fn hash_file_contents(path: &Path) -> Result<String, ClipboardError> {
-    let file = File::open(path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
-    let mut reader = BufReader::new(file);
+fn sample_file_prefix_hash(path: &Path) -> Result<String, ClipboardError> {
+    let mut file = File::open(path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    sample_reader_prefix_hash(&mut file)
+}
+
+fn sample_reader_prefix_hash<R: Read>(reader: &mut R) -> Result<String, ClipboardError> {
+    let mut remaining = FILE_HASH_SAMPLE_BYTES;
+    let mut buffer = [0u8; 8 * 1024];
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
-    loop {
+
+    while remaining > 0 {
+        let read_limit = remaining.min(buffer.len());
         let read_bytes = reader
-            .read(&mut buffer)
+            .read(&mut buffer[..read_limit])
             .map_err(|e| ClipboardError::Backend(e.to_string()))?;
         if read_bytes == 0 {
             break;
         }
         hasher.update(&buffer[..read_bytes]);
+        remaining -= read_bytes;
     }
+
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -559,7 +605,7 @@ fn write_file_bundle(
     archive_bytes: &[u8],
     top_level_names: &[String],
     limits: &SizeLimits,
-) -> Result<(), ClipboardError> {
+) -> Result<AppliedClipboardWrite, ClipboardError> {
     let size_bytes = archive_bytes.len() as u64;
     if size_bytes > limits.max_item_bytes {
         return Err(ClipboardError::TooLarge {
@@ -568,7 +614,7 @@ fn write_file_bundle(
         });
     }
 
-    let bundle_dir = std::env::temp_dir().join("lan-clipboard").join(&item.id);
+    let bundle_dir = internal_clipboard_root().join(&item.id);
     if bundle_dir.exists() {
         fs::remove_dir_all(&bundle_dir).map_err(|e| ClipboardError::Backend(e.to_string()))?;
     }
@@ -586,7 +632,14 @@ fn write_file_bundle(
         ));
     }
 
-    write_file_list(&restored_paths)
+    write_file_list(&restored_paths)?;
+    Ok(AppliedClipboardWrite {
+        content_hash: Some(hash_file_list(&restored_paths)?),
+    })
+}
+
+fn internal_clipboard_root() -> PathBuf {
+    std::env::temp_dir().join("lan-clipboard")
 }
 
 fn unpack_archive_into(bytes: &[u8], destination: &Path) -> Result<(), ClipboardError> {
