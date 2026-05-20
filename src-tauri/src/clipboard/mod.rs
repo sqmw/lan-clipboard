@@ -19,6 +19,10 @@ const CLIPBOARD_IO_DELAY_MS: u64 = 40;
 const IMAGE_SCALE_NUMERATOR: u32 = 85;
 const IMAGE_SCALE_DENOMINATOR: u32 = 100;
 const FILE_HASH_SAMPLE_BYTES: usize = 64 * 1024;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Debug, Error)]
 pub enum ClipboardError {
     #[error("clipboard backend error: {0}")]
@@ -190,6 +194,17 @@ where
         ClipboardError::Backend("clipboard backend exhausted retries".to_string())
     }))
 }
+
+#[cfg(target_os = "windows")]
+fn hide_windows_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn hide_windows_command_window(_command: &mut Command) {}
 
 fn encode_image_payload(
     mut rgba: RgbaImage,
@@ -1124,7 +1139,9 @@ if ([System.Windows.Forms.Clipboard]::ContainsData([System.Windows.Forms.DataFor
   Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($value)))
 }
 "#;
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    hide_windows_command_window(&mut command);
+    let output = command
         .arg("-NoProfile")
         .arg("-STA")
         .arg("-Command")
@@ -1188,7 +1205,9 @@ switch ($format) {
 }
 [System.Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
 "#;
-    let output = Command::new("powershell")
+    let mut command = Command::new("powershell");
+    hide_windows_command_window(&mut command);
+    let output = command
         .arg("-NoProfile")
         .arg("-STA")
         .arg("-Command")
