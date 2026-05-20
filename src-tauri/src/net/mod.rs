@@ -3,6 +3,7 @@ use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
 use aes_gcm_siv::aead::{Aead, KeyInit};
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
+#[cfg(not(target_os = "macos"))]
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use rand::RngCore;
@@ -25,10 +26,11 @@ const LOG_LIMIT: usize = 800;
 const DISCOVERY_REFRESH_MS: u64 = 3_000;
 const DISCOVERY_TIMEOUT_MS: u64 = 900;
 const DISCOVERY_MEMBER_TTL_MS: u64 = 30_000;
+const DISCOVERY_REACHABILITY_TIMEOUT_MS: u64 = 220;
 const UDP_DISCOVERY_PORT: u16 = 32911;
 const UDP_ANNOUNCE_MS: u64 = 500;
+const PRESENCE_RETRY_MS: u64 = 1_000;
 const DISCOVERY_APP: &str = "lan-clipboard";
-const LOCAL_EVENT_DEBOUNCE_MS: u64 = 250;
 const APPLIED_HASH_TTL_MS: u64 = 10_000;
 const RECENT_EVENT_TTL_MS: u64 = 120_000;
 const QUEUE_RETRY_BASE_MS: u64 = 30;
@@ -261,6 +263,7 @@ enum QueueLane {
     Bulk,
 }
 
+#[cfg(not(target_os = "macos"))]
 struct ClipboardWatchHandler {
     runtime: Arc<RuntimeInner>,
     limits: crate::settings::SizeLimits,
@@ -285,7 +288,10 @@ impl SyncEngine {
         let recent_log_count = self.inner.logs.lock().map(|guard| guard.len()).unwrap_or(0);
         let effective_local_ip =
             selected_or_active_local_ip(settings, selected_local_ip, active_local_ip.clone());
-        let peer_count = visible_member_count(&self.inner, effective_local_ip.as_deref());
+        let peer_count = self
+            .devices(effective_local_ip.as_deref())
+            .len()
+            .saturating_add(1);
         RuntimeStatus {
             running: self.inner.running.load(Ordering::SeqCst),
             device_id: settings.sync_device_id(),
@@ -340,8 +346,14 @@ impl SyncEngine {
         filter_devices_for_local_ip(devices, selected_local_ip)
     }
 
-    pub fn merge_discovered_devices(&self, devices: Vec<DiscoveredDevice>) {
-        merge_discovered_devices(&self.inner, devices);
+    pub fn replace_discovered_devices(
+        &self,
+        selected_local_ip: Option<&str>,
+        devices: Vec<DiscoveredDevice>,
+        settings: &Settings,
+    ) {
+        replace_discovered_devices(&self.inner, selected_local_ip, devices);
+        reconcile_member_state(&self.inner, settings);
     }
 
     pub fn start(&self, settings: Settings, device_id: String) -> anyhow::Result<()> {
@@ -419,15 +431,22 @@ impl PresenceService {
             config.listen_port
         );
 
-        if self
+        let same_signature = self
             .inner
             .signature
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
             .as_deref()
-            == Some(signature.as_str())
-        {
+            == Some(signature.as_str());
+        let worker_running = self
+            .inner
+            .worker
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|worker| !worker.is_finished()))
+            .unwrap_or(false);
+        if same_signature && worker_running {
             return Ok(());
         }
 
@@ -463,49 +482,10 @@ impl Drop for PresenceService {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl ClipboardHandler for ClipboardWatchHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        let payload = match clipboard::read_snapshot(&self.limits) {
-            Ok(payload) => payload,
-            Err(clipboard::ClipboardError::Unsupported) => return CallbackResult::Next,
-            Err(error) => {
-                set_error(
-                    &self.runtime,
-                    format!("clipboard watcher read failed: {error}"),
-                );
-                return CallbackResult::Next;
-            }
-        };
-
-        let item = match build_item(&payload, &self.device_id) {
-            Ok(Some(item)) => item,
-            Ok(None) => return CallbackResult::Next,
-            Err(error) => {
-                set_error(
-                    &self.runtime,
-                    format!("clipboard watcher build item failed: {error}"),
-                );
-                return CallbackResult::Next;
-            }
-        };
-
-        if should_ignore_local_observation(&self.runtime, &item.content_hash) {
-            return CallbackResult::Next;
-        }
-
-        push_log(
-            &self.runtime,
-            "INFO",
-            &format!(
-                "detected local clipboard kind={} size_bytes={} item={}",
-                item.payload.kind(),
-                item.size_bytes,
-                item.id
-            ),
-        );
-        register_recent_event(&self.runtime, &item.id);
-        update_latest_item(&self.runtime, &item);
-        enqueue_outbound_item(&self.runtime, item);
+        process_local_clipboard_observation(&self.runtime, &self.limits, &self.device_id);
         CallbackResult::Next
     }
 
@@ -514,30 +494,112 @@ impl ClipboardHandler for ClipboardWatchHandler {
     }
 }
 
-fn run_presence_loop(runtime: Arc<PresenceInner>, config: PresenceConfig) {
-    let mdns = match ServiceDaemon::new() {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let service = match build_service_info(&config) {
-        Ok(value) => value,
-        Err(_) => {
-            let _ = mdns.shutdown();
+fn process_local_clipboard_observation(
+    runtime: &RuntimeInner,
+    limits: &crate::settings::SizeLimits,
+    device_id: &str,
+) {
+    let payload = match clipboard::read_snapshot(limits) {
+        Ok(payload) => payload,
+        Err(clipboard::ClipboardError::Unsupported) => return,
+        Err(error) => {
+            set_error(runtime, format!("clipboard watcher read failed: {error}"));
             return;
         }
     };
 
-    if mdns.register(service).is_err() {
-        let _ = mdns.shutdown();
+    let item = match build_item(&payload, device_id) {
+        Ok(Some(item)) => item,
+        Ok(None) => return,
+        Err(error) => {
+            set_error(
+                runtime,
+                format!("clipboard watcher build item failed: {error}"),
+            );
+            return;
+        }
+    };
+
+    if should_ignore_local_observation(runtime, &item.content_hash) {
         return;
     }
 
-    while !runtime.stop_flag.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(400));
-    }
+    push_log(
+        runtime,
+        "INFO",
+        &format!(
+            "detected local clipboard kind={} size_bytes={} item={}",
+            item.payload.kind(),
+            item.size_bytes,
+            item.id
+        ),
+    );
+    register_recent_event(runtime, &item.id);
+    update_latest_item(runtime, &item);
+    enqueue_outbound_item(runtime, item);
+}
 
-    if let Ok(status_rx) = mdns.shutdown() {
-        let _ = status_rx.recv_timeout(Duration::from_millis(300));
+#[cfg(target_os = "macos")]
+fn seed_local_clipboard_baseline(runtime: &RuntimeInner, limits: &crate::settings::SizeLimits) {
+    let Ok(payload) = clipboard::read_snapshot(limits) else {
+        return;
+    };
+    let Ok(content_hash) = clipboard::payload_content_hash(&payload) else {
+        return;
+    };
+    if let Ok(mut guard) = runtime.last_local_observed.lock() {
+        *guard = Some(ObservedClipboard {
+            content_hash,
+            observed_at_ms: now_ms(),
+        });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_clipboard_watch_poll_loop(
+    runtime: Arc<RuntimeInner>,
+    limits: crate::settings::SizeLimits,
+    device_id: String,
+    poll_interval: Duration,
+) {
+    seed_local_clipboard_baseline(&runtime, &limits);
+    while !runtime.stop_flag.load(Ordering::SeqCst) {
+        process_local_clipboard_observation(&runtime, &limits, &device_id);
+        std::thread::sleep(poll_interval);
+    }
+}
+
+fn run_presence_loop(runtime: Arc<PresenceInner>, config: PresenceConfig) {
+    while !runtime.stop_flag.load(Ordering::SeqCst) {
+        let mdns = match ServiceDaemon::new() {
+            Ok(value) => value,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(PRESENCE_RETRY_MS));
+                continue;
+            }
+        };
+        let service = match build_service_info(&config) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = mdns.shutdown();
+                std::thread::sleep(Duration::from_millis(PRESENCE_RETRY_MS));
+                continue;
+            }
+        };
+
+        if mdns.register(service).is_err() {
+            let _ = mdns.shutdown();
+            std::thread::sleep(Duration::from_millis(PRESENCE_RETRY_MS));
+            continue;
+        }
+
+        while !runtime.stop_flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(400));
+        }
+
+        if let Ok(status_rx) = mdns.shutdown() {
+            let _ = status_rx.recv_timeout(Duration::from_millis(300));
+        }
     }
 }
 
@@ -579,6 +641,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     let mut last_udp_announce = Instant::now() - Duration::from_millis(UDP_ANNOUNCE_MS);
     let device_name = local_device_name();
     let watcher_runtime = Arc::clone(&runtime);
+    #[cfg(not(target_os = "macos"))]
     let watcher_stop_runtime = Arc::clone(&runtime);
     let watcher_limits = settings.limits.clone();
     let watcher_device_id = device_id.clone();
@@ -586,28 +649,41 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
     let watcher = std::thread::Builder::new()
         .name("lan-clipboard-watch".to_string())
         .spawn(move || {
-            let handler = ClipboardWatchHandler {
-                runtime: watcher_runtime,
-                limits: watcher_limits,
-                device_id: watcher_device_id,
-                poll_interval: watcher_poll_interval,
-            };
-            let Ok(mut master) = Master::new(handler) else {
+            #[cfg(target_os = "macos")]
+            {
+                run_clipboard_watch_poll_loop(
+                    watcher_runtime,
+                    watcher_limits,
+                    watcher_device_id,
+                    watcher_poll_interval,
+                );
                 return;
-            };
-            let shutdown = master.shutdown_channel();
-            let _shutdown_guard = std::thread::Builder::new()
-                .name("lan-clipboard-watch-stop".to_string())
-                .spawn({
-                    let runtime = watcher_stop_runtime;
-                    move || {
-                        while !runtime.stop_flag.load(Ordering::SeqCst) {
-                            std::thread::sleep(Duration::from_millis(100));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let handler = ClipboardWatchHandler {
+                    runtime: watcher_runtime,
+                    limits: watcher_limits,
+                    device_id: watcher_device_id,
+                    poll_interval: watcher_poll_interval,
+                };
+                let Ok(mut master) = Master::new(handler) else {
+                    return;
+                };
+                let shutdown = master.shutdown_channel();
+                let _shutdown_guard = std::thread::Builder::new()
+                    .name("lan-clipboard-watch-stop".to_string())
+                    .spawn({
+                        let runtime = watcher_stop_runtime;
+                        move || {
+                            while !runtime.stop_flag.load(Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            shutdown.signal();
                         }
-                        shutdown.signal();
-                    }
-                });
-            let _ = master.run();
+                    });
+                let _ = master.run();
+            }
         })
         .ok();
 
@@ -840,8 +916,8 @@ fn refresh_discovered_devices(
         timeout_ms,
     ) {
         Ok(devices) => {
-            merge_discovered_devices(runtime, devices);
-            prune_stale_discovered_devices(runtime);
+            replace_discovered_devices(runtime, selected_local_ip, devices);
+            reconcile_member_state(runtime, settings);
         }
         Err(error) => set_error(runtime, format!("peer discovery failed: {error}")),
     }
@@ -1457,6 +1533,9 @@ fn stream_prepared_archive_to_peer(
     let mut sent_archive_bytes = 0u64;
 
     loop {
+        if transfer_should_abort(runtime, transfer_id) {
+            return Err(anyhow::anyhow!("transfer canceled"));
+        }
         if is_stale_marker(runtime, &item_marker(item)) {
             return Err(anyhow::anyhow!("superseded by newer clipboard item"));
         }
@@ -1519,6 +1598,9 @@ fn write_all_with_progress(
     let total_bytes = buffer.len() as u64;
     let mut offset = 0usize;
     while offset < buffer.len() {
+        if transfer_should_abort(runtime, transfer_id) {
+            return Err(anyhow::anyhow!("transfer canceled"));
+        }
         let end = (offset + TRANSFER_CHUNK_BYTES).min(buffer.len());
         if let Err(error) = stream.write_all(&buffer[offset..end]) {
             mark_transfer_failed(runtime, transfer_id, error.to_string());
@@ -1694,6 +1776,49 @@ fn process_outbound_queue(
     }
 }
 
+fn reconcile_member_state(runtime: &RuntimeInner, settings: &Settings) {
+    let visible_peers = collect_peer_targets(runtime, settings);
+    let visible_peer_ips = visible_peers
+        .iter()
+        .filter_map(|peer| peer.parse::<SocketAddr>().ok())
+        .map(|socket_addr| socket_addr.ip().to_string())
+        .collect::<HashSet<_>>();
+
+    if visible_peers.is_empty() {
+        if let Ok(mut guard) = runtime.outbound_queue.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = runtime.transfers.lock() {
+            for entry in guard.iter_mut() {
+                if matches!(entry.direction.as_str(), "send")
+                    && matches!(entry.status.as_str(), "sending" | "retrying")
+                {
+                    entry.status = "failed".to_string();
+                    entry.error = Some("共享域只剩本机，已停止发送".to_string());
+                    entry.updated_at_ms = now_ms();
+                }
+            }
+        }
+        return;
+    }
+
+    if let Ok(mut guard) = runtime.transfers.lock() {
+        for entry in guard.iter_mut() {
+            if entry.direction != "receive" || entry.status != "receiving" {
+                continue;
+            }
+            let Some(socket_addr) = entry.peer.parse::<SocketAddr>().ok() else {
+                continue;
+            };
+            if !visible_peer_ips.contains(&socket_addr.ip().to_string()) {
+                entry.status = "failed".to_string();
+                entry.error = Some("发送方已离线，已停止接收".to_string());
+                entry.updated_at_ms = now_ms();
+            }
+        }
+    }
+}
+
 fn pop_ready_queue_entry(queue: &Mutex<VecDeque<QueueEntry>>) -> Option<QueueEntry> {
     let now = now_ms();
     queue.lock().ok().and_then(|mut guard| {
@@ -1827,39 +1952,9 @@ fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<Stri
             }
         }
     }
-    if let Ok(guard) = runtime.known_members.lock() {
-        for member in guard.iter() {
-            if let Some(addr) = member.strip_prefix("addr:") {
-                let normalized = normalize_peer(addr, settings.sync.listen_port);
-                if is_expected_listen_addr(&normalized, settings.sync.listen_port) {
-                    if let Ok(socket_addr) = normalized.parse::<SocketAddr>() {
-                        if is_self_socket_addr(&socket_addr, effective_local_ip.as_deref()) {
-                            continue;
-                        }
-                        if let Some(selected_ipv4) = selected_ipv4 {
-                            if let std::net::IpAddr::V4(peer_ipv4) = socket_addr.ip() {
-                                if !is_same_subnet(selected_ipv4, peer_ipv4) {
-                                    continue;
-                                }
-                            }
-                        }
-                        peer_by_ip
-                            .entry(socket_addr.ip().to_string())
-                            .or_insert(normalized);
-                    }
-                }
-            }
-        }
-    }
     let mut peers = peer_by_ip.into_values().collect::<Vec<_>>();
     peers.sort();
     peers
-}
-
-fn is_expected_listen_addr(addr: &str, listen_port: u16) -> bool {
-    addr.parse::<SocketAddr>()
-        .map(|socket_addr| socket_addr.port() == listen_port)
-        .unwrap_or(false)
 }
 
 fn is_self_socket_addr(socket_addr: &SocketAddr, effective_local_ip: Option<&str>) -> bool {
@@ -1902,16 +1997,6 @@ fn tune_stream_for_receive(stream: &TcpStream, payload_bytes: u64) {
     let socket = SockRef::from(stream);
     let _ = socket.set_send_buffer_size(TCP_BUFFER_BYTES);
     let _ = socket.set_recv_buffer_size(TCP_BUFFER_BYTES);
-}
-
-fn visible_member_count(runtime: &RuntimeInner, effective_local_ip: Option<&str>) -> usize {
-    let devices = runtime
-        .discovered_devices
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
-    let filtered = filter_devices_for_local_ip(devices, effective_local_ip);
-    filtered.len().saturating_add(1)
 }
 
 fn mark_known_member(runtime: &RuntimeInner, kind: &str, member: &str) {
@@ -1992,6 +2077,73 @@ fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevic
     }
 }
 
+fn replace_discovered_devices(
+    runtime: &RuntimeInner,
+    selected_local_ip: Option<&str>,
+    devices: Vec<DiscoveredDevice>,
+) {
+    let now = Instant::now();
+    let selected_ipv4 = parse_selected_ipv4(selected_local_ip).ok().flatten();
+    let existing_devices = runtime
+        .discovered_devices
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    let new_ids = devices
+        .iter()
+        .filter(|device| !device.device_id.trim().is_empty())
+        .map(|device| device.device_id.clone())
+        .collect::<HashSet<_>>();
+
+    if let Ok(mut seen_at) = runtime.discovered_seen_at.lock() {
+        if let Some(selected_ipv4) = selected_ipv4 {
+            seen_at.retain(|device_id, _| {
+                if new_ids.contains(device_id) {
+                    return true;
+                }
+                existing_devices
+                    .iter()
+                    .find(|device| &device.device_id == device_id)
+                    .map(|device| !device_matches_selected_subnet(&device, selected_ipv4))
+                    .unwrap_or(false)
+            });
+        } else {
+            seen_at.retain(|device_id, _| new_ids.contains(device_id));
+        }
+        for device in &devices {
+            if !device.device_id.trim().is_empty() {
+                seen_at.insert(device.device_id.clone(), now);
+            }
+        }
+    }
+
+    if let Ok(mut guard) = runtime.discovered_devices.lock() {
+        if let Some(selected_ipv4) = selected_ipv4 {
+            guard.retain(|device| {
+                !device_matches_selected_subnet(device, selected_ipv4)
+                    || new_ids.contains(&device.device_id)
+            });
+        } else {
+            guard.retain(|device| new_ids.contains(&device.device_id));
+        }
+
+        for device in devices {
+            if device.device_id.trim().is_empty() {
+                continue;
+            }
+            if let Some(existing) = guard
+                .iter_mut()
+                .find(|existing| existing.device_id == device.device_id)
+            {
+                *existing = device;
+            } else {
+                guard.push(device);
+            }
+        }
+        guard.sort_by(|left, right| left.device_name.cmp(&right.device_name));
+    }
+}
+
 fn prune_stale_discovered_devices(runtime: &RuntimeInner) {
     let active_ids = match runtime.discovered_seen_at.lock() {
         Ok(mut seen_at) => {
@@ -2008,16 +2160,15 @@ fn prune_stale_discovered_devices(runtime: &RuntimeInner) {
     }
 }
 
-fn normalize_peer(peer: &str, fallback_port: u16) -> String {
-    let value = peer.trim();
-    if value.is_empty() {
-        return String::new();
-    }
-    if value.contains(':') {
-        value.to_string()
-    } else {
-        format!("{}:{}", value, fallback_port)
-    }
+fn device_matches_selected_subnet(
+    device: &DiscoveredDevice,
+    selected_ipv4: std::net::Ipv4Addr,
+) -> bool {
+    device
+        .addr
+        .parse::<std::net::Ipv4Addr>()
+        .map(|peer_ipv4| is_same_subnet(selected_ipv4, peer_ipv4))
+        .unwrap_or(false)
 }
 
 pub fn build_item(
@@ -2310,10 +2461,9 @@ fn should_ignore_local_observation(runtime: &RuntimeInner, content_hash: &str) -
 
     let observed_at_ms = now_ms();
     if let Ok(mut guard) = runtime.last_local_observed.lock() {
-        if let Some(previous) = guard.as_ref() {
-            if previous.content_hash == content_hash
-                && observed_at_ms.saturating_sub(previous.observed_at_ms) <= LOCAL_EVENT_DEBOUNCE_MS
-            {
+        if let Some(previous) = guard.as_mut() {
+            if previous.content_hash == content_hash {
+                previous.observed_at_ms = observed_at_ms;
                 return true;
             }
         }
@@ -2601,6 +2751,16 @@ fn update_transfer_progress(
     }
 }
 
+fn transfer_should_abort(runtime: &RuntimeInner, transfer_id: &str) -> bool {
+    runtime
+        .transfers
+        .lock()
+        .ok()
+        .and_then(|guard| guard.iter().find(|entry| entry.id == transfer_id).cloned())
+        .map(|entry| entry.status == "failed")
+        .unwrap_or(false)
+}
+
 fn update_transfer_metadata(
     runtime: &RuntimeInner,
     transfer_id: &str,
@@ -2798,7 +2958,41 @@ pub fn discover_devices(
     }
 
     shutdown_discovery_daemon(&mdns, receiver);
-    Ok(devices)
+    Ok(filter_reachable_discovered_devices(
+        devices,
+        DISCOVERY_REACHABILITY_TIMEOUT_MS,
+    ))
+}
+
+fn filter_reachable_discovered_devices(
+    devices: Vec<DiscoveredDevice>,
+    timeout_ms: u64,
+) -> Vec<DiscoveredDevice> {
+    let handles = devices
+        .into_iter()
+        .map(|device| {
+            std::thread::spawn(move || {
+                if discovered_device_is_reachable(&device, timeout_ms) {
+                    Some(device)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .filter_map(|handle| handle.join().ok().flatten())
+        .collect()
+}
+
+fn discovered_device_is_reachable(device: &DiscoveredDevice, timeout_ms: u64) -> bool {
+    let Ok(ip) = device.addr.parse::<IpAddr>() else {
+        return false;
+    };
+    let socket_addr = SocketAddr::new(ip, device.port);
+    TcpStream::connect_timeout(&socket_addr, Duration::from_millis(timeout_ms)).is_ok()
 }
 
 pub fn list_network_interfaces() -> Vec<NetworkInterfaceOption> {

@@ -9,6 +9,8 @@ use crate::state::AppState;
 use tauri::{AppHandle, Manager, State};
 use tokio::task;
 
+const MANUAL_DISCOVERY_SETTLE_MS: u64 = 700;
+
 pub fn settings_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
     let dir = app.path().app_config_dir()?;
     Ok(dir.join("settings.json"))
@@ -161,7 +163,8 @@ pub async fn discover_devices(
         let devices =
             net::discover_devices(&device_id, &shared_code, selected_local_ip.as_deref(), 2200)
                 .map_err(|e| e.to_string())?;
-        sync_engine.merge_discovered_devices(devices);
+        sync_engine.replace_discovered_devices(selected_local_ip.as_deref(), devices, &settings);
+        std::thread::sleep(std::time::Duration::from_millis(MANUAL_DISCOVERY_SETTLE_MS));
         Ok(sync_engine.devices(selected_local_ip.as_deref()))
     })
     .await

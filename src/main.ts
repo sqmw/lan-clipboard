@@ -98,6 +98,7 @@ let draftLanguage: string | null = null;
 let statusRefreshRunning = false;
 let transferRefreshRunning = false;
 let manualRefreshRunning = false;
+let deviceRefreshGeneration = 0;
 let lastStatusKey = "";
 let lastDevicesKey = "";
 let lastRenderedSelfKey = "";
@@ -351,10 +352,14 @@ async function refreshStatus(): Promise<void> {
     return;
   }
   statusRefreshRunning = true;
+  const refreshGeneration = deviceRefreshGeneration;
   try {
   const status = await invoke<RuntimeStatus>("sync_status", {
     selectedLocalIp: getSelectedNetworkIp() || null,
   });
+  if (refreshGeneration !== deviceRefreshGeneration) {
+    return;
+  }
   const nextStatusKey = JSON.stringify(status);
   const previousLocalIp = currentStatus?.local_ip?.trim() ?? "";
   const nextLocalIp = status.local_ip?.trim() ?? "";
@@ -363,8 +368,6 @@ async function refreshStatus(): Promise<void> {
     getText("status-running").textContent = `${t("app.status.label")}: ${
       status.running ? t("app.status.running") : t("app.status.stopped")
     }`;
-    observedMemberCount = Math.max(observedMemberCount, status.peer_count, 1);
-    getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
     lastStatusKey = nextStatusKey;
   }
   if (previousLocalIp !== nextLocalIp) {
@@ -461,6 +464,7 @@ async function scanDevices(): Promise<void> {
     return;
   }
   manualRefreshRunning = true;
+  const refreshGeneration = ++deviceRefreshGeneration;
   const button = document.querySelector("#refresh-domain") as HTMLButtonElement | null;
   const feedback = getText("scan-feedback");
   if (button) {
@@ -472,6 +476,9 @@ async function scanDevices(): Promise<void> {
     const devices = await invoke<DiscoveredDevice[]>("discover_devices", {
       selectedLocalIp: getSelectedNetworkIp() || null,
     });
+    if (refreshGeneration !== deviceRefreshGeneration) {
+      return;
+    }
     renderDevices(devices);
     feedback.textContent =
       devices.length > 0
@@ -490,9 +497,16 @@ async function scanDevices(): Promise<void> {
 }
 
 async function refreshCachedDevices(): Promise<void> {
+  if (manualRefreshRunning) {
+    return;
+  }
+  const refreshGeneration = deviceRefreshGeneration;
   const devices = await invoke<DiscoveredDevice[]>("cached_devices", {
     selectedLocalIp: getSelectedNetworkIp() || null,
   });
+  if (refreshGeneration !== deviceRefreshGeneration || manualRefreshRunning) {
+    return;
+  }
   renderDevices(devices);
 }
 
