@@ -19,6 +19,8 @@ const CLIPBOARD_IO_DELAY_MS: u64 = 40;
 const IMAGE_SCALE_NUMERATOR: u32 = 85;
 const IMAGE_SCALE_DENOMINATOR: u32 = 100;
 const FILE_HASH_SAMPLE_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "windows")]
+const CF_HTML_HEADER_SCAN_BYTES: usize = 4096;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1182,29 +1184,32 @@ fn read_html_payload_windows(
 ) -> Result<Option<ClipboardPayload>, ClipboardError> {
     use clipboard_win::{formats, is_format_avail, Clipboard, Getter};
 
-    let Some(format) = formats::Html::new() else {
+    let Some(html_format) = clipboard_win::register_format("HTML Format") else {
         return Ok(None);
     };
-    if !is_format_avail(format.code()) {
+    if !is_format_avail(html_format.get()) {
         return Ok(None);
     }
 
     let _clip = Clipboard::new_attempts(CLIPBOARD_IO_RETRIES)
         .map_err(|e| ClipboardError::Backend(format!("open windows clipboard for html: {e}")))?;
-    let mut html = String::new();
-    format
-        .read_clipboard(&mut html)
+    let mut raw_bytes = Vec::new();
+    formats::RawData(html_format.get())
+        .read_clipboard(&mut raw_bytes)
         .map_err(|e| ClipboardError::Backend(format!("read windows html: {e}")))?;
-    let size_bytes = html.as_bytes().len() as u64;
-    if size_bytes == 0 {
+    if raw_bytes.is_empty() {
         return Ok(None);
     }
+
+    let html = normalize_windows_cf_html(&raw_bytes)?;
+    let size_bytes = html.as_bytes().len() as u64;
     if size_bytes > limits.max_item_bytes {
         return Err(ClipboardError::TooLarge {
             size_bytes,
             limit_bytes: limits.max_item_bytes,
         });
     }
+
     Ok(Some(ClipboardPayload::Html { html }))
 }
 
@@ -1286,4 +1291,46 @@ fn parse_rich_text_output(
         "rtf" => Ok(Some(ClipboardPayload::Rtf { rtf: value })),
         _ => Ok(None),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_windows_cf_html(raw_bytes: &[u8]) -> Result<String, ClipboardError> {
+    if raw_bytes.is_empty() {
+        return Err(ClipboardError::Backend(
+            "windows html clipboard payload is empty".to_string(),
+        ));
+    }
+
+    let header_scan = &raw_bytes[..raw_bytes.len().min(CF_HTML_HEADER_SCAN_BYTES)];
+    let header_text = String::from_utf8_lossy(header_scan);
+    let start_html = parse_cf_html_offset(&header_text, "StartHTML:");
+    let end_html = parse_cf_html_offset(&header_text, "EndHTML:");
+    let start_fragment = parse_cf_html_offset(&header_text, "StartFragment:");
+    let end_fragment = parse_cf_html_offset(&header_text, "EndFragment:");
+
+    if let (Some(start), Some(end)) = (start_html, end_html) {
+        if let Some(slice) = raw_bytes.get(start..end) {
+            return String::from_utf8(slice.to_vec())
+                .map_err(|e| ClipboardError::Backend(format!("decode windows cf_html: {e}")));
+        }
+    }
+
+    if let (Some(start), Some(end)) = (start_fragment, end_fragment) {
+        if let Some(slice) = raw_bytes.get(start..end) {
+            return String::from_utf8(slice.to_vec()).map_err(|e| {
+                ClipboardError::Backend(format!("decode windows cf_html fragment: {e}"))
+            });
+        }
+    }
+
+    String::from_utf8(raw_bytes.to_vec())
+        .map_err(|e| ClipboardError::Backend(format!("decode windows html payload: {e}")))
+}
+
+#[cfg(target_os = "windows")]
+fn parse_cf_html_offset(header_text: &str, key: &str) -> Option<usize> {
+    header_text
+        .lines()
+        .find_map(|line| line.strip_prefix(key))
+        .and_then(|value| value.trim().parse::<usize>().ok())
 }

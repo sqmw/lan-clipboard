@@ -161,6 +161,7 @@
 
 - 先确认源应用确实写入了 `HTML` 或 `RTF`
 - 某些应用只暴露私有格式时，当前版本会回退成纯文本
+- Windows 源应用如果走 `CF_HTML`，当前应直接传输 `StartHTML/EndHTML` 指向的真实 `HTML` 正文；如果目标端还能看到 `Version:...StartHTML...` 头，说明 `CF_HTML` 规范化链路回归了
 
 ## 建议联调顺序
 
