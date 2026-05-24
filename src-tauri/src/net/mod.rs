@@ -3183,6 +3183,10 @@ pub fn list_network_interfaces() -> Vec<NetworkInterfaceOption> {
             right.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
         is_private_lan_ipv4(right_ip)
             .cmp(&is_private_lan_ipv4(left_ip))
+            .then_with(|| {
+                is_likely_virtual_interface(&left.name)
+                    .cmp(&is_likely_virtual_interface(&right.name))
+            })
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.ip.cmp(&right.ip))
     });
@@ -3252,13 +3256,39 @@ fn pick_ipv4(addresses: &HashSet<IpAddr>) -> Option<String> {
 
 fn pick_local_ip() -> anyhow::Result<IpAddr> {
     let all = local_ip_address::list_afinet_netifas()?;
-    let candidates = all.into_iter().filter_map(|(_, ip)| match ip {
-        IpAddr::V4(v4) => Some(v4),
-        IpAddr::V6(_) => None,
-    });
-    pick_best_ipv4(candidates)
+    let candidates = all
+        .into_iter()
+        .filter_map(|(name, ip)| match ip {
+            IpAddr::V4(v4) => Some((name, v4)),
+            IpAddr::V6(_) => None,
+        })
+        .filter(|(name, ipv4)| is_usable_ipv4(*ipv4) && !is_likely_virtual_interface(name));
+    pick_best_ipv4(candidates.map(|(_, ip)| ip))
         .map(IpAddr::V4)
         .ok_or_else(|| anyhow::anyhow!("no usable local ipv4 address found"))
+}
+
+fn is_likely_virtual_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    #[cfg(target_os = "windows")]
+    {
+        return lower.contains("vethernet")
+            || lower.contains("hyper-v")
+            || lower.contains("virtual")
+            || lower.contains("vmware")
+            || lower.contains("virtualbox")
+            || lower.contains("wsl")
+            || lower.contains("tailscale")
+            || lower.contains("hamachi")
+            || lower.contains("tap")
+            || lower.contains("tun")
+            || lower.contains("loopback");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = lower;
+        false
+    }
 }
 
 fn selected_or_active_local_ip(
@@ -3293,12 +3323,28 @@ fn resolve_local_ip_override(value: &str) -> anyhow::Result<Option<IpAddr>> {
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid selected local ip: {trimmed}"))?;
     match parsed {
-        IpAddr::V4(ipv4) if is_usable_ipv4(ipv4) => Ok(Some(IpAddr::V4(ipv4))),
+        IpAddr::V4(ipv4) if is_usable_ipv4(ipv4) => {
+            if is_ipv4_assigned_locally(ipv4) {
+                Ok(Some(IpAddr::V4(ipv4)))
+            } else {
+                Ok(None)
+            }
+        }
         IpAddr::V4(_) => Err(anyhow::anyhow!(
             "selected local ip is not usable: {trimmed}"
         )),
         IpAddr::V6(_) => Err(anyhow::anyhow!("selected local ip must be ipv4: {trimmed}")),
     }
+}
+
+fn is_ipv4_assigned_locally(ipv4: std::net::Ipv4Addr) -> bool {
+    let Ok(all) = local_ip_address::list_afinet_netifas() else {
+        return true;
+    };
+    all.into_iter().any(|(_, ip)| match ip {
+        IpAddr::V4(found) => found == ipv4,
+        IpAddr::V6(_) => false,
+    })
 }
 
 fn pick_best_ipv4<I>(candidates: I) -> Option<std::net::Ipv4Addr>
