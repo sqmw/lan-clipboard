@@ -42,6 +42,11 @@ const MIN_WRITE_TIMEOUT_MS: u64 = 8_000;
 const MAX_WRITE_TIMEOUT_MS: u64 = 120_000;
 const WRITE_TIMEOUT_BYTES_PER_MS: u64 = 512;
 const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 50;
+const CLIPBOARD_WATCH_MAX_INTERVAL_MS: u64 = 500;
+const MAIN_LOOP_ACTIVE_SLEEP_MS: u64 = 15;
+const MAIN_LOOP_IDLE_SLEEP_MS: u64 = 80;
+const QUEUE_LOOP_ACTIVE_SLEEP_MS: u64 = 5;
+const QUEUE_LOOP_IDLE_SLEEP_MS: u64 = 40;
 const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -489,7 +494,7 @@ impl Drop for PresenceService {
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 impl ClipboardHandler for ClipboardWatchHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        process_local_clipboard_observation(&self.runtime, &self.limits, &self.device_id);
+        let _ = process_local_clipboard_observation(&self.runtime, &self.limits, &self.device_id);
         CallbackResult::Next
     }
 
@@ -502,13 +507,13 @@ fn process_local_clipboard_observation(
     runtime: &RuntimeInner,
     limits: &crate::settings::SizeLimits,
     device_id: &str,
-) {
+) -> bool {
     let payload = match clipboard::read_snapshot(limits) {
         Ok(payload) => payload,
-        Err(clipboard::ClipboardError::Unsupported) => return,
+        Err(clipboard::ClipboardError::Unsupported) => return false,
         Err(error) => {
             set_error(runtime, format!("clipboard watcher read failed: {error}"));
-            return;
+            return false;
         }
     };
 
@@ -522,23 +527,23 @@ fn process_local_clipboard_observation(
             "DEBUG",
             "drop local observation from internal clipboard file payload",
         );
-        return;
+        return false;
     }
 
     let item = match build_item(&payload, device_id) {
         Ok(Some(item)) => item,
-        Ok(None) => return,
+        Ok(None) => return false,
         Err(error) => {
             set_error(
                 runtime,
                 format!("clipboard watcher build item failed: {error}"),
             );
-            return;
+            return false;
         }
     };
 
     if should_ignore_local_observation(runtime, &item) {
-        return;
+        return false;
     }
 
     push_log(
@@ -554,6 +559,7 @@ fn process_local_clipboard_observation(
     register_recent_event(runtime, &item.id);
     update_latest_item(runtime, &item);
     enqueue_outbound_item(runtime, item);
+    true
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -580,9 +586,16 @@ fn run_clipboard_watch_poll_loop(
     poll_interval: Duration,
 ) {
     seed_local_clipboard_baseline(&runtime, &limits);
+    let mut current_interval = poll_interval;
     while !runtime.stop_flag.load(Ordering::SeqCst) {
-        process_local_clipboard_observation(&runtime, &limits, &device_id);
-        std::thread::sleep(poll_interval);
+        let changed = process_local_clipboard_observation(&runtime, &limits, &device_id);
+        if changed {
+            current_interval = poll_interval;
+        } else {
+            let max_interval = Duration::from_millis(CLIPBOARD_WATCH_MAX_INTERVAL_MS);
+            current_interval = (current_interval + current_interval).min(max_interval);
+        }
+        std::thread::sleep(current_interval);
     }
 }
 
@@ -778,7 +791,22 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
         prune_recent_event_ids(&runtime);
         prune_prepared_archives(&runtime);
 
-        std::thread::sleep(Duration::from_millis(10));
+        let queue_busy = runtime
+            .outbound_queue
+            .lock()
+            .map(|guard| !guard.is_empty())
+            .unwrap_or(true)
+            || runtime
+                .inbound_queue
+                .lock()
+                .map(|guard| !guard.is_empty())
+                .unwrap_or(true);
+        let sleep_ms = if has_active_transfers(&runtime) || queue_busy {
+            MAIN_LOOP_ACTIVE_SLEEP_MS
+        } else {
+            MAIN_LOOP_IDLE_SLEEP_MS
+        };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     if let Some(handle) = watcher {
@@ -798,8 +826,13 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
 fn run_inbound_apply_loop(runtime: Arc<RuntimeInner>, settings: Settings) {
     while !runtime.stop_flag.load(Ordering::SeqCst) {
-        process_inbound_queue(&runtime, &settings);
-        std::thread::sleep(Duration::from_millis(10));
+        let did_work = process_inbound_queue(&runtime, &settings);
+        let sleep_ms = if did_work {
+            QUEUE_LOOP_ACTIVE_SLEEP_MS
+        } else {
+            QUEUE_LOOP_IDLE_SLEEP_MS
+        };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 }
 
@@ -809,8 +842,13 @@ fn run_outbound_dispatch_loop(
     allowed_lanes: &'static [QueueLane],
 ) {
     while !runtime.stop_flag.load(Ordering::SeqCst) {
-        process_outbound_queue(&runtime, &settings, allowed_lanes);
-        std::thread::sleep(Duration::from_millis(10));
+        let did_work = process_outbound_queue(&runtime, &settings, allowed_lanes);
+        let sleep_ms = if did_work {
+            QUEUE_LOOP_ACTIVE_SLEEP_MS
+        } else {
+            QUEUE_LOOP_IDLE_SLEEP_MS
+        };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 }
 
@@ -1629,11 +1667,13 @@ fn write_all_with_progress(
     Ok(())
 }
 
-fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
+fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) -> bool {
+    let mut did_work = false;
     loop {
         let Some(mut entry) = pop_ready_queue_entry(&runtime.inbound_queue) else {
             break;
         };
+        did_work = true;
         if is_stale_marker(runtime, &item_marker(&entry.item)) {
             if let Some(transfer_id) = find_receive_transfer_id(runtime, &entry.item.id) {
                 mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
@@ -1723,18 +1763,21 @@ fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) {
             }
         }
     }
+    did_work
 }
 
 fn process_outbound_queue(
     runtime: &RuntimeInner,
     settings: &Settings,
     allowed_lanes: &[QueueLane],
-) {
+) -> bool {
+    let mut did_work = false;
     loop {
         let Some(mut entry) = pop_ready_outbound_entry(&runtime.outbound_queue, allowed_lanes)
         else {
             break;
         };
+        did_work = true;
         if is_stale_marker(runtime, &item_marker(&entry.item)) {
             clear_content_inflight(runtime, &entry.item.content_hash);
             push_log(
@@ -1801,6 +1844,7 @@ fn process_outbound_queue(
             ),
         );
     }
+    did_work
 }
 
 fn reconcile_member_state(runtime: &RuntimeInner, settings: &Settings) {
