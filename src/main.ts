@@ -401,18 +401,88 @@ function renderDeviceRow(
   return `<div class="${rowClass}"><span>${escapeHtml(title)} <em>${escapeHtml(subtitle)}</em></span><span class="device-tag">${escapeHtml(tag)}</span></div>`;
 }
 
+function isUuidLike(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
+}
+
+function isDeviceNameFallback(deviceName: string): boolean {
+  const trimmed = deviceName.trim();
+  return (
+    !trimmed ||
+    trimmed === "当前设备" ||
+    trimmed === "This device" ||
+    trimmed === t("app.self.device") ||
+    isUuidLike(trimmed)
+  );
+}
+
+function getLocalDeviceDisplayName(): string {
+  const statusName = currentStatus?.device_name?.trim() ?? "";
+  if (!isDeviceNameFallback(statusName)) {
+    return statusName;
+  }
+
+  const localIds = new Set(
+    [currentStatus?.device_id, settings?.sync?.device_id]
+      .map((id) => id?.trim())
+      .filter((id): id is string => Boolean(id)),
+  );
+  const discoveredLocalName = lastDiscovered
+    .find((device) => localIds.has(device.device_id.trim()) && !isDeviceNameFallback(device.device_name))
+    ?.device_name.trim();
+
+  return discoveredLocalName || statusName || t("app.self.device");
+}
+
+function getDeviceDisplayName(device: DiscoveredDevice): string {
+  const localIds = new Set(
+    [currentStatus?.device_id, settings?.sync?.device_id]
+      .map((id) => id?.trim())
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  if (localIds.has(device.device_id.trim())) {
+    return getLocalDeviceDisplayName();
+  }
+
+  const deviceName = device.device_name.trim();
+  return isDeviceNameFallback(deviceName) ? device.device_id : deviceName;
+}
+
+function orderDevicesWithLocalFirst(devices: DiscoveredDevice[]): DiscoveredDevice[] {
+  const localIds = new Set(
+    [currentStatus?.device_id, settings?.sync?.device_id]
+      .map((id) => id?.trim())
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  if (!localIds.size) {
+    return devices;
+  }
+
+  return [...devices].sort((left, right) => {
+    const leftIsLocal = localIds.has(left.device_id.trim());
+    const rightIsLocal = localIds.has(right.device_id.trim());
+    if (leftIsLocal === rightIsLocal) {
+      return 0;
+    }
+    return leftIsLocal ? -1 : 1;
+  });
+}
+
 function renderDevices(devices: DiscoveredDevice[]): void {
   const container = getText("discovered-devices");
   const feedback = getText("scan-feedback");
   lastDiscovered = devices;
   observedMemberCount = Math.max(1, devices.length + 1);
   getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
-  const selfName = currentStatus?.device_name || t("app.self.device");
+  const selfName = getLocalDeviceDisplayName();
   const selfIp = currentStatus?.local_ip?.trim();
   const selfMeta = selfIp ? `${t("app.self")} · ${selfIp}` : t("app.self");
   const selfRenderKey = `${selfName}|${selfMeta}|${membersExpanded ? "1" : "0"}`;
+  const orderedDevices = orderDevicesWithLocalFirst(devices);
   const devicesKey = JSON.stringify(
-    devices.map((device) => [device.device_id, device.device_name, device.addr, device.port]),
+    orderedDevices.map((device) => [device.device_id, device.device_name, device.addr, device.port]),
   );
   if (lastDevicesKey === devicesKey && lastRenderedSelfKey === selfRenderKey) {
     feedback.textContent = devices.length
@@ -422,10 +492,10 @@ function renderDevices(devices: DiscoveredDevice[]): void {
   }
   lastDevicesKey = devicesKey;
   lastRenderedSelfKey = selfRenderKey;
-  const remoteRows = devices.length
-    ? devices
+  const remoteRows = orderedDevices.length
+    ? orderedDevices
         .map((device) =>
-          renderDeviceRow(device.device_name, device.addr, t("app.domain.member_tag")),
+          renderDeviceRow(getDeviceDisplayName(device), device.addr, t("app.domain.member_tag")),
         )
         .join("")
     : `<p class="empty-members">${escapeHtml(t("app.domain.empty"))}</p>`;
