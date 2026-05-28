@@ -100,7 +100,9 @@ pub struct RuntimeLog {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+const DISCOVERED_DEVICE_LIMIT: usize = 100;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredDevice {
     pub device_id: String,
     pub device_name: String,
@@ -304,7 +306,7 @@ impl SyncEngine {
         RuntimeStatus {
             running: self.inner.running.load(Ordering::SeqCst),
             device_id: settings.sync_device_id(),
-            device_name: local_device_name(),
+            device_name: local_device_name(&settings.sync_device_id()),
             local_ip: effective_local_ip,
             shared_code: settings.sync.shared_code.clone(),
             last_error: error,
@@ -425,8 +427,8 @@ impl SyncEngine {
 impl PresenceService {
     pub fn ensure(&self, settings: Settings, device_id: String) -> anyhow::Result<()> {
         let config = PresenceConfig {
-            device_id,
-            device_name: local_device_name(),
+            device_id: device_id.clone(),
+            device_name: local_device_name(&settings.sync_device_id()),
             shared_code: settings.sync.shared_code.trim().to_string(),
             local_ip: settings.sync.local_ip.trim().to_string(),
             listen_port: settings.sync.listen_port,
@@ -669,7 +671,7 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
     let mut last_discovery = Instant::now() - Duration::from_millis(DISCOVERY_REFRESH_MS);
     let mut last_udp_announce = Instant::now() - Duration::from_millis(UDP_ANNOUNCE_MS);
-    let device_name = local_device_name();
+    let device_name = local_device_name(&device_id);
     let watcher_runtime = Arc::clone(&runtime);
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let watcher_stop_runtime = Arc::clone(&runtime);
@@ -2151,6 +2153,10 @@ fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevic
             }
         }
         guard.sort_by(|left, right| left.device_name.cmp(&right.device_name));
+        guard.dedup_by(|left, right| left.device_id == right.device_id);
+        if guard.len() > DISCOVERED_DEVICE_LIMIT {
+            guard.truncate(DISCOVERED_DEVICE_LIMIT);
+        }
     }
 }
 
@@ -3461,11 +3467,40 @@ fn udp_broadcast_targets(selected_local_ip: &str) -> Vec<SocketAddr> {
     targets.into_iter().collect()
 }
 
-fn local_device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "当前设备".to_string())
+fn local_device_name(device_id: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(name) = std::env::var("COMPUTERNAME") {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        for args in [
+            &["--get", "ComputerName"][..],
+            &["--get", "LocalHostName"][..],
+        ] {
+            if let Ok(output) = std::process::Command::new("scutil").args(args).output() {
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("hostname").output() {
+        if output.status.success() {
+            let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !hostname.is_empty() {
+                return hostname;
+            }
+        }
+    }
+
+    device_id.to_string()
 }
