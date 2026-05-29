@@ -19,6 +19,11 @@ const DICTS: Record<Locale, Dict> = {
     "app.transfer.empty": "当前没有进行中的传输任务。",
     "app.transfer.expand": "展开",
     "app.transfer.collapse": "收起",
+    "transfer.stats.current": "当前",
+    "transfer.stats.average": "平均",
+    "transfer.stats.peak": "峰值",
+    "transfer.stats.elapsed": "用时",
+    "transfer.stats.remaining": "剩余",
 
     "app.settings.kicker": "设置",
     "app.settings.title": "同步配置",
@@ -114,6 +119,11 @@ const DICTS: Record<Locale, Dict> = {
     "app.transfer.empty": "No active transfers.",
     "app.transfer.expand": "Expand",
     "app.transfer.collapse": "Collapse",
+    "transfer.stats.current": "Current",
+    "transfer.stats.average": "Average",
+    "transfer.stats.peak": "Peak",
+    "transfer.stats.elapsed": "Elapsed",
+    "transfer.stats.remaining": "Remaining",
 
     "app.settings.kicker": "Settings",
     "app.settings.title": "Sync Settings",

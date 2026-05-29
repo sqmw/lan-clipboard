@@ -711,6 +711,90 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatTransferDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
+function formatTransferSpeed(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return "0 B/s";
+  if (bytesPerSecond < 1024) return `${bytesPerSecond.toFixed(0)} B/s`;
+  if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+type TransferStats = {
+  lastBytes: number;
+  lastSeenMs: number;
+  startedAtMs: number;
+  speedBytesPerSecond: number;
+  maxSpeedBytesPerSecond: number;
+};
+
+const transferStatsById = new Map<string, TransferStats>();
+
+function renderTransferStatsLine(transfer: TransferProgress): string {
+  const now = Date.now();
+  const existing = transferStatsById.get(transfer.id);
+  let stats: TransferStats;
+
+  if (!existing || transfer.transferred_bytes < existing.lastBytes || transfer.status === "queued") {
+    stats = {
+      lastBytes: transfer.transferred_bytes,
+      lastSeenMs: now,
+      startedAtMs: now,
+      speedBytesPerSecond: 0,
+      maxSpeedBytesPerSecond: 0,
+    };
+  } else {
+    const elapsedSeconds = Math.max(0.001, (now - existing.lastSeenMs) / 1000);
+    const bytesDelta = Math.max(0, transfer.transferred_bytes - existing.lastBytes);
+    const instantSpeed = bytesDelta / elapsedSeconds;
+    const speedBytesPerSecond =
+      instantSpeed > 0
+        ? existing.speedBytesPerSecond > 0
+          ? existing.speedBytesPerSecond * 0.65 + instantSpeed * 0.35
+          : instantSpeed
+        : existing.speedBytesPerSecond;
+
+    stats = {
+      lastBytes: transfer.transferred_bytes,
+      lastSeenMs: now,
+      startedAtMs: existing.startedAtMs,
+      speedBytesPerSecond,
+      maxSpeedBytesPerSecond: Math.max(existing.maxSpeedBytesPerSecond, speedBytesPerSecond),
+    };
+  }
+
+  transferStatsById.set(transfer.id, stats);
+
+  const elapsedSeconds = (now - stats.startedAtMs) / 1000;
+  const remainingBytes = Math.max(0, transfer.total_bytes - transfer.transferred_bytes);
+  const etaSeconds = stats.speedBytesPerSecond > 0 ? remainingBytes / stats.speedBytesPerSecond : 0;
+  const averageSpeedBytesPerSecond = elapsedSeconds > 0 ? transfer.transferred_bytes / elapsedSeconds : 0;
+  const percent = `${transfer.percent}%`;
+  const speedSummary = `${t("transfer.stats.current")} ${formatTransferSpeed(stats.speedBytesPerSecond)} · ${t(
+    "transfer.stats.average",
+  )} ${formatTransferSpeed(averageSpeedBytesPerSecond)} · ${t("transfer.stats.peak")} ${formatTransferSpeed(
+    stats.maxSpeedBytesPerSecond,
+  )}`;
+
+  const timeSummary =
+    transfer.status === "completed" || transfer.percent >= 100
+      ? `${speedSummary} · ${t("transfer.stats.elapsed")} ${formatTransferDuration(elapsedSeconds)}`
+      : `${speedSummary} · ${t("transfer.stats.elapsed")} ${formatTransferDuration(elapsedSeconds)} / ${t(
+          "transfer.stats.remaining",
+        )} ${formatTransferDuration(etaSeconds)}`;
+
+  return `${percent} · ${timeSummary}`;
+}
+
 function transferStatusText(status: string): string {
   switch (status) {
     case "sending":
@@ -856,7 +940,7 @@ function renderTransferProgress(transfers: TransferProgress[]): void {
             )}`,
           )}</p>
           <div class="transfer-bar"><span style="width: ${transfer.percent}%"></span></div>
-          <p class="transfer-meta">${escapeHtml(`${transfer.percent}%`)}</p>
+          <p class="transfer-meta">${escapeHtml(renderTransferStatsLine(transfer))}</p>
           ${error}
         </article>
       `;
