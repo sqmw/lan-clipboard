@@ -50,12 +50,12 @@ const QUEUE_LOOP_IDLE_SLEEP_MS: u64 = 40;
 const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const FILE_STREAM_CHUNK_BYTES: usize = 1024 * 1024;
+const FILE_STREAM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
 const HIGH_PRIORITY_YIELD_MS: u64 = 12;
 const PREPARED_ARCHIVE_TTL_MS: u64 = 120_000;
-const TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const TCP_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
@@ -139,7 +139,8 @@ struct FileStreamStart {
 
 struct IncomingFileStream {
     meta: FileStreamStart,
-    archive_bytes: Vec<u8>,
+    archive_path: PathBuf,
+    received_bytes: u64,
     peer: String,
 }
 
@@ -1064,66 +1065,141 @@ fn handle_incoming(
                 if update_latest_marker(runtime, marker) {
                     prune_stale_queue_entries(runtime);
                 }
+
+                if let Some(previous) = incoming_files.remove(&meta.item_id) {
+                    let _ = std::fs::remove_file(&previous.archive_path);
+                }
+
+                let safe_source = sanitize_file_component(&meta.source_device_id);
+                let safe_item = sanitize_file_component(&meta.item_id);
+                let archive_path = std::env::temp_dir().join(format!(
+                    "lan-clipboard-incoming-{safe_source}-{safe_item}.archive"
+                ));
+                let _ = std::fs::remove_file(&archive_path);
+                if let Err(error) = std::fs::File::create(&archive_path) {
+                    mark_transfer_failed(runtime, &canonical_transfer_id, error.to_string());
+                    push_log(
+                        runtime,
+                        "WARN",
+                        &format!(
+                            "create inbound temp archive failed item={} path={} error={}",
+                            meta.item_id,
+                            archive_path.display(),
+                            error
+                        ),
+                    );
+                    continue;
+                }
+
                 incoming_files.insert(
                     meta.item_id.clone(),
                     IncomingFileStream {
                         meta,
-                        archive_bytes: Vec::new(),
+                        archive_path,
+                        received_bytes: 0,
                         peer: remote_addr.as_deref().unwrap_or("未知来源").to_string(),
                     },
                 );
             }
             WireBody::FileStreamChunk { item_id, bytes } => {
-                let should_drop = incoming_files
-                    .get(&item_id)
-                    .map(|file_stream| {
-                        is_stale_marker(runtime, &file_stream_marker(&file_stream.meta))
-                    })
-                    .unwrap_or(false);
-                if should_drop {
-                    if let Some(file_stream) = incoming_files.remove(&item_id) {
-                        let canonical_transfer_id =
-                            format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
-                        mark_transfer_failed(
-                            runtime,
-                            &canonical_transfer_id,
-                            "已被更新内容替代".to_string(),
-                        );
-                    }
-                    continue;
-                }
                 if let Some(file_stream) = incoming_files.get_mut(&item_id) {
-                    let canonical_transfer_id =
-                        format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
-                    file_stream.archive_bytes.extend_from_slice(&bytes);
-                    update_transfer_progress(
-                        runtime,
-                        &canonical_transfer_id,
-                        file_stream.archive_bytes.len() as u64,
-                        file_stream.meta.size_bytes,
+                    let transfer_id = format!(
+                        "recv:{}:{}",
+                        file_stream.meta.source_device_id, file_stream.meta.item_id
                     );
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&file_stream.archive_path)
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
+                    {
+                        Ok(()) => {
+                            file_stream.received_bytes = file_stream
+                                .received_bytes
+                                .saturating_add(bytes.len() as u64);
+                            update_transfer_progress(
+                                runtime,
+                                &transfer_id,
+                                file_stream.received_bytes,
+                                file_stream.meta.size_bytes,
+                            );
+                        }
+                        Err(error) => {
+                            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+                            push_log(
+                                runtime,
+                                "WARN",
+                                &format!(
+                                    "write inbound file chunk failed item={} path={} error={}",
+                                    file_stream.meta.item_id,
+                                    file_stream.archive_path.display(),
+                                    error
+                                ),
+                            );
+                            let _ = std::fs::remove_file(&file_stream.archive_path);
+                            incoming_files.remove(&item_id);
+                        }
+                    }
                 }
             }
             WireBody::FileStreamEnd { item_id } => {
                 if let Some(file_stream) = incoming_files.remove(&item_id) {
-                    if is_stale_marker(runtime, &file_stream_marker(&file_stream.meta)) {
-                        let canonical_transfer_id =
-                            format!("recv:{}:{}", file_stream.meta.source_device_id, item_id);
+                    let transfer_id = format!(
+                        "recv:{}:{}",
+                        file_stream.meta.source_device_id, file_stream.meta.item_id
+                    );
+                    if file_stream.received_bytes != file_stream.meta.size_bytes {
                         mark_transfer_failed(
                             runtime,
-                            &canonical_transfer_id,
-                            "已被更新内容替代".to_string(),
+                            &transfer_id,
+                            format!(
+                                "文件接收不完整：已接收 {} 字节，期望 {} 字节",
+                                file_stream.received_bytes, file_stream.meta.size_bytes
+                            ),
                         );
+                        push_log(
+                            runtime,
+                            "WARN",
+                            &format!(
+                                "incomplete inbound file stream item={} received_bytes={} expected_bytes={} peer={}",
+                                file_stream.meta.item_id,
+                                file_stream.received_bytes,
+                                file_stream.meta.size_bytes,
+                                file_stream.peer
+                            ),
+                        );
+                        let _ = std::fs::remove_file(&file_stream.archive_path);
                         continue;
                     }
+
+                    let archive_bytes = match std::fs::read(&file_stream.archive_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+                            push_log(
+                                runtime,
+                                "WARN",
+                                &format!(
+                                    "read inbound temp archive failed item={} path={} error={}",
+                                    file_stream.meta.item_id,
+                                    file_stream.archive_path.display(),
+                                    error
+                                ),
+                            );
+                            let _ = std::fs::remove_file(&file_stream.archive_path);
+                            continue;
+                        }
+                    };
+                    let _ = std::fs::remove_file(&file_stream.archive_path);
+
                     let item = ClipboardItem {
-                        id: file_stream.meta.item_id,
+                        id: file_stream.meta.item_id.clone(),
                         content_hash: file_stream.meta.content_hash,
                         created_at_us: file_stream.meta.created_at_us,
                         source_device_id: file_stream.meta.source_device_id,
-                        size_bytes: file_stream.archive_bytes.len() as u64,
+                        size_bytes: archive_bytes.len() as u64,
                         payload: ClipboardPayload::FileBundle {
-                            archive_bytes: file_stream.archive_bytes,
+                            archive_bytes,
                             top_level_names: file_stream.meta.top_level_names,
                         },
                     };
@@ -1141,6 +1217,7 @@ fn discard_incomplete_incoming_files(
     reason: &str,
 ) {
     for (_, file_stream) in incoming_files.drain() {
+        let _ = std::fs::remove_file(&file_stream.archive_path);
         let transfer_id = format!(
             "recv:{}:{}",
             file_stream.meta.source_device_id, file_stream.meta.item_id
@@ -1152,7 +1229,7 @@ fn discard_incomplete_incoming_files(
             &format!(
                 "discard incomplete inbound file item={} received_bytes={} expected_bytes={} peer={} reason={}",
                 file_stream.meta.item_id,
-                file_stream.archive_bytes.len(),
+                file_stream.received_bytes,
                 file_stream.meta.size_bytes,
                 file_stream.peer,
                 reason
@@ -2681,6 +2758,21 @@ fn item_marker(item: &ClipboardItem) -> ItemMarker {
         id: item.id.clone(),
         created_at_us: item.created_at_us,
         source_device_id: item.source_device_id.clone(),
+    }
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
     }
 }
 
