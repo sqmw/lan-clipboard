@@ -136,7 +136,37 @@ class FifoPool<T> {
 }
 
 const DISCOVERED_DEVICE_POOL_CAPACITY = 100;
-const lastDiscovered = new FifoPool<DiscoveredDevice>(DISCOVERED_DEVICE_POOL_CAPACITY);
+const DISCOVERED_DEVICE_STALE_MS = 5000;
+
+type DiscoveredDeviceWithSeen = DiscoveredDevice & {
+  lastSeen: number;
+};
+
+const lastDiscovered = new FifoPool<DiscoveredDeviceWithSeen>(DISCOVERED_DEVICE_POOL_CAPACITY);
+
+function mergeDiscoveredDevices(devices: DiscoveredDevice[]): void {
+  const now = Date.now();
+  const existingDevices = lastDiscovered.values();
+  const existingById = new Map(existingDevices.map((device) => [device.device_id, device]));
+
+  for (const device of devices) {
+    const existing = existingById.get(device.device_id);
+    if (existing) {
+      existing.device_name = device.device_name;
+      existing.addr = device.addr;
+      existing.port = device.port;
+      existing.lastSeen = now;
+      continue;
+    }
+
+    lastDiscovered.push({ ...device, lastSeen: now });
+  }
+
+  lastDiscovered.replaceAll(
+    lastDiscovered.values().filter((device) => now - device.lastSeen <= DISCOVERED_DEVICE_STALE_MS),
+  );
+}
+
 let currentStatus: RuntimeStatus | null = null;
 let statusTimer: number | null = null;
 let transferTimer: number | null = null;
@@ -530,7 +560,6 @@ function orderDevicesWithLocalFirst(devices: DiscoveredDevice[]): DiscoveredDevi
 function renderDevices(devices: DiscoveredDevice[]): void {
   const container = getText("discovered-devices");
   const feedback = getText("scan-feedback");
-  lastDiscovered.replaceAll(devices);
   observedMemberCount = Math.max(1, devices.length + 1);
   getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
   const selfName = getLocalDeviceDisplayName();
@@ -606,7 +635,8 @@ async function scanDevices(): Promise<void> {
     if (refreshGeneration !== deviceRefreshGeneration) {
       return;
     }
-    renderDevices(devices);
+    mergeDiscoveredDevices(devices);
+    renderDevices(lastDiscovered.values());
     feedback.textContent =
       devices.length > 0
         ? t("app.scan.done_found", { count: devices.length })
@@ -634,7 +664,8 @@ async function refreshCachedDevices(): Promise<void> {
   if (refreshGeneration !== deviceRefreshGeneration || manualRefreshRunning) {
     return;
   }
-  renderDevices(devices);
+  mergeDiscoveredDevices(devices);
+  renderDevices(lastDiscovered.values());
 }
 
 async function refreshDomain(): Promise<void> {
