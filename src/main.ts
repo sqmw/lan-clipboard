@@ -81,7 +81,62 @@ const MIN_MAX_ITEM_MB = 1;
 const MAX_MAX_ITEM_MB = 1000;
 
 let settings: Settings;
-let lastDiscovered: DiscoveredDevice[] = [];
+
+class FifoPool<T> {
+  private readonly items: Array<T | undefined>;
+  private head = 0;
+  private sizeValue = 0;
+
+  constructor(private readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new Error("FifoPool capacity must be a positive integer");
+    }
+    this.items = new Array<T | undefined>(capacity);
+  }
+
+  push(item: T): void {
+    const writeIndex = (this.head + this.sizeValue) % this.capacity;
+    this.items[writeIndex] = item;
+
+    if (this.sizeValue < this.capacity) {
+      this.sizeValue += 1;
+      return;
+    }
+
+    this.head = (this.head + 1) % this.capacity;
+  }
+
+  replaceAll(items: T[]): void {
+    this.clear();
+    for (const item of items) {
+      this.push(item);
+    }
+  }
+
+  values(): T[] {
+    const result: T[] = [];
+    for (let offset = 0; offset < this.sizeValue; offset += 1) {
+      const item = this.items[(this.head + offset) % this.capacity];
+      if (item !== undefined) {
+        result.push(item);
+      }
+    }
+    return result;
+  }
+
+  get length(): number {
+    return this.sizeValue;
+  }
+
+  clear(): void {
+    this.items.fill(undefined);
+    this.head = 0;
+    this.sizeValue = 0;
+  }
+}
+
+const DISCOVERED_DEVICE_POOL_CAPACITY = 100;
+const lastDiscovered = new FifoPool<DiscoveredDevice>(DISCOVERED_DEVICE_POOL_CAPACITY);
 let currentStatus: RuntimeStatus | null = null;
 let statusTimer: number | null = null;
 let transferTimer: number | null = null;
@@ -235,6 +290,7 @@ function compareNetworkOptions(
 function selectRecommendedNetworkIp(): string {
   const peerSubnets = new Set(
     lastDiscovered
+      .values()
       .map((device) => subnetKey(device.addr))
       .filter((value): value is string => Boolean(value)),
   );
@@ -428,6 +484,7 @@ function getLocalDeviceDisplayName(): string {
       .filter((id): id is string => Boolean(id)),
   );
   const discoveredLocalName = lastDiscovered
+    .values()
     .find((device) => localIds.has(device.device_id.trim()) && !isDeviceNameFallback(device.device_name))
     ?.device_name.trim();
 
@@ -473,7 +530,7 @@ function orderDevicesWithLocalFirst(devices: DiscoveredDevice[]): DiscoveredDevi
 function renderDevices(devices: DiscoveredDevice[]): void {
   const container = getText("discovered-devices");
   const feedback = getText("scan-feedback");
-  lastDiscovered = devices;
+  lastDiscovered.replaceAll(devices);
   observedMemberCount = Math.max(1, devices.length + 1);
   getText("status-peer-count").textContent = `${t("app.status.members")}: ${observedMemberCount}`;
   const selfName = getLocalDeviceDisplayName();
@@ -850,7 +907,7 @@ async function boot(): Promise<void> {
   await refreshStatus();
   await refreshTransferProgress();
   await refreshLogs();
-  renderDevices(lastDiscovered);
+  renderDevices(lastDiscovered.values());
   await refreshDomain();
   if (statusTimer !== null) {
     window.clearInterval(statusTimer);
@@ -901,7 +958,7 @@ window.addEventListener("DOMContentLoaded", () => {
     lastRenderedSelfKey = "";
     lastTransfersKey = "";
     markConfigDirty();
-    renderDevices(lastDiscovered);
+    renderDevices(lastDiscovered.values());
     void refreshTransferProgress();
     void refreshStatus();
   });
