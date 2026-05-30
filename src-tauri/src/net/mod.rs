@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +51,7 @@ const WIRE_VERSION: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const FILE_STREAM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const FILE_STREAM_PROGRESS_EMIT_INTERVAL_MS: u64 = 250;
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
 const HIGH_PRIORITY_YIELD_MS: u64 = 12;
@@ -125,6 +126,7 @@ enum WireBody {
     FileStreamStart(FileStreamStart),
     FileStreamChunk { item_id: String, bytes: Vec<u8> },
     FileStreamEnd { item_id: String },
+    FileStreamRawStart(FileStreamStart),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1206,8 +1208,155 @@ fn handle_incoming(
                     handle_incoming_item(runtime, &file_stream.peer, item, device_id);
                 }
             }
+            WireBody::FileStreamRawStart(meta) => {
+                receive_raw_file_stream(
+                    runtime,
+                    settings,
+                    &mut stream,
+                    remote_addr.as_deref().unwrap_or("未知来源"),
+                    meta,
+                    device_id,
+                )?;
+            }
         }
     }
+    Ok(())
+}
+
+fn receive_raw_file_stream(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    stream: &mut TcpStream,
+    peer: &str,
+    meta: FileStreamStart,
+    device_id: &str,
+) -> anyhow::Result<()> {
+    let transfer_id = format!("recv:{}:{}", meta.source_device_id, meta.item_id);
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "receive".to_string(),
+            peer: peer.to_string(),
+            item_kind: "file_bundle".to_string(),
+            item_label: file_stream_label(&meta.top_level_names),
+            item_summary: file_stream_summary(&meta.top_level_names),
+            item_id: meta.item_id.clone(),
+            transferred_bytes: 0,
+            total_bytes: meta.size_bytes,
+            percent: 0,
+            status: "receiving".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
+
+    let marker = file_stream_marker(&meta);
+    if is_stale_marker(runtime, &marker) {
+        mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
+        return Err(anyhow::anyhow!("stale inbound raw file stream"));
+    }
+    if update_latest_marker(runtime, marker) {
+        prune_stale_queue_entries(runtime);
+    }
+
+    let safe_source = sanitize_file_component(&meta.source_device_id);
+    let safe_item = sanitize_file_component(&meta.item_id);
+    let archive_path = std::env::temp_dir().join(format!(
+        "lan-clipboard-incoming-{safe_source}-{safe_item}.archive"
+    ));
+    let _ = std::fs::remove_file(&archive_path);
+    let archive_file = match std::fs::File::create(&archive_path) {
+        Ok(file) => file,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            return Err(error.into());
+        }
+    };
+    let mut writer = BufWriter::with_capacity(FILE_STREAM_CHUNK_BYTES, archive_file);
+    let mut received_bytes = 0u64;
+    let mut last_progress_update = Instant::now();
+
+    while received_bytes < meta.size_bytes {
+        let Some(frame_bytes) = read_wire_frame(stream)? else {
+            let _ = std::fs::remove_file(&archive_path);
+            mark_transfer_failed(
+                runtime,
+                &transfer_id,
+                "发送方已下线，已丢弃未完成传输".to_string(),
+            );
+            return Err(anyhow::anyhow!(
+                "sender disconnected during raw file stream"
+            ));
+        };
+        let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
+        let bytes = decode_wire_payload(&frame, settings)?;
+        if bytes.is_empty() {
+            continue;
+        }
+        let remaining = meta.size_bytes.saturating_sub(received_bytes);
+        if bytes.len() as u64 > remaining {
+            let _ = std::fs::remove_file(&archive_path);
+            mark_transfer_failed(runtime, &transfer_id, "文件接收超过声明大小".to_string());
+            return Err(anyhow::anyhow!("raw file stream exceeded expected size"));
+        }
+        writer.write_all(&bytes)?;
+        received_bytes = received_bytes.saturating_add(bytes.len() as u64);
+        let progress_now = Instant::now();
+        if progress_now.duration_since(last_progress_update)
+            >= Duration::from_millis(FILE_STREAM_PROGRESS_EMIT_INTERVAL_MS)
+            || received_bytes >= meta.size_bytes
+        {
+            update_transfer_progress(runtime, &transfer_id, received_bytes, meta.size_bytes);
+            last_progress_update = progress_now;
+        }
+    }
+
+    writer.flush()?;
+    drop(writer);
+
+    match read_wire_body_from_stream(stream, settings)? {
+        Some(WireBody::FileStreamEnd { item_id }) if item_id == meta.item_id => {}
+        Some(_) => {
+            let _ = std::fs::remove_file(&archive_path);
+            mark_transfer_failed(runtime, &transfer_id, "文件流结束帧不匹配".to_string());
+            return Err(anyhow::anyhow!("unexpected raw file stream end frame"));
+        }
+        None => {
+            let _ = std::fs::remove_file(&archive_path);
+            mark_transfer_failed(
+                runtime,
+                &transfer_id,
+                "发送方已下线，已丢弃未完成传输".to_string(),
+            );
+            return Err(anyhow::anyhow!(
+                "sender disconnected before raw file stream end"
+            ));
+        }
+    }
+
+    let archive_bytes = match std::fs::read(&archive_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = std::fs::remove_file(&archive_path);
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            return Err(error.into());
+        }
+    };
+    let _ = std::fs::remove_file(&archive_path);
+
+    let item = ClipboardItem {
+        id: meta.item_id,
+        content_hash: meta.content_hash,
+        created_at_us: meta.created_at_us,
+        source_device_id: meta.source_device_id,
+        size_bytes: archive_bytes.len() as u64,
+        payload: ClipboardPayload::FileBundle {
+            archive_bytes,
+            top_level_names: meta.top_level_names,
+        },
+    };
+    handle_incoming_item(runtime, peer, item, device_id);
     Ok(())
 }
 
@@ -1301,6 +1450,7 @@ fn read_wire_frame(stream: &mut TcpStream) -> anyhow::Result<Option<Vec<u8>>> {
 struct BroadcastReport {
     attempted: usize,
     delivered: usize,
+    deferred: bool,
 }
 
 fn send_to_all_peers(
@@ -1320,6 +1470,7 @@ fn send_to_all_peers(
             return BroadcastReport {
                 attempted: 0,
                 delivered: 0,
+                deferred: false,
             };
         }
     };
@@ -1350,6 +1501,7 @@ fn send_to_all_peers(
     BroadcastReport {
         attempted,
         delivered,
+        deferred: false,
     }
 }
 
@@ -1359,47 +1511,93 @@ fn send_file_list_to_all_peers(
     item: &ClipboardItem,
     peers: Vec<String>,
 ) -> BroadcastReport {
-    let prepared = match prepare_file_list_archive(runtime, item) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            set_error(
-                runtime,
-                format!(
-                    "prepare file archive failed: item={} error={error}",
-                    item.id
-                ),
-            );
+    let attempted = peers.len();
+    if attempted == 0 {
+        return BroadcastReport {
+            attempted,
+            delivered: 0,
+            deferred: false,
+        };
+    }
+
+    let runtime_addr = runtime as *const RuntimeInner as usize;
+    let settings = settings.clone();
+    let item = item.clone();
+    let item_id = item.id.clone();
+    let content_hash = item.content_hash.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("lan-clipboard-file-send-{item_id}"))
+        .spawn(move || {
+            let runtime = unsafe { &*(runtime_addr as *const RuntimeInner) };
+            let prepared = match prepare_file_list_archive(runtime, &item) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    set_error(
+                        runtime,
+                        format!(
+                            "prepare file archive failed: item={} error={error}",
+                            item.id
+                        ),
+                    );
+                    push_log(
+                        runtime,
+                        "WARN",
+                        &format!("prepare file archive failed item={} error={error}", item.id),
+                    );
+                    clear_content_inflight(runtime, &item.content_hash);
+                    return;
+                }
+            };
+
+            let delivered = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(peers.len());
+                for peer in peers {
+                    let prepared_ref = &prepared;
+                    let settings_ref = &settings;
+                    let item_ref = &item;
+                    handles.push(scope.spawn(move || {
+                        send_file_list_to_peer(runtime, settings_ref, item_ref, prepared_ref, &peer)
+                    }));
+                }
+
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .filter(|delivered| *delivered)
+                    .count()
+            });
+
+            if delivered > 0 {
+                mark_shared_fingerprint(runtime, &item.content_hash);
+            }
+            clear_content_inflight(runtime, &item.content_hash);
             push_log(
                 runtime,
-                "WARN",
-                &format!("prepare file archive failed item={} error={error}", item.id),
+                "DEBUG",
+                &format!(
+                    "file stream completed item={} delivered={} attempted={}",
+                    item.id, delivered, attempted
+                ),
             );
-            return BroadcastReport {
-                attempted: peers.len(),
-                delivered: 0,
-            };
-        }
-    };
-    let attempted = peers.len();
-    let delivered = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(peers.len());
-        for peer in peers {
-            let prepared_ref = &prepared;
-            handles.push(scope.spawn(move || {
-                send_file_list_to_peer(runtime, settings, item, prepared_ref, &peer)
-            }));
-        }
+        });
 
-        handles
-            .into_iter()
-            .filter_map(|handle| handle.join().ok())
-            .filter(|delivered| *delivered)
-            .count()
-    });
+    if let Err(error) = spawn_result {
+        set_error(
+            runtime,
+            format!("spawn file stream sender failed: item={item_id} error={error}"),
+        );
+        clear_content_inflight(runtime, &content_hash);
+        return BroadcastReport {
+            attempted,
+            delivered: 0,
+            deferred: false,
+        };
+    }
 
     BroadcastReport {
         attempted,
-        delivered,
+        delivered: attempted,
+        deferred: true,
     }
 }
 
@@ -1528,7 +1726,7 @@ fn send_file_list_to_peer(
         remember_active_local_ip(runtime, local_addr.ip());
     }
 
-    let start = WireBody::FileStreamStart(FileStreamStart {
+    let start = WireBody::FileStreamRawStart(FileStreamStart {
         item_id: item.id.clone(),
         content_hash: item.content_hash.clone(),
         created_at_us: item.created_at_us,
@@ -1552,7 +1750,6 @@ fn send_file_list_to_peer(
         &mut stream,
         prepared,
         item,
-        &item.id,
         &transfer_id,
     ) {
         mark_transfer_failed(runtime, &transfer_id, error.to_string());
@@ -1659,12 +1856,12 @@ fn stream_prepared_archive_to_peer(
     stream: &mut TcpStream,
     prepared: &PreparedFileArchive,
     item: &ClipboardItem,
-    item_id: &str,
     transfer_id: &str,
 ) -> anyhow::Result<()> {
     let mut file = File::open(&prepared.path)?;
     let mut buffer = vec![0u8; FILE_STREAM_CHUNK_BYTES];
     let mut sent_archive_bytes = 0u64;
+    let mut last_progress_update = Instant::now();
 
     loop {
         if transfer_should_abort(runtime, transfer_id) {
@@ -1678,22 +1875,27 @@ fn stream_prepared_archive_to_peer(
             break;
         }
 
-        write_wire_body_to_stream(
+        write_wire_payload_to_stream(
             stream,
             settings,
-            &WireBody::FileStreamChunk {
-                item_id: item_id.to_string(),
-                bytes: buffer[..read_bytes].to_vec(),
-            },
+            &item.source_device_id,
+            &buffer[..read_bytes],
         )?;
 
         sent_archive_bytes = sent_archive_bytes.saturating_add(read_bytes as u64);
-        update_transfer_progress(
-            runtime,
-            transfer_id,
-            sent_archive_bytes,
-            prepared.size_bytes,
-        );
+        let progress_now = Instant::now();
+        if progress_now.duration_since(last_progress_update)
+            >= Duration::from_millis(FILE_STREAM_PROGRESS_EMIT_INTERVAL_MS)
+            || sent_archive_bytes >= prepared.size_bytes
+        {
+            update_transfer_progress(
+                runtime,
+                transfer_id,
+                sent_archive_bytes,
+                prepared.size_bytes,
+            );
+            last_progress_update = progress_now;
+        }
 
         if has_ready_outbound_lane(runtime, &[QueueLane::Realtime, QueueLane::Visual]) {
             std::thread::sleep(Duration::from_millis(HIGH_PRIORITY_YIELD_MS));
@@ -1711,6 +1913,28 @@ fn write_wire_body_to_stream(
     let payload = encode_wire_body(body, settings)?;
     stream.write_all(&payload)?;
     Ok(())
+}
+
+fn write_wire_payload_to_stream(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    source_device_id: &str,
+    plain: &[u8],
+) -> anyhow::Result<()> {
+    let payload = encode_wire_payload(plain, source_device_id, settings)?;
+    stream.write_all(&payload)?;
+    Ok(())
+}
+
+fn read_wire_body_from_stream(
+    stream: &mut TcpStream,
+    settings: &Settings,
+) -> anyhow::Result<Option<WireBody>> {
+    let Some(frame_bytes) = read_wire_frame(stream)? else {
+        return Ok(None);
+    };
+    let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
+    Ok(Some(decode_wire_body(&frame, settings)?))
 }
 
 fn read_exact_with_progress(stream: &mut TcpStream, buffer: &mut [u8]) -> anyhow::Result<()> {
@@ -1877,6 +2101,14 @@ fn process_outbound_queue(
                     "drop outbound item {} because shared domain only contains self",
                     entry.item.id
                 ),
+            );
+            continue;
+        }
+        if report.deferred {
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("outbound item {} deferred to file sender", entry.item.id),
             );
             continue;
         }
@@ -2370,13 +2602,21 @@ fn encode_wire_message(item: &ClipboardItem, settings: &Settings) -> anyhow::Res
 fn encode_wire_body(body: &WireBody, settings: &Settings) -> anyhow::Result<Vec<u8>> {
     let plain = bincode::serialize(body)?;
     let source_device_id = wire_body_source_device_id(body);
+    encode_wire_payload(&plain, &source_device_id, settings)
+}
+
+fn encode_wire_payload(
+    plain: &[u8],
+    source_device_id: &str,
+    settings: &Settings,
+) -> anyhow::Result<Vec<u8>> {
     let frame = if settings.security.encryption_enabled {
         let secret = effective_secret(settings);
-        let (nonce, body) = encrypt_bytes(&plain, &derive_key(&secret))?;
+        let (nonce, body) = encrypt_bytes(plain, &derive_key(&secret))?;
         WireMessage {
             v: WIRE_VERSION,
             encrypted: true,
-            source_device_id: source_device_id.clone(),
+            source_device_id: source_device_id.to_string(),
             nonce: Some(nonce),
             body,
         }
@@ -2384,9 +2624,9 @@ fn encode_wire_body(body: &WireBody, settings: &Settings) -> anyhow::Result<Vec<
         WireMessage {
             v: WIRE_VERSION,
             encrypted: false,
-            source_device_id,
+            source_device_id: source_device_id.to_string(),
             nonce: None,
-            body: plain,
+            body: plain.to_vec(),
         }
     };
 
@@ -2403,7 +2643,9 @@ fn encode_wire_body(body: &WireBody, settings: &Settings) -> anyhow::Result<Vec<
 fn wire_body_source_device_id(body: &WireBody) -> String {
     match body {
         WireBody::ClipboardItem(item) => item.source_device_id.clone(),
-        WireBody::FileStreamStart(meta) => meta.source_device_id.clone(),
+        WireBody::FileStreamStart(meta) | WireBody::FileStreamRawStart(meta) => {
+            meta.source_device_id.clone()
+        }
         WireBody::FileStreamChunk { .. } | WireBody::FileStreamEnd { .. } => String::new(),
     }
 }
@@ -2557,6 +2799,11 @@ fn text_preview_snippet(value: &str, limit: usize) -> String {
 }
 
 fn decode_wire_body(frame: &WireMessage, settings: &Settings) -> anyhow::Result<WireBody> {
+    let bytes = decode_wire_payload(frame, settings)?;
+    Ok(bincode::deserialize::<WireBody>(&bytes)?)
+}
+
+fn decode_wire_payload(frame: &WireMessage, settings: &Settings) -> anyhow::Result<Vec<u8>> {
     if frame.v != WIRE_VERSION {
         return Err(anyhow::anyhow!("unsupported wire version: {}", frame.v));
     }
@@ -2578,7 +2825,7 @@ fn decode_wire_body(frame: &WireMessage, settings: &Settings) -> anyhow::Result<
         frame.body.clone()
     };
 
-    Ok(bincode::deserialize::<WireBody>(&bytes)?)
+    Ok(bytes)
 }
 
 fn effective_secret(settings: &Settings) -> String {
