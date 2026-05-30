@@ -9,7 +9,7 @@
 
 因此默认需要：
 - 共享码建立共享域级信任（后续升级设备指纹）
-- 传输加密（当前为 `AES-GCM-SIV`）
+- 传输加密（控制帧为 `AES-GCM-SIV`，文件体为 `ChaCha20-Poly1305`）
 - 严格大小限制与解析前校验
 
 ## 共享码与加密（M0 当前实现）
@@ -22,5 +22,5 @@
 
 ## 传输（当前 + 后续）
 
-当前：`TCP + AES-GCM-SIV`
+当前：`TCP + AES-GCM-SIV` 控制帧 + `ChaCha20-Poly1305` 文件体帧
 后续：`TCP + TLS` 或 `QUIC + Noise/TLS`

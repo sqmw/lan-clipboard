@@ -35,7 +35,8 @@
 
 M0 线协议（当前实现）：
 - 传输：`TCP`
-- 帧格式：`4 bytes` big-endian 长度前缀 + `bincode(WireMessage)`；不再使用一行 JSON 或 base64 body
+- 控制帧格式：`4 bytes` big-endian 长度前缀 + `bincode(WireMessage)`；不再使用一行 JSON 或 base64 body
+- 文件体帧格式：`4 bytes` big-endian 长度前缀 + `version:u8` + `flags:u8` + raw bytes；加密开启时为 `version:u8` + `flags:u8` + `nonce:12 bytes` + `ChaCha20-Poly1305` encrypted bytes
 - 节点关系：每个节点监听本地端口，并向共享域内自动发现的设备主动推送
 - 本机触发：监听到本机剪贴板变化后，立即生成一条 `ClipboardItem` 放入发送队列
 - 远端触发：收到远端 `ClipboardItem` 后，先进入接收队列，再顺序写入本机剪贴板
@@ -44,10 +45,10 @@ M0 线协议（当前实现）：
   - `mDNS` 服务类型 `_lan-clipboard._tcp.local.`
   - UDP 广播心跳端口 `32911`（默认每 `500ms` 发送一次）
 - 发现筛选：仅接受 `shared_code` 相同的设备
-- 加密封装：`WireMessage`（raw body bytes + 可选 12 bytes nonce）
+- 控制帧加密封装：`WireMessage`（raw body bytes + 可选 12 bytes nonce，当前为 `AES-GCM-SIV`）
 
 `WireMessage` 字段：
-- `v`：协议版本（当前 `2`）
+- `v`：协议版本（当前 `3`）
 - `encrypted`：是否加密
 - `source_device_id`：发送端设备 ID
 - `nonce`：加密随机数（加密时必填，12 bytes）
@@ -90,15 +91,15 @@ UDP 心跳字段：
 大内容传输策略：
 - 图片的 `size_bytes` 按原始 PNG 字节计算；协议和 TCP 帧都不再额外做 base64 膨胀
 - 文件/目录复制会在发送前打成 `tar` bundle，远端解包到临时目录后再写回系统剪贴板
-- 文件流采用独立 bulk worker 发送；控制帧仍走 `WireBody`，文件体改走约 `4MB` raw payload frame，避免每个大块再封装成 `FileStreamChunk` 结构体
-- raw payload frame 仍复用当前 `WireMessage` 的加密与长度前缀；接收端按 `FileStreamRawStart.size_bytes` 连续读满文件体，再读取 `FileStreamEnd`
+- 文件流采用独立 bulk worker 发送；控制帧仍走 `WireBody`，文件体改走约 `16MB` raw payload frame，避免每个大块再封装成 `FileStreamChunk` 结构体
+- raw payload frame 使用专用二进制小头部，不再对每个文件块做 `bincode(WireMessage)` 包装；文件体加密使用 `ChaCha20-Poly1305`，接收端按 `FileStreamRawStart.size_bytes` 连续读满文件体，再读取 `FileStreamEnd`
 - 文件流在发送和接收过程中都会检查自己是否已被更新内容替代；若判定为旧事件，会尽快中止并丢弃
-- 同一条文件复制事件会先在发送端临时目录准备一次归档，再由多个 peer 复用同一份归档文件，避免广播时按 peer 重复打包
+- 文件/目录发送端会边生成 `tar` bundle 边写入 raw payload frame；不再先生成完整 outbound-cache 归档文件再二次读取发送
 - 若文件流接收过程中发送方断链、下线或连接异常关闭，接收端会直接丢弃该未完成文件流并把这条传输标记为失败，不会继续保留半包状态
 - 若图片超出当前大小限制，发送前会自动等比缩小，直到进入限制范围或无法继续缩小
 - 图片重编码使用快速 PNG 压缩；Windows 源端若剪贴板已有原生 `PNG` bytes，则直接复用，避免无意义重编码
 - TCP 连接超时保持短超时；TCP 写超时按实际 wire payload 大小动态放宽，避免图片还在传输时被固定短超时中断
-- 发送端和接收端统一设置约 `8MB` 的 TCP 收发缓冲，并保留 `nodelay`，用于提升局域网内连续 raw payload frame 传输时的吞吐稳定性
+- 发送端和接收端统一设置约 `16MB` 的 TCP 收发缓冲，并保留 `nodelay`，用于提升局域网内连续 raw payload frame 传输时的吞吐稳定性
 - 但当前实现仍未承诺“稳定拉满局域网带宽”；特别是文件归档准备、系统剪贴板交互和大内容广播时，吞吐还存在明显继续优化空间
 
 低延迟参数：

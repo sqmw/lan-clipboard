@@ -1,8 +1,9 @@
 use crate::clipboard;
 use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
-use aes_gcm_siv::aead::{Aead, KeyInit};
-use aes_gcm_siv::{Aes256GcmSiv, Nonce};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce as AesNonce};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -11,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::SockRef;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
@@ -47,16 +47,16 @@ const MAIN_LOOP_ACTIVE_SLEEP_MS: u64 = 15;
 const MAIN_LOOP_IDLE_SLEEP_MS: u64 = 80;
 const QUEUE_LOOP_ACTIVE_SLEEP_MS: u64 = 5;
 const QUEUE_LOOP_IDLE_SLEEP_MS: u64 = 40;
-const WIRE_VERSION: u8 = 2;
+const WIRE_VERSION: u8 = 3;
+const RAW_PAYLOAD_ENCRYPTED_FLAG: u8 = 1;
 const MAX_WIRE_FRAME_BYTES: usize = 512 * 1024 * 1024;
 const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const FILE_STREAM_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const FILE_STREAM_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const FILE_STREAM_PROGRESS_EMIT_INTERVAL_MS: u64 = 250;
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
 const HIGH_PRIORITY_YIELD_MS: u64 = 12;
-const PREPARED_ARCHIVE_TTL_MS: u64 = 120_000;
-const TCP_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const TCP_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeStatus {
@@ -146,14 +146,6 @@ struct IncomingFileStream {
     peer: String,
 }
 
-#[derive(Debug, Clone)]
-struct PreparedFileArchive {
-    path: PathBuf,
-    size_bytes: u64,
-    top_level_names: Vec<String>,
-    prepared_at: Instant,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscoveryAnnouncement {
     pub v: u8,
@@ -184,7 +176,6 @@ struct RuntimeInner {
     discovered_devices: Mutex<Vec<DiscoveredDevice>>,
     discovered_seen_at: Mutex<HashMap<String, Instant>>,
     known_members: Mutex<HashSet<String>>,
-    prepared_archives: Mutex<HashMap<String, PreparedFileArchive>>,
 }
 
 impl Default for RuntimeInner {
@@ -208,7 +199,6 @@ impl Default for RuntimeInner {
             discovered_devices: Mutex::new(Vec::new()),
             discovered_seen_at: Mutex::new(HashMap::new()),
             known_members: Mutex::new(HashSet::new()),
-            prepared_archives: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -794,8 +784,6 @@ fn run_sync_loop(runtime: Arc<RuntimeInner>, settings: Settings, device_id: Stri
 
         prune_ignored_local_hashes(&runtime);
         prune_recent_event_ids(&runtime);
-        prune_prepared_archives(&runtime);
-
         let queue_busy = runtime
             .outbound_queue
             .lock()
@@ -1278,7 +1266,7 @@ fn receive_raw_file_stream(
     let mut last_progress_update = Instant::now();
 
     while received_bytes < meta.size_bytes {
-        let Some(frame_bytes) = read_wire_frame(stream)? else {
+        let Some(bytes) = read_wire_payload_frame(stream, settings)? else {
             let _ = std::fs::remove_file(&archive_path);
             mark_transfer_failed(
                 runtime,
@@ -1289,8 +1277,6 @@ fn receive_raw_file_stream(
                 "sender disconnected during raw file stream"
             ));
         };
-        let frame = bincode::deserialize::<WireMessage>(&frame_bytes)?;
-        let bytes = decode_wire_payload(&frame, settings)?;
         if bytes.is_empty() {
             continue;
         }
@@ -1529,34 +1515,13 @@ fn send_file_list_to_all_peers(
         .name(format!("lan-clipboard-file-send-{item_id}"))
         .spawn(move || {
             let runtime = unsafe { &*(runtime_addr as *const RuntimeInner) };
-            let prepared = match prepare_file_list_archive(runtime, &item) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    set_error(
-                        runtime,
-                        format!(
-                            "prepare file archive failed: item={} error={error}",
-                            item.id
-                        ),
-                    );
-                    push_log(
-                        runtime,
-                        "WARN",
-                        &format!("prepare file archive failed item={} error={error}", item.id),
-                    );
-                    clear_content_inflight(runtime, &item.content_hash);
-                    return;
-                }
-            };
-
             let delivered = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(peers.len());
                 for peer in peers {
-                    let prepared_ref = &prepared;
                     let settings_ref = &settings;
                     let item_ref = &item;
                     handles.push(scope.spawn(move || {
-                        send_file_list_to_peer(runtime, settings_ref, item_ref, prepared_ref, &peer)
+                        send_file_list_to_peer(runtime, settings_ref, item_ref, &peer)
                     }));
                 }
 
@@ -1673,10 +1638,14 @@ fn send_file_list_to_peer(
     runtime: &RuntimeInner,
     settings: &Settings,
     item: &ClipboardItem,
-    prepared: &PreparedFileArchive,
     peer: &str,
 ) -> bool {
-    let ClipboardPayload::FileList { .. } = &item.payload else {
+    let ClipboardPayload::FileList {
+        paths,
+        top_level_names,
+        estimated_archive_bytes,
+    } = &item.payload
+    else {
         return false;
     };
     let socket_addr: SocketAddr = match peer.parse() {
@@ -1702,7 +1671,7 @@ fn send_file_list_to_peer(
             item_summary: payload_summary(&item.payload),
             item_id: item.id.clone(),
             transferred_bytes: 0,
-            total_bytes: prepared.size_bytes,
+            total_bytes: *estimated_archive_bytes,
             percent: 0,
             status: "sending".to_string(),
             updated_at_ms: now_ms(),
@@ -1721,7 +1690,7 @@ fn send_file_list_to_peer(
                 return false;
             }
         };
-    tune_stream_for_send(&stream, prepared.size_bytes);
+    tune_stream_for_send(&stream, *estimated_archive_bytes);
     if let Ok(local_addr) = stream.local_addr() {
         remember_active_local_ip(runtime, local_addr.ip());
     }
@@ -1731,8 +1700,8 @@ fn send_file_list_to_peer(
         content_hash: item.content_hash.clone(),
         created_at_us: item.created_at_us,
         source_device_id: item.source_device_id.clone(),
-        size_bytes: prepared.size_bytes,
-        top_level_names: prepared.top_level_names.clone(),
+        size_bytes: *estimated_archive_bytes,
+        top_level_names: top_level_names.clone(),
     });
     if let Err(error) = write_wire_body_to_stream(&mut stream, settings, &start) {
         mark_transfer_failed(runtime, &transfer_id, error.to_string());
@@ -1744,19 +1713,20 @@ fn send_file_list_to_peer(
         return false;
     }
 
-    if let Err(error) = stream_prepared_archive_to_peer(
+    if let Err(error) = stream_file_list_archive_to_peer(
         runtime,
         settings,
         &mut stream,
-        prepared,
         item,
+        paths,
+        *estimated_archive_bytes,
         &transfer_id,
     ) {
         mark_transfer_failed(runtime, &transfer_id, error.to_string());
         push_log(
             runtime,
             "DEBUG",
-            &format!("stream prepared archive failed peer={peer} error={error}"),
+            &format!("stream file archive failed peer={peer} error={error}"),
         );
         return false;
     }
@@ -1781,128 +1751,167 @@ fn send_file_list_to_peer(
     true
 }
 
-fn prepare_file_list_archive(
+fn stream_file_list_archive_to_peer(
     runtime: &RuntimeInner,
+    settings: &Settings,
+    stream: &mut TcpStream,
     item: &ClipboardItem,
-) -> anyhow::Result<PreparedFileArchive> {
-    let ClipboardPayload::FileList {
-        paths,
-        top_level_names,
-        ..
-    } = &item.payload
-    else {
-        return Err(anyhow::anyhow!("clipboard item is not a file list"));
-    };
-
-    if let Some(cached) = load_prepared_archive(runtime, &item.id) {
-        return Ok(cached);
-    }
-
-    let cache_dir = std::env::temp_dir()
-        .join("lan-clipboard")
-        .join("outbound-cache");
-    std::fs::create_dir_all(&cache_dir)?;
-    let final_path = cache_dir.join(format!("{}.tar", item.id));
-    let partial_path = cache_dir.join(format!("{}.partial", item.id));
-    let _ = std::fs::remove_file(&partial_path);
-    let _ = std::fs::remove_file(&final_path);
-
-    let prepare_started_at = Instant::now();
-    let size_bytes = clipboard::write_file_bundle_archive_to_path(paths, &partial_path)?;
-    std::fs::rename(&partial_path, &final_path)?;
-    let prepared = PreparedFileArchive {
-        path: final_path,
+    paths: &[PathBuf],
+    size_bytes: u64,
+    transfer_id: &str,
+) -> anyhow::Result<()> {
+    let archive_started_at = Instant::now();
+    let mut writer = FileStreamNetworkWriter::new(
+        runtime,
+        settings,
+        stream,
+        transfer_id,
         size_bytes,
-        top_level_names: top_level_names.clone(),
-        prepared_at: Instant::now(),
-    };
-    store_prepared_archive(runtime, &item.id, prepared.clone());
+        item_marker(item),
+    );
+    clipboard::stream_file_bundle_archive(paths, &mut writer)?;
+    writer.finish()?;
+    let sent_bytes = writer.sent_bytes();
+    if sent_bytes != size_bytes {
+        return Err(anyhow::anyhow!(
+            "streamed archive size mismatch: sent {sent_bytes} bytes, expected {size_bytes} bytes"
+        ));
+    }
     push_log(
         runtime,
         "DEBUG",
         &format!(
-            "prepared file archive item={} size_bytes={} elapsed_ms={}",
+            "streamed file archive item={} size_bytes={} elapsed_ms={}",
             item.id,
-            size_bytes,
-            prepare_started_at.elapsed().as_millis()
+            sent_bytes,
+            archive_started_at.elapsed().as_millis()
         ),
     );
-    Ok(prepared)
+    Ok(())
 }
 
-fn load_prepared_archive(runtime: &RuntimeInner, item_id: &str) -> Option<PreparedFileArchive> {
-    runtime.prepared_archives.lock().ok().and_then(|mut guard| {
-        let archive = guard.get_mut(item_id)?;
-        if !archive.path.exists() {
-            guard.remove(item_id);
-            return None;
-        }
-        archive.prepared_at = Instant::now();
-        Some(archive.clone())
-    })
+struct FileStreamNetworkWriter<'a> {
+    runtime: &'a RuntimeInner,
+    settings: &'a Settings,
+    stream: &'a mut TcpStream,
+    transfer_id: &'a str,
+    total_bytes: u64,
+    marker: ItemMarker,
+    buffer: Vec<u8>,
+    sent_bytes: u64,
+    last_progress_update: Instant,
 }
 
-fn store_prepared_archive(runtime: &RuntimeInner, item_id: &str, archive: PreparedFileArchive) {
-    if let Ok(mut guard) = runtime.prepared_archives.lock() {
-        if let Some(previous) = guard.insert(item_id.to_string(), archive) {
-            let _ = std::fs::remove_file(previous.path);
+impl<'a> FileStreamNetworkWriter<'a> {
+    fn new(
+        runtime: &'a RuntimeInner,
+        settings: &'a Settings,
+        stream: &'a mut TcpStream,
+        transfer_id: &'a str,
+        total_bytes: u64,
+        marker: ItemMarker,
+    ) -> Self {
+        Self {
+            runtime,
+            settings,
+            stream,
+            transfer_id,
+            total_bytes,
+            marker,
+            buffer: Vec::with_capacity(FILE_STREAM_CHUNK_BYTES),
+            sent_bytes: 0,
+            last_progress_update: Instant::now(),
         }
     }
-}
 
-fn stream_prepared_archive_to_peer(
-    runtime: &RuntimeInner,
-    settings: &Settings,
-    stream: &mut TcpStream,
-    prepared: &PreparedFileArchive,
-    item: &ClipboardItem,
-    transfer_id: &str,
-) -> anyhow::Result<()> {
-    let mut file = File::open(&prepared.path)?;
-    let mut buffer = vec![0u8; FILE_STREAM_CHUNK_BYTES];
-    let mut sent_archive_bytes = 0u64;
-    let mut last_progress_update = Instant::now();
+    fn sent_bytes(&self) -> u64 {
+        self.sent_bytes
+    }
 
-    loop {
-        if transfer_should_abort(runtime, transfer_id) {
+    fn finish(&mut self) -> anyhow::Result<()> {
+        self.flush_buffer()?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn ensure_current(&self) -> anyhow::Result<()> {
+        if transfer_should_abort(self.runtime, self.transfer_id) {
             return Err(anyhow::anyhow!("transfer canceled"));
         }
-        if is_stale_marker(runtime, &item_marker(item)) {
+        if is_stale_marker(self.runtime, &self.marker) {
             return Err(anyhow::anyhow!("superseded by newer clipboard item"));
         }
-        let read_bytes = file.read(&mut buffer)?;
-        if read_bytes == 0 {
-            break;
+        Ok(())
+    }
+
+    fn flush_buffer(&mut self) -> anyhow::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
         }
+        let chunk = std::mem::take(&mut self.buffer);
+        self.write_frame(&chunk)?;
+        self.buffer = Vec::with_capacity(FILE_STREAM_CHUNK_BYTES);
+        Ok(())
+    }
 
-        write_wire_payload_to_stream(
-            stream,
-            settings,
-            &item.source_device_id,
-            &buffer[..read_bytes],
-        )?;
+    fn write_frame(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.ensure_current()?;
+        write_wire_payload_to_stream(self.stream, self.settings, bytes)?;
+        self.sent_bytes = self.sent_bytes.saturating_add(bytes.len() as u64);
+        self.maybe_update_progress();
+        if has_ready_outbound_lane(self.runtime, &[QueueLane::Realtime, QueueLane::Visual]) {
+            std::thread::sleep(Duration::from_millis(HIGH_PRIORITY_YIELD_MS));
+        }
+        Ok(())
+    }
 
-        sent_archive_bytes = sent_archive_bytes.saturating_add(read_bytes as u64);
+    fn maybe_update_progress(&mut self) {
         let progress_now = Instant::now();
-        if progress_now.duration_since(last_progress_update)
+        if progress_now.duration_since(self.last_progress_update)
             >= Duration::from_millis(FILE_STREAM_PROGRESS_EMIT_INTERVAL_MS)
-            || sent_archive_bytes >= prepared.size_bytes
+            || self.sent_bytes >= self.total_bytes
         {
             update_transfer_progress(
-                runtime,
-                transfer_id,
-                sent_archive_bytes,
-                prepared.size_bytes,
+                self.runtime,
+                self.transfer_id,
+                self.sent_bytes,
+                self.total_bytes,
             );
-            last_progress_update = progress_now;
-        }
-
-        if has_ready_outbound_lane(runtime, &[QueueLane::Realtime, QueueLane::Visual]) {
-            std::thread::sleep(Duration::from_millis(HIGH_PRIORITY_YIELD_MS));
+            self.last_progress_update = progress_now;
         }
     }
 
-    Ok(())
+    fn write_all_inner(&mut self, mut input: &[u8]) -> anyhow::Result<()> {
+        while !input.is_empty() {
+            if self.buffer.is_empty() && input.len() >= FILE_STREAM_CHUNK_BYTES {
+                let (chunk, rest) = input.split_at(FILE_STREAM_CHUNK_BYTES);
+                self.write_frame(chunk)?;
+                input = rest;
+                continue;
+            }
+
+            let capacity_left = FILE_STREAM_CHUNK_BYTES - self.buffer.len();
+            let take = capacity_left.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() >= FILE_STREAM_CHUNK_BYTES {
+                self.flush_buffer()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Write for FileStreamNetworkWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.write_all_inner(buffer)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 fn write_wire_body_to_stream(
@@ -1918,12 +1927,69 @@ fn write_wire_body_to_stream(
 fn write_wire_payload_to_stream(
     stream: &mut TcpStream,
     settings: &Settings,
-    source_device_id: &str,
     plain: &[u8],
 ) -> anyhow::Result<()> {
-    let payload = encode_wire_payload(plain, source_device_id, settings)?;
-    stream.write_all(&payload)?;
+    if settings.security.encryption_enabled {
+        let (nonce, encrypted) =
+            encrypt_raw_payload_bytes(plain, &derive_key(&effective_secret(settings)))?;
+        let frame_len = 2usize
+            .saturating_add(nonce.len())
+            .saturating_add(encrypted.len());
+        if frame_len > u32::MAX as usize {
+            return Err(anyhow::anyhow!("raw payload frame too large"));
+        }
+        stream.write_all(&(frame_len as u32).to_be_bytes())?;
+        stream.write_all(&[WIRE_VERSION, RAW_PAYLOAD_ENCRYPTED_FLAG])?;
+        stream.write_all(&nonce)?;
+        stream.write_all(&encrypted)?;
+    } else {
+        let frame_len = 2usize.saturating_add(plain.len());
+        if frame_len > u32::MAX as usize {
+            return Err(anyhow::anyhow!("raw payload frame too large"));
+        }
+        stream.write_all(&(frame_len as u32).to_be_bytes())?;
+        stream.write_all(&[WIRE_VERSION, 0])?;
+        stream.write_all(plain)?;
+    }
     Ok(())
+}
+
+fn read_wire_payload_frame(
+    stream: &mut TcpStream,
+    settings: &Settings,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(frame_bytes) = read_wire_frame(stream)? else {
+        return Ok(None);
+    };
+    if frame_bytes.len() < 2 {
+        return Err(anyhow::anyhow!("raw payload frame too short"));
+    }
+    let version = frame_bytes[0];
+    if version != WIRE_VERSION {
+        return Err(anyhow::anyhow!(
+            "unsupported raw payload version: {version}"
+        ));
+    }
+    let encrypted = frame_bytes[1] == RAW_PAYLOAD_ENCRYPTED_FLAG;
+    if encrypted {
+        if frame_bytes.len() < 14 {
+            return Err(anyhow::anyhow!("encrypted raw payload frame too short"));
+        }
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&frame_bytes[2..14]);
+        return decrypt_raw_payload_bytes(
+            nonce,
+            &frame_bytes[14..],
+            &derive_key(&effective_secret(settings)),
+        )
+        .map(Some);
+    }
+    if settings.security.encryption_enabled {
+        return Err(anyhow::anyhow!(
+            "received plain raw payload but encryption enabled"
+        ));
+    }
+    Ok(Some(frame_bytes[2..].to_vec()))
 }
 
 fn read_wire_body_from_stream(
@@ -2425,12 +2491,6 @@ fn clear_member_cache(runtime: &RuntimeInner) {
     if let Ok(mut guard) = runtime.recent_event_ids.lock() {
         guard.clear();
     }
-    if let Ok(mut guard) = runtime.prepared_archives.lock() {
-        for archive in guard.values() {
-            let _ = std::fs::remove_file(&archive.path);
-        }
-        guard.clear();
-    }
 }
 
 fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevice>) {
@@ -2845,7 +2905,7 @@ fn encrypt_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<([u8; 12], Vec<
     let cipher = Aes256GcmSiv::new_from_slice(key)?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
     let encrypted = cipher
         .encrypt(nonce, plain)
         .map_err(|_| anyhow::anyhow!("encrypt failed"))?;
@@ -2854,10 +2914,34 @@ fn encrypt_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<([u8; 12], Vec<
 
 fn decrypt_bytes(nonce_bytes: [u8; 12], body: &[u8], key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
     let cipher = Aes256GcmSiv::new_from_slice(key)?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = AesNonce::from_slice(&nonce_bytes);
     let plain = cipher
         .decrypt(nonce, body)
         .map_err(|_| anyhow::anyhow!("decrypt failed (shared code mismatch?)"))?;
+    Ok(plain)
+}
+
+fn encrypt_raw_payload_bytes(plain: &[u8], key: &[u8; 32]) -> anyhow::Result<([u8; 12], Vec<u8>)> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key)?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let nonce = ChaChaNonce::from_slice(&nonce_bytes);
+    let encrypted = cipher
+        .encrypt(nonce, plain)
+        .map_err(|_| anyhow::anyhow!("encrypt raw payload failed"))?;
+    Ok((nonce_bytes, encrypted))
+}
+
+fn decrypt_raw_payload_bytes(
+    nonce_bytes: [u8; 12],
+    body: &[u8],
+    key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new_from_slice(key)?;
+    let nonce = ChaChaNonce::from_slice(&nonce_bytes);
+    let plain = cipher
+        .decrypt(nonce, body)
+        .map_err(|_| anyhow::anyhow!("decrypt raw payload failed (shared code mismatch?)"))?;
     Ok(plain)
 }
 
@@ -2983,20 +3067,6 @@ fn register_recent_event(runtime: &RuntimeInner, event_id: &str) {
 fn prune_recent_event_ids(runtime: &RuntimeInner) {
     if let Ok(mut guard) = runtime.recent_event_ids.lock() {
         guard.retain(|_, seen_at| seen_at.elapsed() < Duration::from_millis(RECENT_EVENT_TTL_MS));
-    }
-}
-
-fn prune_prepared_archives(runtime: &RuntimeInner) {
-    if let Ok(mut guard) = runtime.prepared_archives.lock() {
-        guard.retain(|_, archive| {
-            let keep = archive.prepared_at.elapsed()
-                < Duration::from_millis(PREPARED_ARCHIVE_TTL_MS)
-                && archive.path.exists();
-            if !keep {
-                let _ = std::fs::remove_file(&archive.path);
-            }
-            keep
-        });
     }
 }
 
