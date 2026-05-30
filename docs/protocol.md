@@ -95,6 +95,7 @@ UDP 心跳字段：
 - raw payload frame 使用专用二进制小头部，不再对每个文件块做 `bincode(WireMessage)` 包装；文件体加密使用 `ChaCha20-Poly1305`，接收端按 `FileStreamRawStart.size_bytes` 连续读满文件体，再读取 `FileStreamEnd`
 - 文件流在发送和接收过程中都会检查自己是否已被更新内容替代；若判定为旧事件，会尽快中止并丢弃
 - 文件/目录发送端会边生成 `tar` bundle 边写入 raw payload frame；不再先生成完整 outbound-cache 归档文件再二次读取发送
+- 文件/目录接收端会保留已接收的临时 archive 路径并交给剪贴板写回流程；不再在接收完成后把完整 archive 二次读回内存
 - 若文件流接收过程中发送方断链、下线或连接异常关闭，接收端会直接丢弃该未完成文件流并把这条传输标记为失败，不会继续保留半包状态
 - 若图片超出当前大小限制，发送前会自动等比缩小，直到进入限制范围或无法继续缩小
 - 图片重编码使用快速 PNG 压缩；Windows 源端若剪贴板已有原生 `PNG` bytes，则直接复用，避免无意义重编码

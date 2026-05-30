@@ -56,7 +56,7 @@ const DICTS: Record<Locale, Dict> = {
 
     "app.advanced.summary": "高级 / 日志",
     "app.security.title": "高级加密",
-    "app.security.encrypt": "加密传输",
+    "app.security.encrypt": "加密传输（会降低速度）",
     "app.logs.title": "运行日志",
     "app.logs.refresh": "刷新",
     "app.logs.clear": "清空",
@@ -157,7 +157,7 @@ const DICTS: Record<Locale, Dict> = {
 
     "app.advanced.summary": "Advanced / Logs",
     "app.security.title": "Encryption",
-    "app.security.encrypt": "Encrypt transfers",
+    "app.security.encrypt": "Encrypt transfers (slower)",
     "app.logs.title": "Runtime Logs",
     "app.logs.refresh": "Refresh",
     "app.logs.clear": "Clear",

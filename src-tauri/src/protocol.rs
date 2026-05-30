@@ -13,6 +13,10 @@ pub enum ClipboardPayload {
         archive_bytes: Vec<u8>,
         top_level_names: Vec<String>,
     },
+    FileBundlePath {
+        archive_path: PathBuf,
+        top_level_names: Vec<String>,
+    },
     FileList {
         paths: Vec<PathBuf>,
         top_level_names: Vec<String>,
@@ -31,9 +35,9 @@ impl ClipboardPayload {
         match self {
             ClipboardPayload::Text { .. } => "text",
             ClipboardPayload::ImagePng { .. } => "image_png",
-            ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => {
-                "file_bundle"
-            }
+            ClipboardPayload::FileBundle { .. }
+            | ClipboardPayload::FileBundlePath { .. }
+            | ClipboardPayload::FileList { .. } => "file_bundle",
             ClipboardPayload::Html { .. } => "html",
             ClipboardPayload::Rtf { .. } => "rtf",
         }

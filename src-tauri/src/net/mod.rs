@@ -1162,34 +1162,14 @@ fn handle_incoming(
                         continue;
                     }
 
-                    let archive_bytes = match std::fs::read(&file_stream.archive_path) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            mark_transfer_failed(runtime, &transfer_id, error.to_string());
-                            push_log(
-                                runtime,
-                                "WARN",
-                                &format!(
-                                    "read inbound temp archive failed item={} path={} error={}",
-                                    file_stream.meta.item_id,
-                                    file_stream.archive_path.display(),
-                                    error
-                                ),
-                            );
-                            let _ = std::fs::remove_file(&file_stream.archive_path);
-                            continue;
-                        }
-                    };
-                    let _ = std::fs::remove_file(&file_stream.archive_path);
-
                     let item = ClipboardItem {
                         id: file_stream.meta.item_id.clone(),
                         content_hash: file_stream.meta.content_hash,
                         created_at_us: file_stream.meta.created_at_us,
                         source_device_id: file_stream.meta.source_device_id,
-                        size_bytes: archive_bytes.len() as u64,
-                        payload: ClipboardPayload::FileBundle {
-                            archive_bytes,
+                        size_bytes: file_stream.meta.size_bytes,
+                        payload: ClipboardPayload::FileBundlePath {
+                            archive_path: file_stream.archive_path,
                             top_level_names: file_stream.meta.top_level_names,
                         },
                     };
@@ -1321,24 +1301,14 @@ fn receive_raw_file_stream(
         }
     }
 
-    let archive_bytes = match std::fs::read(&archive_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = std::fs::remove_file(&archive_path);
-            mark_transfer_failed(runtime, &transfer_id, error.to_string());
-            return Err(error.into());
-        }
-    };
-    let _ = std::fs::remove_file(&archive_path);
-
     let item = ClipboardItem {
         id: meta.item_id,
         content_hash: meta.content_hash,
         created_at_us: meta.created_at_us,
         source_device_id: meta.source_device_id,
-        size_bytes: archive_bytes.len() as u64,
-        payload: ClipboardPayload::FileBundle {
-            archive_bytes,
+        size_bytes: meta.size_bytes,
+        payload: ClipboardPayload::FileBundlePath {
+            archive_path,
             top_level_names: meta.top_level_names,
         },
     };
@@ -2337,7 +2307,9 @@ fn outbound_lane(entry: &QueueEntry) -> QueueLane {
         | ClipboardPayload::Html { .. }
         | ClipboardPayload::Rtf { .. } => QueueLane::Realtime,
         ClipboardPayload::ImagePng { .. } => QueueLane::Visual,
-        ClipboardPayload::FileBundle { .. } | ClipboardPayload::FileList { .. } => QueueLane::Bulk,
+        ClipboardPayload::FileBundle { .. }
+        | ClipboardPayload::FileBundlePath { .. }
+        | ClipboardPayload::FileList { .. } => QueueLane::Bulk,
     }
 }
 
@@ -2635,6 +2607,9 @@ pub fn build_item(
         ClipboardPayload::Text { text } => text.as_bytes().len() as u64,
         ClipboardPayload::ImagePng { png_bytes } => png_bytes.len() as u64,
         ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.len() as u64,
+        ClipboardPayload::FileBundlePath { archive_path, .. } => std::fs::metadata(archive_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
         ClipboardPayload::Html { html } => html.as_bytes().len() as u64,
         ClipboardPayload::Rtf { rtf } => rtf.as_bytes().len() as u64,
     };
@@ -2724,6 +2699,9 @@ fn payload_summary(payload: &ClipboardPayload) -> String {
         ClipboardPayload::FileBundle {
             top_level_names, ..
         }
+        | ClipboardPayload::FileBundlePath {
+            top_level_names, ..
+        }
         | ClipboardPayload::FileList {
             top_level_names, ..
         } => {
@@ -2764,6 +2742,9 @@ fn payload_label(payload: &ClipboardPayload) -> String {
         ClipboardPayload::Text { .. } => "直接复制文字".to_string(),
         ClipboardPayload::ImagePng { .. } => "图片".to_string(),
         ClipboardPayload::FileBundle {
+            top_level_names, ..
+        }
+        | ClipboardPayload::FileBundlePath {
             top_level_names, ..
         }
         | ClipboardPayload::FileList {

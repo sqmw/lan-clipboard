@@ -1,114 +1,178 @@
 <!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="stylesheet" href="/src/styles.css" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LAN Clipboard</title>
-    <script type="module" src="/src/main.ts" defer></script>
-  </head>
-  <body>
-    <main class="app-shell">
-      <section class="panel panel-connect">
-        <div class="section-head">
-          <div>
-            <p class="section-kicker" id="i18n-domain-kicker">共享域</p>
-            <h2 id="i18n-domain-title">查看当前共享域成员与同步状态</h2>
-          </div>
-          <button class="ghost-button" id="refresh-domain" type="button">刷新</button>
-        </div>
-        <div class="connect-box connect-list">
-          <div class="label" id="i18n-devices-label">设备列表</div>
-          <div id="discovered-devices"></div>
-          <p class="list-feedback" id="scan-feedback">当前没有发现其他共享域成员。</p>
-        </div>
-        <div class="section-head section-head-inline">
-          <div>
-            <p class="section-kicker" id="i18n-status-kicker">运行状态</p>
-            <h2 id="i18n-status-title">同步状态</h2>
-          </div>
-        </div>
-        <div class="status-grid">
-          <article class="status-card">
-            <span class="status-label" id="i18n-status-label">状态</span>
-            <strong id="status-running">-</strong>
-          </article>
-          <article class="status-card">
-            <span class="status-label" id="i18n-members-label">共享域成员（含本机）</span>
-            <strong id="status-peer-count">-</strong>
-          </article>
-        </div>
-        <div class="connect-box connect-list">
-          <div class="label" id="i18n-transfer-label">传输进度</div>
-          <div id="transfer-progress-list"></div>
-        </div>
-      </section>
+    <head>
+        <meta charset="UTF-8" />
+        <link rel="stylesheet" href="/src/styles.css" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>LAN Clipboard</title>
+        <script type="module" src="/src/main.ts" defer></script>
+    </head>
+    <body>
+        <main class="app-shell">
+            <section class="panel panel-connect">
+                <div class="section-head">
+                    <div>
+                        <p class="section-kicker" id="i18n-domain-kicker">
+                            共享域
+                        </p>
+                        <h2 id="i18n-domain-title">
+                            查看当前共享域成员与同步状态
+                        </h2>
+                    </div>
+                    <button
+                        class="ghost-button"
+                        id="refresh-domain"
+                        type="button"
+                    >
+                        刷新
+                    </button>
+                </div>
+                <div class="connect-box connect-list">
+                    <div class="label" id="i18n-devices-label">设备列表</div>
+                    <div id="discovered-devices"></div>
+                    <p class="list-feedback" id="scan-feedback">
+                        当前没有发现其他共享域成员。
+                    </p>
+                </div>
+                <div class="section-head section-head-inline">
+                    <div>
+                        <p class="section-kicker" id="i18n-status-kicker">
+                            运行状态
+                        </p>
+                        <h2 id="i18n-status-title">同步状态</h2>
+                    </div>
+                </div>
+                <div class="status-grid">
+                    <article class="status-card">
+                        <span class="status-label" id="i18n-status-label"
+                            >状态</span
+                        >
+                        <strong id="status-running">-</strong>
+                    </article>
+                    <article class="status-card">
+                        <span class="status-label" id="i18n-members-label"
+                            >共享域成员（含本机）</span
+                        >
+                        <strong id="status-peer-count">-</strong>
+                    </article>
+                </div>
+                <div class="connect-box connect-list">
+                    <div class="label" id="i18n-transfer-label">传输进度</div>
+                    <div id="transfer-progress-list"></div>
+                </div>
+            </section>
 
-      <section class="panel panel-settings">
-        <div class="section-head">
-          <div>
-            <p class="section-kicker" id="i18n-settings-kicker">设置</p>
-            <h2 id="i18n-settings-title">同步配置</h2>
-          </div>
-          <button class="primary-button" id="save-settings" type="button">保存配置</button>
-        </div>
-        <div class="settings-grid">
-          <label>
-            <span id="i18n-shared-code-label">共享码</span>
-            <input id="shared-code" placeholder="6位数字" maxlength="6" inputmode="numeric" />
-          </label>
-          <label>
-            <span id="i18n-language-label">语言</span>
-            <select id="language"></select>
-          </label>
-          <label>
-            <span id="i18n-network-label">使用网络</span>
-            <select id="network-ip"></select>
-          </label>
-          <label>
-            <span id="i18n-max-mb-label">最大发送大小（MB）</span>
-            <input id="max-item-mb" type="number" min="1" max="1000" step="1" />
-          </label>
-        </div>
-        <div class="panel-sub settings-subpanel">
-          <h3 id="i18n-startup-title">后台与启动</h3>
-          <label class="compact-toggle-row">
-            <span class="compact-toggle-copy">
-              <span class="compact-toggle-label" id="i18n-launch-at-login-label">开机启动</span>
-              <span class="compact-toggle-hint" id="i18n-background-hint"
-                >应用启动后默认在后台运行；关闭窗口会保留在菜单栏 / 托盘。</span
-              >
-            </span>
-            <span class="switch">
-              <input id="launch-at-login" type="checkbox" />
-              <span class="switch-slider" aria-hidden="true"></span>
-            </span>
-          </label>
-        </div>
-        <p class="hint" id="i18n-settings-hint">推荐家庭或小团队共用一个 6 位码；同网段内填写相同共享码的设备都会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。</p>
-        <p class="save-feedback" id="config-feedback">修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。</p>
-        <details class="advanced">
-          <summary id="i18n-advanced-summary">高级 / 日志</summary>
-          <div class="panel-sub">
-            <h3 id="i18n-security-title">高级加密</h3>
-            <label class="compact-toggle-row">
-              <span class="compact-toggle-label" id="i18n-encrypt-label">加密传输</span>
-              <span class="switch">
-                <input id="encryption-enabled" type="checkbox" />
-                <span class="switch-slider" aria-hidden="true"></span>
-              </span>
-            </label>
-          </div>
-          <div class="panel-sub">
-            <h3 id="i18n-logs-title">运行日志</h3>
-            <div class="actions">
-              <button id="refresh-logs" type="button">刷新</button>
-              <button id="clear-logs" type="button">清空</button>
-            </div>
-            <pre id="runtime-logs"></pre>
-          </div>
-        </details>
-      </section>
-    </main>
-  </body>
+            <section class="panel panel-settings">
+                <div class="section-head">
+                    <div>
+                        <p class="section-kicker" id="i18n-settings-kicker">
+                            设置
+                        </p>
+                        <h2 id="i18n-settings-title">同步配置</h2>
+                    </div>
+                    <button
+                        class="primary-button"
+                        id="save-settings"
+                        type="button"
+                    >
+                        保存配置
+                    </button>
+                </div>
+                <div class="settings-grid">
+                    <label>
+                        <span id="i18n-shared-code-label">共享码</span>
+                        <input
+                            id="shared-code"
+                            placeholder="6位数字"
+                            maxlength="6"
+                            inputmode="numeric"
+                        />
+                    </label>
+                    <label>
+                        <span id="i18n-language-label">语言</span>
+                        <select id="language"></select>
+                    </label>
+                    <label>
+                        <span id="i18n-network-label">使用网络</span>
+                        <select id="network-ip"></select>
+                    </label>
+                    <label>
+                        <span id="i18n-max-mb-label">最大发送大小（MB）</span>
+                        <input
+                            id="max-item-mb"
+                            type="number"
+                            min="1"
+                            max="1000"
+                            step="1"
+                        />
+                    </label>
+                </div>
+                <div class="panel-sub settings-subpanel">
+                    <h3 id="i18n-startup-title">后台与启动</h3>
+                    <label class="compact-toggle-row">
+                        <span class="compact-toggle-copy">
+                            <span
+                                class="compact-toggle-label"
+                                id="i18n-launch-at-login-label"
+                                >开机启动</span
+                            >
+                            <span
+                                class="compact-toggle-hint"
+                                id="i18n-background-hint"
+                                >应用启动后默认在后台运行；关闭窗口会保留在菜单栏
+                                / 托盘。</span
+                            >
+                        </span>
+                        <span class="switch">
+                            <input id="launch-at-login" type="checkbox" />
+                            <span
+                                class="switch-slider"
+                                aria-hidden="true"
+                            ></span>
+                        </span>
+                    </label>
+                </div>
+                <p class="hint" id="i18n-settings-hint">
+                    推荐家庭或小团队共用一个 6
+                    位码；同网段内填写相同共享码的设备都会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。
+                </p>
+                <p class="save-feedback" id="config-feedback">
+                    修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。
+                </p>
+                <details class="advanced">
+                    <summary id="i18n-advanced-summary">高级 / 日志</summary>
+                    <div class="panel-sub">
+                        <h3 id="i18n-security-title">高级加密</h3>
+                        <label class="compact-toggle-row">
+                            <span
+                                class="compact-toggle-label"
+                                id="i18n-encrypt-label"
+                                >加密传输（加密会降低速度）</span
+                            >
+                            <span class="switch">
+                                <input
+                                    id="encryption-enabled"
+                                    type="checkbox"
+                                />
+                                <span
+                                    class="switch-slider"
+                                    aria-hidden="true"
+                                ></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="panel-sub">
+                        <h3 id="i18n-logs-title">运行日志</h3>
+                        <div class="actions">
+                            <button id="refresh-logs" type="button">
+                                刷新
+                            </button>
+                            <button id="clear-logs" type="button">清空</button>
+                        </div>
+                        <pre id="runtime-logs"></pre>
+                    </div>
+                </details>
+            </section>
+        </main>
+    </body>
 </html>

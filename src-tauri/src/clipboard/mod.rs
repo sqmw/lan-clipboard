@@ -102,6 +102,9 @@ pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String,
         ClipboardPayload::FileBundle { archive_bytes, .. } => {
             hash_file_bundle_archive(archive_bytes)
         }
+        ClipboardPayload::FileBundlePath { archive_path, .. } => {
+            hash_file_bundle_archive_path(archive_path)
+        }
     }
 }
 
@@ -161,6 +164,10 @@ fn write_item_once(
             archive_bytes,
             top_level_names,
         } => write_file_bundle(item, archive_bytes, top_level_names, limits),
+        ClipboardPayload::FileBundlePath {
+            archive_path,
+            top_level_names,
+        } => write_file_bundle_from_path(item, archive_path, top_level_names, limits),
         ClipboardPayload::FileList { .. } => Err(ClipboardError::Unsupported),
         ClipboardPayload::Html { html } => {
             write_rich_text_payload("html", html)?;
@@ -436,7 +443,16 @@ fn collect_path_hash_records(
 
 fn hash_file_bundle_archive(archive_bytes: &[u8]) -> Result<String, ClipboardError> {
     let cursor = Cursor::new(archive_bytes);
-    let mut archive = Archive::new(cursor);
+    hash_file_bundle_archive_reader(cursor)
+}
+
+fn hash_file_bundle_archive_path(archive_path: &Path) -> Result<String, ClipboardError> {
+    let file = File::open(archive_path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    hash_file_bundle_archive_reader(file)
+}
+
+fn hash_file_bundle_archive_reader<R: Read>(reader: R) -> Result<String, ClipboardError> {
+    let mut archive = Archive::new(reader);
     let mut records = Vec::new();
 
     let entries = archive
@@ -615,7 +631,7 @@ fn write_file_bundle(
         fs::remove_dir_all(&bundle_dir).map_err(|e| ClipboardError::Backend(e.to_string()))?;
     }
     fs::create_dir_all(&bundle_dir).map_err(|e| ClipboardError::Backend(e.to_string()))?;
-    unpack_archive_into(archive_bytes, &bundle_dir)?;
+    unpack_archive_bytes_into(archive_bytes, &bundle_dir)?;
 
     let restored_paths = top_level_names
         .iter()
@@ -634,13 +650,66 @@ fn write_file_bundle(
     })
 }
 
+fn write_file_bundle_from_path(
+    item: &ClipboardItem,
+    archive_path: &Path,
+    top_level_names: &[String],
+    limits: &SizeLimits,
+) -> Result<AppliedClipboardWrite, ClipboardError> {
+    let size_bytes = fs::metadata(archive_path)
+        .map_err(|e| ClipboardError::Backend(e.to_string()))?
+        .len();
+    if size_bytes > limits.max_item_bytes {
+        return Err(ClipboardError::TooLarge {
+            size_bytes,
+            limit_bytes: limits.max_item_bytes,
+        });
+    }
+
+    let bundle_dir = internal_clipboard_root().join(&item.id);
+    if bundle_dir.exists() {
+        fs::remove_dir_all(&bundle_dir).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    }
+    fs::create_dir_all(&bundle_dir).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    unpack_archive_path_into(archive_path, &bundle_dir)?;
+
+    let restored_paths = top_level_names
+        .iter()
+        .map(|name| bundle_dir.join(name))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if restored_paths.is_empty() {
+        return Err(ClipboardError::Backend(
+            "restored clipboard file bundle is empty".to_string(),
+        ));
+    }
+
+    write_file_list(&restored_paths)?;
+    let _ = fs::remove_file(archive_path);
+    Ok(AppliedClipboardWrite {
+        content_hash: Some(hash_file_list(&restored_paths)?),
+    })
+}
+
 fn internal_clipboard_root() -> PathBuf {
     std::env::temp_dir().join("lan-clipboard")
 }
 
-fn unpack_archive_into(bytes: &[u8], destination: &Path) -> Result<(), ClipboardError> {
+fn unpack_archive_bytes_into(bytes: &[u8], destination: &Path) -> Result<(), ClipboardError> {
     let cursor = Cursor::new(bytes);
-    let mut archive = Archive::new(cursor);
+    unpack_archive_reader_into(cursor, destination)
+}
+
+fn unpack_archive_path_into(archive_path: &Path, destination: &Path) -> Result<(), ClipboardError> {
+    let file = File::open(archive_path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    unpack_archive_reader_into(file, destination)
+}
+
+fn unpack_archive_reader_into<R: Read>(
+    reader: R,
+    destination: &Path,
+) -> Result<(), ClipboardError> {
+    let mut archive = Archive::new(reader);
     let entries = archive
         .entries()
         .map_err(|e| ClipboardError::Backend(e.to_string()))?;
