@@ -28,6 +28,31 @@
 - [ ] 失败原因更细粒度展示（区分“未发现成员”“网络失败”“远端剪贴板忙”）
 - [ ] 历史记录（可选，需明确隐私与落盘策略）
 
+## 里程碑 M3（大文件吞吐）
+
+- [x] 发送端边生成 `tar` bundle 边写入网络分帧，避免完整 outbound archive 落盘后二次读取
+- [x] 接收端边接收 raw payload 边解包到内部目录，避免完整 inbound archive 落盘和二次读取
+- [x] 分阶段 profiling 日志：覆盖剪贴板读取、文件指纹、发送、接收、系统剪贴板写回
+- [x] 发送端归档读取缓冲：大文件发送时使用 `1MB` 源文件读取缓冲，减少默认小块读取造成的吞吐损耗
+- [x] 发送端细分 profiling：记录文件流帧数、累计 socket 写入耗时和单帧最大写入耗时，避免只看到整体 `stream_ms`
+- [ ] 发送端更细分 profiling：继续拆出文件读取与 `tar` 编码时间
+- [ ] 多连接 / 分片并行传输：用于继续逼近局域网带宽上限，需先明确协议版本、失败恢复和单槽位最新值语义
+- [ ] 纯网络 benchmark：绕过剪贴板和 tar，用于测当前 TCP + 加密数据面的理论上限
+
+## 里程碑 M4（结构治理）
+
+- [x] 第一轮保行为拆分：从 `net/mod.rs` 拆出 `crypto`、`display`、`metrics`、`wire`、`file_stream`、`discovery`、`members`、`queue`、`transfers`、`logs`、`marker`、`dedupe`、`item`、`socket`、`udp`、`sender`、`inbound`，从 `clipboard/mod.rs` 拆出 `fingerprint`
+- [x] 第二轮剪贴板拆分：从 `clipboard/mod.rs` 拆出 `files`、`image_payload`、`rich_text`、`platform`、`types`，入口文件只保留格式选择、大小限制分发和剪贴板 IO 重试
+- [x] 第三轮运行层拆分：从 `net/mod.rs` 拆出 `lifecycle`，集中管理同步主循环、剪贴板监听、presence、入站/出站 worker 和周期性发现心跳
+- [x] 第一轮前端拆分：从 `src/main.ts` 拆出 `transferProgress`，集中管理传输卡片、速度统计、文本预览展开和滚动交互
+- [x] 第二轮前端拆分：从 `src/main.ts` 拆出 `settingsForm`、`deviceList`、`types`、`html`，入口文件只保留启动编排、IPC 调用和定时刷新
+- [x] 第四轮网络拆分：从 `net/mod.rs` 拆出 `state`、`domain`、`flow`，入口文件不再承载运行态容器、共享域目标收集和队列流转细节
+- [x] 第三轮前端拆分：从 `src/styles.css` 拆出 `src/styles/` 样式子模块，入口样式文件只保留导入顺序
+- [x] 第五轮网络拆分：从 `net/lifecycle.rs` 拆出 `presence`、`watch`、`workers`，生命周期文件只保留监听主循环和周期性发现衔接
+- [ ] 继续拆网络运行细节：优先拆 `inbound`、`sender`、`discovery` 中仍偏重的协议、连接和发现逻辑
+- [ ] 继续拆 `clipboard` 平台细节：如 Windows 图片 DIB 转换、macOS Swift 脚本、Windows 富文本 PowerShell fallback 继续向平台子模块下沉
+- [ ] 继续拆前端入口：把 `src/main.ts` 的日志和 API 调用继续拆到独立模块
+
 ## 风险清单（需要早决策）
 
 - “任何类型”跨 OS 的真实含义：macOS UTI 与 Windows clipboard formats 不可一一映射；建议定义“跨平台支持的格式集合”，其余类型降级或跳过（详见 `docs/protocol.md`）。

@@ -1,0 +1,52 @@
+#runtime-logs {
+  margin: 0;
+  min-height: 120px;
+  max-height: 240px;
+  overflow: auto;
+  border-radius: 8px;
+  padding: 10px;
+  background: #1c1c1e;
+  color: #f2f2f7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.tips-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.tip-card {
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-hover);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tip-card span {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.tip-card p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.actions button {
+  flex: 1;
+}

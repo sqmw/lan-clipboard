@@ -1,6 +1,6 @@
 [package]
 name = "lan-clipboard"
-version = "1.0.2"
+version = "1.0.3"
 description = "A Tauri App"
 authors = ["kingsun22515@gmail.com"]
 edition = "2021"

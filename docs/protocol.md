@@ -92,10 +92,10 @@ UDP 心跳字段：
 - 图片的 `size_bytes` 按原始 PNG 字节计算；协议和 TCP 帧都不再额外做 base64 膨胀
 - 文件/目录复制会在发送前打成 `tar` bundle，远端解包到临时目录后再写回系统剪贴板
 - 文件流采用独立 bulk worker 发送；控制帧仍走 `WireBody`，文件体改走约 `16MB` raw payload frame，避免每个大块再封装成 `FileStreamChunk` 结构体
-- raw payload frame 使用专用二进制小头部，不再对每个文件块做 `bincode(WireMessage)` 包装；文件体加密使用 `ChaCha20-Poly1305`，接收端按 `FileStreamRawStart.size_bytes` 连续读满文件体，再读取 `FileStreamEnd`
+- raw payload frame 使用专用二进制小头部，不再对每个文件块做 `bincode(WireMessage)` 包装；文件体加密使用 `ChaCha20-Poly1305`，接收端按 `FileStreamRawStart.size_bytes` 把连续文件体帧直接喂给 `tar` reader，再读取 `FileStreamEnd`
 - 文件流在发送和接收过程中都会检查自己是否已被更新内容替代；若判定为旧事件，会尽快中止并丢弃
 - 文件/目录发送端会边生成 `tar` bundle 边写入 raw payload frame；不再先生成完整 outbound-cache 归档文件再二次读取发送
-- 文件/目录接收端会保留已接收的临时 archive 路径并交给剪贴板写回流程；不再在接收完成后把完整 archive 二次读回内存
+- 文件/目录接收端会边收边解包到内部目录；不再先保留完整临时 archive，也不再在接收完成后把完整 archive 二次读回内存
 - 若文件流接收过程中发送方断链、下线或连接异常关闭，接收端会直接丢弃该未完成文件流并把这条传输标记为失败，不会继续保留半包状态
 - 若图片超出当前大小限制，发送前会自动等比缩小，直到进入限制范围或无法继续缩小
 - 图片重编码使用快速 PNG 压缩；Windows 源端若剪贴板已有原生 `PNG` bytes，则直接复用，避免无意义重编码

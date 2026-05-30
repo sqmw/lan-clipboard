@@ -1,0 +1,35 @@
+.device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.device-row + .device-row {
+  margin-top: 6px;
+}
+
+.device-row-self {
+  background: linear-gradient(180deg, #f8fbff 0%, #eef5ff 100%);
+}
+
+.device-row-self .device-tag {
+  background: rgba(0, 122, 255, 0.1);
+  color: var(--accent);
+}
+
+.device-row button {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.list-feedback {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 8px 0 0;
+}

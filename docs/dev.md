@@ -90,15 +90,18 @@
 ## 当前实现要点
 
 - 剪贴板变化当前在 macOS / Windows 都采用后台指纹轮询监听；`50ms` 轮询只负责发现“是否变成了新内容”，不再使用旧版“定时把当前剪贴板内容广播出去”的同步模型
+- 剪贴板观察、presence 注册和队列 worker 调度已经从 `net/lifecycle.rs` 拆到 `net/watch.rs`、`net/presence.rs`、`net/workers.rs`；后续改 worker 细节时不要回填到生命周期主循环
+- 前端样式已按 `src/styles/` 子模块拆分；新增界面样式时优先放入对应子模块，不要继续把所有规则堆回 `src/styles.css`
 - 发送队列调度规则：`新任务 > 旧重试`，`文本/富文本 > 图片 > 文件`
 - 网络层已拆成主调度循环、入站连接 worker、接收写回 worker、发送 worker
 - 文件发送端会边生成 `tar` bundle 边写入网络分帧；多 peer 广播会分别走各自的流式发送路径
+- 文件发送端源文件读取使用 `1MB` 归档读取缓冲；如果大文件 `profile file_send stream_ms` 仍偏高，下一步要继续拆分“文件读取 / tar 写入 / socket 阻塞”等子阶段
 - 发送/接收进度会展示类型、大小、方向和失败信息
 - 高级加密开关已改为 switch 形式，但行为仍然只是控制 `encryption_enabled`
 - 当前传输链路还没有把局域网带宽稳定吃满；如果回归目标包含高吞吐大文件传输，需要把“速度未拉满带宽”当成已知限制，而不是回归失败
 - `pnpm tauri dev` 使用 Rust debug profile；当前已对加密和 `bincode` 相关依赖启用局部 `opt-level=3`，否则大文件加密传输会被 debug 构建明显拖慢
 - 大文件体加密走 `ChaCha20-Poly1305`，控制帧仍走 `AES-GCM-SIV`；调试吞吐时需要确保双端都重新编译到同一线协议版本
-- 文件接收端当前保留临时 archive 路径并直接交给写回流程，不再在完整接收后把 archive 读回内存；如果大文件吞吐仍偏低，下一步优先检查系统剪贴板写回与底层落盘路径
+- 文件接收端当前会边收边解包到内部目录，不再先落完整临时 archive；如果大文件吞吐仍偏低，下一步优先检查多连接分片、加密数据面和系统剪贴板写回
 
 ## 调试入口
 
@@ -108,6 +111,22 @@
 - 运行日志会落盘到系统临时目录下的 `lan-clipboard/runtime.log`
 
 ### 重点日志关键字
+
+- `profile local_clipboard ... read_snapshot_ms=... build_item_ms=... total_ms=...`
+  - 本机识别剪贴板和生成内容指纹耗时；文件场景下 `build_item_ms` 可反映文件指纹采样成本
+
+- `profile file_send ... connect_ms=... start_frame_ms=... stream_ms=... throughput_mib_s=...`
+  - 发送端大文件链路耗时；`stream_ms` 包含边打包、加密和 TCP 写入，适合先判断发送侧真实吞吐
+  - 若 `local_clipboard` 很快、`clipboard_apply` 也很快，但发送和接收吞吐都低，优先怀疑发送端 `tar` 打包读取或 socket 写入阻塞，而不是 UI 或剪贴板写回
+
+- `streamed file archive ... frame_count=... write_frame_ms=... write_frame_max_ms=...`
+  - 发送端文件流内部耗时；`write_frame_ms` 接近总耗时时，瓶颈更可能是 TCP 写入/接收端反压，否则优先看文件读取与 `tar` 打包
+
+- `profile file_recv ... stream_ms=... throughput_mib_s=...`
+  - 接收端收包与流式解包耗时；可与发送端 `throughput_mib_s` 对照判断瓶颈在发送侧还是接收侧
+
+- `profile clipboard_apply ... apply_ms=...`
+  - 接收端写入系统剪贴板耗时；如果网络速度正常但粘贴很晚，优先看这一项
 
 - `outbound item ... pending peers`
   - 当前复制事件正在等待成员发现或补重试

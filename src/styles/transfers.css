@@ -1,0 +1,145 @@
+.transfer-card {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.transfer-card + .transfer-card {
+  margin-top: 8px;
+}
+
+.transfer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.transfer-head strong {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.transfer-badge {
+  flex: none;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(0, 122, 255, 0.1);
+}
+
+.transfer-completed {
+  color: var(--success);
+  background: rgba(52, 199, 89, 0.12);
+}
+
+.transfer-failed {
+  color: #d70015;
+  background: rgba(215, 0, 21, 0.1);
+}
+
+.transfer-meta,
+.transfer-error {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.transfer-title {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.transfer-preview {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f6f8fc;
+  border: 1px solid #e3e8f2;
+}
+
+.transfer-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.transfer-preview-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.transfer-preview-toggle {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #c8d4e8;
+  background: #ffffff;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.transfer-preview-toggle:hover {
+  border-color: var(--accent);
+  background: #eef5ff;
+}
+
+.transfer-preview-content {
+  margin: 0;
+  max-height: 54px;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.transfer-preview.is-expanded .transfer-preview-content {
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.transfer-preview-content:focus {
+  outline: 2px solid rgba(0, 122, 255, 0.18);
+  outline-offset: 2px;
+}
+
+.transfer-error {
+  color: #d70015;
+}
+
+.transfer-bar {
+  margin-top: 8px;
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: #e9edf5;
+  overflow: hidden;
+}
+
+.transfer-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #4a90ff 0%, #007aff 100%);
+}

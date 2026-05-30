@@ -1,0 +1,33 @@
+@media (max-width: 640px) {
+  .connect-grid,
+  .settings-grid,
+  .tips-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-card {
+    flex-direction: column;
+    text-align: center;
+    gap: 8px;
+  }
+
+  .hero-card-tip {
+    max-width: none;
+  }
+
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .inline-form {
+    flex-direction: column;
+  }
+
+  .inline-form button {
+    width: 100%;
+  }
+
+  .section-head {
+    align-items: flex-start;
+  }
+}
