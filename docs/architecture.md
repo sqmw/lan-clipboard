@@ -45,7 +45,7 @@ LAN Clipboard 在同一局域网内同步 macOS / Windows 的常用剪贴板格�
 | `state` | `RuntimeInner`、socket registry、队列/缓存/进度容器 |
 | `lifecycle` | TCP/UDP 监听、worker 创建、readiness 与主循环 |
 | `workers` | inbound apply 与两类 outbound 调度循环 |
-| `domain` | 当前可见 peer、成员变化、队列/staging 清理 |
+| `domain` | 当前可见 peer 与过期队列/staging 清理；发现瞬态不作为传输终止信号 |
 | `queue` | lane、优先级、失败 peer 与有界退避 |
 | `transfers` | UI 可消费的传输状态与保留 |
 | `logs` | 有界内存日志、错误状态和安全落盘轮转 |
@@ -57,7 +57,7 @@ LAN Clipboard 在同一局域网内同步 macOS / Windows 的常用剪贴板格�
 | `presence` | mDNS 注册与重试；同步禁用时停止广播 |
 | `discovery` | mDNS 扫描、字段校验、网卡选择、有界可达性探测 |
 | `udp` | 域摘要心跳、每轮接收预算与候选合并 |
-| `members` | discovered/seen/known 的 TTL、上限与驱逐 |
+| `members` | mDNS/UDP 观测合并，以及 discovered/seen/known 的 TTL、上限与驱逐 |
 | `handshake` | 固定长度 PSK challenge/response/ack 与 per-connection session |
 | `crypto` | domain id、HKDF/HMAC、控制/文件 AEAD 原语 |
 
@@ -108,6 +108,7 @@ system clipboard change
   -> flow::enqueue_outbound_item
   -> queue lane selection
   -> collect current discovered peers
+  -> no peer: bounded discovery retry
   -> bounded sender workers
   -> TCP connect -> client_handshake
   -> per-session encode/encrypt/write
@@ -141,7 +142,7 @@ validate update
   -> apply next runtime if needed
   -> atomically persist settings
   -> publish in-memory settings + increment revision
-  -> clear or restore discovery cache
+  -> only explicit discovery-setting changes clear cache; routine scans merge observations
 ```
 
 任何阶段失败都恢复 previous runtime；异步 discovery 写回前必须核对 revision。discovery 在进入 blocking 线程池前取得 busy-fast lease；已有扫描时直接返回“进行中”，不排队也不合并出第二个 mDNS 任务。

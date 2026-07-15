@@ -70,6 +70,17 @@ pub(super) fn merge_discovered_devices(runtime: &RuntimeInner, devices: Vec<Disc
     }
 }
 
+/// Merges a routine discovery observation into the member cache.
+///
+/// A discovery scan is only a point-in-time observation: an empty or partial
+/// mDNS response does not prove that a previously observed peer left the
+/// shared domain. Members therefore remain visible until their TTL expires.
+/// Explicit cache replacement is handled separately by
+/// [`replace_discovered_devices`].
+pub(super) fn refresh_discovered_devices(runtime: &RuntimeInner, devices: Vec<DiscoveredDevice>) {
+    merge_discovered_devices(runtime, devices);
+}
+
 pub(super) fn replace_discovered_devices(
     runtime: &RuntimeInner,
     selected_local_ip: Option<&str>,
@@ -219,6 +230,42 @@ mod tests {
         );
         assert!(runtime.discovered_devices.lock().unwrap().len() <= DISCOVERED_DEVICE_LIMIT);
         assert!(runtime.discovered_seen_at.lock().unwrap().len() <= DISCOVERED_DEVICE_LIMIT);
+    }
+
+    #[test]
+    fn periodic_refresh_keeps_fresh_udp_members_when_mdns_is_empty_or_partial() {
+        let runtime = RuntimeInner::default();
+        let udp_member = device(1);
+        let mdns_member = device(2);
+
+        merge_discovered_devices(&runtime, vec![udp_member.clone()]);
+        refresh_discovered_devices(&runtime, Vec::new());
+        refresh_discovered_devices(&runtime, vec![mdns_member.clone()]);
+
+        let devices = runtime.discovered_devices.lock().unwrap();
+        assert!(devices
+            .iter()
+            .any(|device| device.device_id == udp_member.device_id));
+        assert!(devices
+            .iter()
+            .any(|device| device.device_id == mdns_member.device_id));
+    }
+
+    #[test]
+    fn stale_discovered_member_is_pruned_after_ttl() {
+        let runtime = RuntimeInner::default();
+        let stale_member = device(1);
+        merge_discovered_devices(&runtime, vec![stale_member.clone()]);
+
+        runtime.discovered_seen_at.lock().unwrap().insert(
+            stale_member.device_id.clone(),
+            Instant::now() - Duration::from_millis(DISCOVERY_MEMBER_TTL_MS + 1),
+        );
+
+        prune_stale_discovered_devices(&runtime);
+
+        assert!(runtime.discovered_devices.lock().unwrap().is_empty());
+        assert!(runtime.discovered_seen_at.lock().unwrap().is_empty());
     }
 
     #[test]

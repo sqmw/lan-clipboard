@@ -3,7 +3,7 @@ use super::discovery::{
 };
 use super::inbound::{shutdown_incoming_workers, spawn_incoming_connection_worker};
 use super::logs::{push_log, set_error};
-use super::members::replace_discovered_devices;
+use super::members::refresh_discovered_devices as merge_discovery_refresh;
 use super::queue::QueueLane;
 use super::transfers::has_active_transfers;
 use super::udp::{receive_udp_announcements, send_udp_announcement};
@@ -12,7 +12,7 @@ use super::watch::{prune_clipboard_observation_caches, spawn_clipboard_watch_wor
 use super::workers::{
     join_worker, main_loop_sleep_duration, spawn_inbound_apply_worker, spawn_outbound_worker,
 };
-use super::{reconcile_member_state, RuntimeInner};
+use super::RuntimeInner;
 use crate::settings::Settings;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener};
 use std::sync::atomic::Ordering;
@@ -205,8 +205,7 @@ fn refresh_discovered_devices(
         timeout_ms,
     ) {
         Ok(devices) => {
-            replace_discovered_devices(runtime, selected_local_ip, devices);
-            reconcile_member_state(runtime, settings);
+            merge_discovery_refresh(runtime, devices);
         }
         Err(error) => set_error(runtime, format!("peer discovery failed: {error}")),
     }

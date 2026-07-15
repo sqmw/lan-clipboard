@@ -228,15 +228,27 @@ pub(super) fn process_outbound_queue(
             entry.pending_peers.as_deref(),
         );
         if report.attempted == 0 {
-            clear_content_inflight(runtime, &entry.item.content_hash);
+            if schedule_retry(&mut entry) {
+                push_log(
+                    runtime,
+                    "DEBUG",
+                    &format!(
+                        "outbound item {} waiting for peer discovery retry={}",
+                        entry.item.id, entry.attempts
+                    ),
+                );
+                push_queue_entry(&runtime.outbound_queue, entry);
+                continue;
+            }
             push_log(
                 runtime,
-                "DEBUG",
+                "WARN",
                 &format!(
-                    "drop outbound item {} because shared domain only contains self",
+                    "drop outbound item {} after peer discovery retry window",
                     entry.item.id
                 ),
             );
+            clear_content_inflight(runtime, &entry.item.content_hash);
             continue;
         }
         if report.deferred {
@@ -379,4 +391,50 @@ pub(super) fn enqueue_inbound_item(
         "DEBUG",
         &format!("queued inbound item {item_id} kind={kind} size_bytes={size_bytes} from {source}"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_item() -> ClipboardItem {
+        ClipboardItem {
+            id: "item-1".to_string(),
+            content_hash: "hash-1".to_string(),
+            created_at_us: 1,
+            source_device_id: "source-device".to_string(),
+            size_bytes: 4,
+            payload: ClipboardPayload::Text {
+                text: "text".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn outbound_item_waits_for_peer_discovery_instead_of_being_dropped() {
+        let runtime = RuntimeInner::default();
+        let settings = Settings::default();
+        let item = text_item();
+        enqueue_outbound_item(&runtime, item.clone());
+
+        assert!(process_outbound_queue(
+            &runtime,
+            &settings,
+            &[QueueLane::Realtime],
+        ));
+
+        let queue = runtime.outbound_queue.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        let entry = queue.front().unwrap();
+        assert_eq!(entry.item.id, item.id);
+        assert_eq!(entry.attempts, 1);
+        assert!(entry.pending_peers.is_none());
+        drop(queue);
+        assert!(runtime
+            .inflight_content_fingerprints
+            .lock()
+            .unwrap()
+            .contains(&item.content_hash));
+        assert!(runtime.shared_content_fingerprint.lock().unwrap().is_none());
+    }
 }

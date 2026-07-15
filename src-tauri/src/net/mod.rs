@@ -26,7 +26,7 @@ mod wire;
 mod workers;
 pub use discovery::{discover_devices, list_network_interfaces};
 use discovery::{filter_devices_for_local_ip, local_device_name, selected_or_active_local_ip};
-use domain::{clear_member_cache, reconcile_member_state};
+use domain::clear_member_cache;
 use domain::{collect_peer_targets, remember_active_local_ip};
 use flow::{enqueue_inbound_item, enqueue_outbound_item, should_skip_remote_item};
 pub use item::{build_item, new_device_id};
@@ -35,7 +35,9 @@ use crypto::discovery_domain_id;
 use lifecycle::run_sync_loop;
 pub use logs::RuntimeLog;
 use logs::{clear_runtime_log_file, push_log, LOG_LIMIT};
-use members::{prune_stale_discovered_devices, replace_discovered_devices};
+use members::{
+    prune_stale_discovered_devices, refresh_discovered_devices, replace_discovered_devices,
+};
 use presence::run_presence_loop;
 use sender::shutdown_outbound_connections;
 pub use state::{DiscoveredDevice, NetworkInterfaceOption, RuntimeStatus};
@@ -176,10 +178,15 @@ impl SyncEngine {
         &self,
         selected_local_ip: Option<&str>,
         devices: Vec<DiscoveredDevice>,
-        settings: &Settings,
     ) {
         replace_discovered_devices(&self.inner, selected_local_ip, devices);
-        reconcile_member_state(&self.inner, settings);
+    }
+
+    /// Applies a routine discovery observation without treating omitted peers
+    /// as an authoritative membership removal. Explicit settings/domain resets
+    /// must continue to use [`Self::replace_discovered_devices`].
+    pub fn refresh_discovered_devices(&self, devices: Vec<DiscoveredDevice>) {
+        refresh_discovered_devices(&self.inner, devices);
     }
 
     pub fn start(&self, settings: Settings, device_id: String) -> anyhow::Result<()> {
@@ -367,5 +374,110 @@ impl PresenceService {
 impl Drop for PresenceService {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ClipboardItem, ClipboardPayload};
+    use uuid::Uuid;
+
+    fn device(index: u128, address: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            device_id: Uuid::from_u128(index).hyphenated().to_string(),
+            device_name: format!("peer-{index}"),
+            addr: address.to_string(),
+            port: 32910,
+        }
+    }
+
+    fn text_item() -> ClipboardItem {
+        ClipboardItem {
+            id: "item-1".to_string(),
+            content_hash: "hash-1".to_string(),
+            created_at_us: 1,
+            source_device_id: "source-device".to_string(),
+            size_bytes: 4,
+            payload: ClipboardPayload::Text {
+                text: "text".to_string(),
+            },
+        }
+    }
+
+    fn transfer(id: &str, direction: &str, status: &str) -> TransferProgress {
+        TransferProgress {
+            id: id.to_string(),
+            direction: direction.to_string(),
+            peer: "192.168.1.2:32910".to_string(),
+            item_kind: "text".to_string(),
+            item_label: "text".to_string(),
+            item_summary: "text".to_string(),
+            item_id: "item-1".to_string(),
+            transferred_bytes: 0,
+            total_bytes: 4,
+            percent: 0,
+            status: status.to_string(),
+            updated_at_ms: metrics::now_ms(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn routine_discovery_refresh_preserves_members_and_active_transfer_state() {
+        let engine = SyncEngine::default();
+        let first_peer = device(1, "192.168.1.2");
+        let partial_scan_peer = device(2, "192.168.1.3");
+
+        engine.refresh_discovered_devices(vec![first_peer.clone()]);
+        engine
+            .inner
+            .outbound_queue
+            .lock()
+            .unwrap()
+            .push_back(queue::new_queue_entry(text_item()));
+        engine.inner.transfers.lock().unwrap().extend([
+            transfer("send:peer:item-1", "send", "sending"),
+            transfer("recv:peer:item-1", "receive", "receiving"),
+        ]);
+
+        engine.refresh_discovered_devices(Vec::new());
+        engine.refresh_discovered_devices(vec![partial_scan_peer.clone()]);
+
+        let devices = engine.devices(None);
+        assert!(devices
+            .iter()
+            .any(|device| device.device_id == first_peer.device_id));
+        assert!(devices
+            .iter()
+            .any(|device| device.device_id == partial_scan_peer.device_id));
+        assert_eq!(engine.inner.outbound_queue.lock().unwrap().len(), 1);
+
+        let transfers = engine.transfers();
+        assert_eq!(
+            transfers
+                .iter()
+                .find(|entry| entry.id == "send:peer:item-1")
+                .map(|entry| entry.status.as_str()),
+            Some("sending")
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .find(|entry| entry.id == "recv:peer:item-1")
+                .map(|entry| entry.status.as_str()),
+            Some("receiving")
+        );
+    }
+
+    #[test]
+    fn explicit_member_replacement_remains_authoritative_for_domain_resets() {
+        let engine = SyncEngine::default();
+        let peer = device(3, "192.168.1.4");
+
+        engine.refresh_discovered_devices(vec![peer]);
+        engine.replace_discovered_devices(None, Vec::new());
+
+        assert!(engine.devices(None).is_empty());
     }
 }

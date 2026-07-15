@@ -6,55 +6,10 @@ use super::discovery::{
 use super::logs::push_log;
 use super::marker::{compare_markers, item_marker};
 use super::members::prune_stale_discovered_devices;
-use super::metrics::now_ms;
 use super::socket::is_self_socket_addr;
 use super::{RuntimeInner, Settings};
 use crate::protocol::ClipboardPayload;
-use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-
-pub(super) fn reconcile_member_state(runtime: &RuntimeInner, settings: &Settings) {
-    let visible_peers = collect_peer_targets(runtime, settings);
-    let visible_peer_ips = visible_peers
-        .iter()
-        .filter_map(|peer| peer.parse::<SocketAddr>().ok())
-        .map(|socket_addr| socket_addr.ip().to_string())
-        .collect::<HashSet<_>>();
-
-    if visible_peers.is_empty() {
-        if let Ok(mut guard) = runtime.outbound_queue.lock() {
-            guard.clear();
-        }
-        if let Ok(mut guard) = runtime.transfers.lock() {
-            for entry in guard.iter_mut() {
-                if matches!(entry.direction.as_str(), "send")
-                    && matches!(entry.status.as_str(), "sending" | "retrying")
-                {
-                    entry.status = "failed".to_string();
-                    entry.error = Some("共享域只剩本机，已停止发送".to_string());
-                    entry.updated_at_ms = now_ms();
-                }
-            }
-        }
-        return;
-    }
-
-    if let Ok(mut guard) = runtime.transfers.lock() {
-        for entry in guard.iter_mut() {
-            if entry.direction != "receive" || entry.status != "receiving" {
-                continue;
-            }
-            let Some(socket_addr) = entry.peer.parse::<SocketAddr>().ok() else {
-                continue;
-            };
-            if !visible_peer_ips.contains(&socket_addr.ip().to_string()) {
-                entry.status = "failed".to_string();
-                entry.error = Some("发送方已离线，已停止接收".to_string());
-                entry.updated_at_ms = now_ms();
-            }
-        }
-    }
-}
 
 pub(super) fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) -> Vec<String> {
     prune_stale_discovered_devices(runtime);

@@ -105,15 +105,11 @@ fn configure_runtime(
     }
 }
 
-fn restore_discovery_cache(
-    state: &AppState,
-    settings: &Settings,
-    cached_devices: Option<&[DiscoveredDevice]>,
-) {
+fn restore_discovery_cache(state: &AppState, cached_devices: Option<&[DiscoveredDevice]>) {
     if let Some(devices) = cached_devices {
         state
             .sync_engine
-            .replace_discovered_devices(None, devices.to_vec(), settings);
+            .replace_discovered_devices(None, devices.to_vec());
     }
 }
 
@@ -284,7 +280,7 @@ fn set_settings_blocking(
         }
         if let Err(error) = configure_runtime(state, &next, true) {
             let rollback = configure_runtime(state, &previous, was_running);
-            restore_discovery_cache(state, &previous, cached_devices.as_deref());
+            restore_discovery_cache(state, cached_devices.as_deref());
             return Err(transaction_error("apply runtime settings", error, rollback));
         }
     }
@@ -296,7 +292,7 @@ fn set_settings_blocking(
             } else {
                 Ok(())
             };
-            restore_discovery_cache(state, &previous, cached_devices.as_deref());
+            restore_discovery_cache(state, cached_devices.as_deref());
             return Err(transaction_error(
                 "persist settings",
                 error.to_string(),
@@ -316,9 +312,9 @@ fn set_settings_blocking(
     if discovery_changed {
         state
             .sync_engine
-            .replace_discovered_devices(None, Vec::new(), &next);
+            .replace_discovered_devices(None, Vec::new());
     } else {
-        restore_discovery_cache(state, &next, cached_devices.as_deref());
+        restore_discovery_cache(state, cached_devices.as_deref());
     }
     Ok(())
 }
@@ -387,11 +383,7 @@ pub async fn discover_devices(
                 .lock()
                 .map_err(|_| "settings update lock poisoned".to_string())?;
             ensure_current_revision(&state.settings_revision, settings_revision)?;
-            state.sync_engine.replace_discovered_devices(
-                selected_local_ip.as_deref(),
-                devices,
-                &settings,
-            );
+            state.sync_engine.refresh_discovered_devices(devices);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(MANUAL_DISCOVERY_SETTLE_MS));

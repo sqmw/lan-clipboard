@@ -39,6 +39,7 @@
 - UI 手动刷新可以使用未保存的网络选择做预览，但配对密钥始终使用已保存设置；实际运行状态只反映已保存设置。
 - discovery 使用 busy-fast singleflight；已有扫描时立即返回进行中，不向 blocking 线程池排队；旧 generation/revision 结果不能覆盖新设置。
 - 主动扫描失败后仍可显示同一 generation 的后台缓存，不会每 `1.8s` 无限重扫。
+- 后台和手动 mDNS 结果只合并发现观测；空/局部扫描不会把 TTL `30s` 内的 UDP 或 mDNS 成员误显示为“只剩本机”。只有显式变更共享域/网络配置才清空成员缓存。
 - 候选字段、数量、探测并发和 UDP 每轮处理时间都有硬限制。
 
 ## 可靠性
@@ -47,6 +48,7 @@
 - inbound apply、priority outbound、bulk outbound 分 worker 运行。
 - 新任务优先旧重试；文本/富文本优先图片，图片优先文件。
 - peer 广播最多 8 并发，只重试失败 peer，不重复发送给已成功 peer。
+- 暂时没有可用 peer 时，待发送项保留并按有界退避等待发现；成员发现的空快照不会取消已建立的接收传输。
 - incoming/outbound socket 都可在 stop 时主动 shutdown，避免设置保存或退出卡在长写超时。
 - 入站总连接 16、单 IP 4、同时文件接收 2。
 - 文件校验总字节数、chunk 数、完整 SHA-256 和 tar 路径/条目限制。
@@ -83,6 +85,7 @@
 | 主循环 | 活跃约 `15ms`，空闲约 `80ms` |
 | UDP announcement | `500ms` |
 | 后台 mDNS refresh | `3000ms` |
+| 成员发现 TTL | `30000ms` |
 | 前端状态/成员刷新 | `1800ms` |
 | 传输进度刷新 | `500ms` |
 | 握手读写超时 | `2s` |
