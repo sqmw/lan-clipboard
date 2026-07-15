@@ -2,8 +2,10 @@
 
 ## 启动
 
-- 安装依赖：`pnpm install`
-- 启动开发版：`pnpm tauri dev`
+- 项目开发命令统一从根目录 `Makefile` 进入；运行 `make` 或 `make help` 可查看全部目标
+- 安装依赖：`make install`（等价命令：`pnpm install`）
+- 启动 Tauri 开发版：`make dev`（等价命令：`pnpm tauri dev`）
+- 仅启动 Vite 前端：`make dev-web`（等价命令：`pnpm dev`）
 - Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
 - 若代码是从 macOS 手动同步到 Windows，必须避免把 `._*` 资源副文件带过去；这类文件会污染 `src-tauri/capabilities/` 并导致 `tauri build` 在 Windows 上报 `stream did not contain valid UTF-8`
 - Windows 安装版若要保证“启动直接进后台”，不要让 `tauri.conf.json` 在启动阶段预创建主窗口；当前实现是启动时仅创建托盘，主界面由 Rust 侧手动按需创建
@@ -30,7 +32,8 @@
 
 ## 打包发行
 
-- 打包命令：`pnpm tauri build`
+- 完整 Tauri 打包：`make build`（等价命令：`pnpm tauri build`）
+- 仅构建前端：`make build-web`（等价命令：`pnpm build`）
 - 发行配置入口：`src-tauri/tauri.conf.json`
   - `productName`：应用名
   - `version`：发行版本号
@@ -49,6 +52,12 @@
 - 当前能力边界：`docs/status.md`
 - 当前架构：`docs/architecture.md`
 - 当前协议与调度：`docs/protocol.md`
+
+## 自动检查
+
+- `make check`：覆盖 TypeScript 类型检查与 Rust `cargo check`；等价命令为 `pnpm exec tsc --noEmit` 和 `cargo check --manifest-path src-tauri/Cargo.toml`
+- `make test`：执行现有 Rust 测试套件，等价命令为 `cargo test --manifest-path src-tauri/Cargo.toml`；项目当前没有独立的前端测试脚本
+- Windows 环境如未安装 `make`，可使用上文列出的 `pnpm` / `cargo` 等价命令；`Makefile` 只负责统一入口和轻量编排
 
 ## 最小回归清单
 
