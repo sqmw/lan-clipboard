@@ -24,7 +24,7 @@ This folder focuses on two things:
 
 ### Security & environment
 
-- `docs/security.md`: shared code and encryption strategy
+- `docs/security.md`: pairing key, threat model, and authenticated encryption
 - `docs/syncthing.md`: Syncthing mapping facts for macOS ↔ Windows in this environment
 
 ## Doc Responsibilities
@@ -33,7 +33,7 @@ This folder focuses on two things:
 - `docs/architecture.md`: how modules/threads are split; control-plane vs data-plane
 - `docs/protocol.md`: formats, scheduling and transfer rules
 - `docs/dev.md`: how to run and debug; actionable steps only
-- `docs/todo.md`: milestone/TODO index only
+- `docs/todo.md`: milestone/TODO entry plus a searchable Done index
 
 ## Practical Suggestions
 

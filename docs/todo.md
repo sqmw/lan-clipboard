@@ -1,5 +1,35 @@
 # TODO
 
+## 当前主线：M5 后续防御纵深与发布验证
+
+M5 的 P0/P1 安全收敛已于 `2026-07-15` 完成，最终独立 review 未发现未修复的 P0/P1。当前代码可进入候选验证，但 `2.0.0/v4` 尚未形成正式发布包，也未完成真实双端剪贴板互操作矩阵。
+
+活跃任务：
+
+- [ ] P2：从群组 PSK 迁移到逐设备身份、成员撤销与前向保密；这会改变成员模型和配对流程，落地前需先做架构决策。
+- [ ] P2：为 inbound/outbound queue 增加独立容量常量；当前依赖 latest-marker、连接数和 worker 数形成实际边界。
+- [ ] P2：区分活动传输注册表与 24 条 UI 历史，避免极端并发时旧活动卡片被截断。
+- [ ] P2：定义 NFC/NFD 与完整平台 case-fold 的文件名碰撞策略；迁移前需说明重命名/拒绝语义。
+- [ ] P2：profile `16MiB` TCP buffer 与 16 条入站连接的内存峰值，再决定是否降低缓冲，避免无数据支持的吞吐回归。
+- [ ] P2：在用户停止当前 Windows Tauri/Node/pnpm 进程后，把损坏的可再生 `node_modules` 无损移出同步目录并重跑 `pnpm install --frozen-lockfile && pnpm build`；本轮未擅自结束进程或清理状态。
+- [ ] P2：真实 macOS ↔ Windows 重新配对，并 smoke Finder/Explorer、Office/浏览器、autostart、mDNS 降级和多网卡源地址。
+- [ ] P3：生成、签名、安装并验证双平台 bundle；当前 CI 只做源码编译/测试与依赖审计。
+- [ ] P3：经用户授权后单独清理 `docs/syncthing.md` 中仍残留的历史连接脚本/示例；该文件与 `.stignore` 是独立用户改动，不纳入本轮提交。
+
+回退边界：`v4` 与 `v3` 不互通。若候选验证失败，只能让同一共享域所有设备整体回到旧应用和 legacy 配置备份，不能单机降级后继续混用。
+
+## Done Log
+
+### M5 安全边界收敛（2026-07-15）
+
+- 结果：线上 DTO 与本机路径分离；固定长度 PSK 握手和每连接 session；控制/raw AEAD 绑定；高熵配对密钥与可见迁移；no-follow 文件访问、受限 tar/staging；连接、帧、文件、发现、日志、成员与去重状态均有硬边界；设置/autostart/discovery 事务和跨平台剪贴板路径收敛。
+- macOS 验证：`pnpm build`、`pnpm audit`、Rust `check/test/clippy --locked --all-targets --all-features`、`pnpm exec tauri info`、`git diff --check`；Rust `91 passed`。
+- Windows 验证：在实际 Windows Syncthing 工作区核对关键 SHA-256 与 macOS 一致；Rust fmt/check/test/严格 Clippy 通过，Windows 条件集 `85 passed`。前端冻结安装被正在使用的旧 `node_modules` 缺文件阻断，未为验证而结束用户进程或清理目录。
+- Review：最终独立认证、路径、资源、设置事务、平台与构建 review 未发现剩余 P0/P1；后续项全部回写本 TODO。
+- 文档：协议、安全、架构、状态、开发与本 TODO 已同步。结构复审统计为 Markdown `12` 个 / 源码 `61` 个（`19.7%`，触发文件数阈值），文档 `1226` 行 / 源码 `15877` 行（`7.7%`）；双语入口、专题职责与唯一主 TODO 没有形成重复任务系统，因此保留当前分层，不做机械删减。
+- 相关提交：`2fe1c65`（Make 入口）、`7a38060`（v4 核心与边界）、`dd6b7a6`（前端设置事务）、`17ae69e`（双平台验证基线）；协议、安全与验证细节由本 Done Log 及专题文档索引。
+- 遗留风险：群组成员冒充/无前向保密、队列防御性容量、活动 UI 历史、Unicode 名称等价、socket 内存峰值与真实应用互操作。
+
 ## 里程碑 M0（可运行的最小闭环）
 
 - [x] 共享码房间模型：同一 `shared_code` 的设备可自动互通
@@ -19,7 +49,7 @@
 
 ## 里程碑 M2（体验与可靠性）
 
-- [ ] 托盘 + 开机自启 + 后台常驻策略
+- [x] 托盘 + 开机自启 + 后台常驻策略
 - [x] 冲突/回环去重（防止 A->B->A 无限回写，事件驱动队列版）
 - [x] 共享域成员缓存：持续心跳识别成员，避免单次扫描空结果导致界面误显示 1
 - [x] 网络断连重试与队列退避：部分送达、剪贴板短时忙碌时自动补重试；共享域只有本机时不保留空转发送任务

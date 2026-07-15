@@ -1,206 +1,147 @@
-# Dev Guide
+# Development Guide
 
-## 启动
+## 入口与边界
 
-- 项目开发命令统一从根目录 `Makefile` 进入；运行 `make` 或 `make help` 可查看全部目标
-- 安装依赖：`make install`（等价命令：`pnpm install`）
-- 启动 Tauri 开发版：`make dev`（等价命令：`pnpm tauri dev`）
-- 仅启动 Vite 前端：`make dev-web`（等价命令：`pnpm dev`）
-- Windows 若 `pnpm tauri dev` 跑不起来，先确认已执行过 `pnpm install`
-- 若代码是从 macOS 手动同步到 Windows，必须避免把 `._*` 资源副文件带过去；这类文件会污染 `src-tauri/capabilities/` 并导致 `tauri build` 在 Windows 上报 `stream did not contain valid UTF-8`
-- Windows 安装版若要保证“启动直接进后台”，不要让 `tauri.conf.json` 在启动阶段预创建主窗口；当前实现是启动时仅创建托盘，主界面由 Rust 侧手动按需创建
-- 当前 `main` 窗口不再放在 `tauri.conf.json` 的 `app.windows` 里；要显示主界面，必须通过 Rust 侧 `WebviewWindowBuilder::new(...)` 手动创建
-- 由于主窗口默认不创建，后台同步初始化必须放在 Rust `setup()` 之后完成，不能再依赖前端 `boot()` 调 `start_sync`
-- Windows 后台启动如果出现“只有打开一次主窗口后才会被 Mac 发现”，优先检查 Rust `setup()` 后的存在广播线程是否已注册成功；当前存在广播会检测线程是否已退出，并在 mDNS 初始化/注册失败时每 `1000ms` 后台重试
-- 当前判断：Windows 启动误显主窗口的根因更接近“配置窗口仍被系统启动链路预创建”，而不是普通前端样式或一次 `hide()` 时机问题
-- Windows 拖动卡顿的当前根因更接近“前端高频空刷新 + `sync_status` 隐式扫描”，不是单纯线程数量不够；当前已把状态读取与设备发现拆开，并降低无变化时的重绘频率
-- 手动刷新成员时，`discover_devices` 当前通过后台阻塞任务执行，避免 `mdns` 扫描阶段把 WebView 交互线程一起拖住
-- 手动刷新成员当前不是只看一轮 `mDNS` 结果；主动发现后会再等待一个很短的收敛窗口，把后台 `UDP` 心跳发现的成员也并入返回值
-- 主动发现返回的 `mDNS` 设备必须先通过短 TCP 连接探测才会写入成员缓存；Windows 上如果对端应用已退出但系统仍返回陈旧 `mDNS` 服务记录，按钮刷新应直接过滤掉该记录
-- Windows 若出现“右键刷新界面后成员数正确，但主界面按钮刷新后成员数仍偏大”，优先检查按钮刷新是否被旧的状态/缓存轮询结果覆盖；当前成员数只由设备列表刷新链路写入，且前端用刷新世代号丢弃过期轮询结果
-- 当前发送层不再把历史 `known_members` 单独当作发送目标；发送是否发生，以当前可见共享域成员为准，避免“界面只剩本机但后台仍向旧 IP 发包”
-- `macOS` 若出现“复制时主窗口被重新拉到前台”，当前优先不再走 `clipboard-master` 系统回调监听，改用后台轮询剪贴板内容作为根因规避方案
-- Windows 安装版若出现“复制文件后进程直接退出”，优先怀疑系统剪贴板回调链路重入或栈异常；当前 Windows 已与 macOS 一样使用后台轮询监听，避开 `clipboard-master` 回调路径
-- 当前设备发现结果会回写运行态成员缓存；如果最新发现确认共享域只剩本机，会清空待发送队列，并把活跃发送/失联接收标记为失败以尽快停止
-- `macOS` 轮询监听引入后，当前已把“相同内容连续轮询命中”视为同一次本地观察，避免同一个文件/文本被重复排队并在前端堆出多张 `superseded` 失败卡片
-- 远端写回抑制当前收敛为三层：共享域当前槽位指纹、发送中指纹、以及“刚写回到本机”的短时内容忽略表；文件/目录还会额外对内部接收目录做最前置硬拦截
-- 发送入口会拦截两类重复内容：一是已成为共享域当前槽位的内容指纹，二是已经在发送中的内容指纹；这条规则优先于排队和传输
-- 文件/目录写回到系统剪贴板时会使用系统临时目录下的 `lan-clipboard/<item-id>/`；监听到该内部目录下的文件列表时必须直接丢弃，避免接收端把自己刚写入的远端文件再次广播
-- Windows 的内部目录识别当前按大小写不敏感路径匹配处理，避免系统返回的驱动器大小写或分隔符差异导致误放行
-- 文件/目录判重指纹当前使用相对路径、条目类型、文件大小和部分文件内容采样哈希；这样比只看名称/大小更稳，又不会为了判重完整读取整个大文件
-- `macOS` 轮询监听启动时会先读取一次当前系统剪贴板作为基线，不会把应用启动前就存在的内容当成新的本地复制事件
+- 当前能力与已知限制：`docs/status.md`
+- 线协议、队列与测试参数：`docs/protocol.md`
+- 威胁模型、资源上限与迁移：`docs/security.md`
+- 模块所有权：`docs/architecture.md`
+- 唯一任务主记录：`docs/todo.md`
 
-## 打包发行
+运行数据不得写入仓库或同步工作区。settings 使用 Tauri 的用户级配置目录；staging 与 runtime log 使用运行时发现的用户级应用缓存目录。
 
-- 完整 Tauri 打包：`make build`（等价命令：`pnpm tauri build`）
-- 仅构建前端：`make build-web`（等价命令：`pnpm build`）
-- 发行配置入口：`src-tauri/tauri.conf.json`
-  - `productName`：应用名
-  - `version`：发行版本号
-  - `identifier`：应用标识（macOS bundle id / Windows 标识）
-  - `bundle.icon`：打包图标
-  - `build.beforeBuildCommand` / `build.frontendDist`：前端构建与产物目录
+## 工具链
 
-建议对齐：
+仓库通过 `mise.toml` 声明基线：
 
-- `src-tauri/tauri.conf.json` 的 `version`
-- `src-tauri/Cargo.toml` 的 `version`
-- `package.json` 的 `version`
+| 工具 | 版本 |
+| --- | ---: |
+| Node.js | `24.6.0` |
+| pnpm | `11.5.0` |
+| Rust | `1.93.0` |
 
-## 开发前先看
+推荐先执行：
 
-- 当前能力边界：`docs/status.md`
-- 当前架构：`docs/architecture.md`
-- 当前协议与调度：`docs/protocol.md`
+```sh
+mise install
+mise exec -- make install
+```
 
-## 自动检查
+没有 `mise` 时也可使用等价版本直接运行 `make` / `pnpm` / `cargo`，但提交前必须记录与基线的差异。
 
-- `make check`：覆盖 TypeScript 类型检查与 Rust `cargo check`；等价命令为 `pnpm exec tsc --noEmit` 和 `cargo check --manifest-path src-tauri/Cargo.toml`
-- `make test`：执行现有 Rust 测试套件，等价命令为 `cargo test --manifest-path src-tauri/Cargo.toml`；项目当前没有独立的前端测试脚本
-- Windows 环境如未安装 `make`，可使用上文列出的 `pnpm` / `cargo` 等价命令；`Makefile` 只负责统一入口和轻量编排
+## Make 入口
 
-## 最小回归清单
+`make` 或 `make help` 显示全部目标。
 
-### 启动与配置
+| 命令 | 作用 |
+| --- | --- |
+| `make install` | 严格按 `pnpm-lock.yaml` 安装前端与 Tauri CLI 依赖 |
+| `make dev` | 启动 Tauri 开发应用 |
+| `make dev-web` | 只启动 Vite 前端 |
+| `make build-web` | TypeScript 检查并构建前端 |
+| `make build` | 使用锁文件构建正式 Tauri bundle（Cargo runner 传入 `--locked`） |
+| `make check` | 前端构建、Rust fmt check、全 target/feature 严格 Clippy |
+| `make test` | 以 `--locked --all-targets --all-features` 运行 Rust 测试 |
+| `make audit-web` | 通过 npm 官方 registry 审计依赖 |
+| `make verify` | 顺序执行 check、test、前端依赖审计 |
 
-- macOS / Windows 都能启动
-- 同一端只保留一个实例
-- 启动后默认后台运行，不主动显示主窗口
-- 关闭主窗口后不会退出，只会隐藏到菜单栏 / 系统托盘
-- 修改共享码、网络、大小限制后，点击“保存配置”能生效并持久化
-- 多网卡时可手动选择正确局域网 IP
-- 可在设置里切换 UI 语言（中文 / English），保存后作为默认语言
-- 可在设置里切换“开机启动”，并在下次启动后保持一致
+Windows 没有 `make` 时使用等价命令：
 
-### 共享域与成员
+```powershell
+pnpm build
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features
+cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --all-features -- -D warnings
+pnpm audit --registry=https://registry.npmjs.org --audit-level moderate
+```
 
-- 相同 `shared_code` 的设备能进入同一共享域
-- 成员列表默认显示本机，展开后能看到其他在线设备
-- “刷新”会立即按当前下拉框选中的网络补充扫描；这里不要求先点“保存配置”
-- 切换“使用网络”下拉框后，会自动触发一次轻量刷新，减少手动再点一次“刷新”
-- 未保存的网络切换不会再被状态轮询自动改回；下拉框会保持当前草稿选择，直到你再次切换或保存配置
-- 日常成员状态主要由后台缓存持续维护，缓存展示也会按当前选择网络过滤
+CI 在标准 `macos-15` arm64 与 `windows-2025` x64 runner 上执行同一组检查，并使用 `cargo-deny` 对 `src-tauri/Cargo.lock` 执行 RustSec advisories 检查；第三方 actions 固定到已核对的 peeled commit，并在行尾保留版本标签索引。Rust 审计不混入本地默认 `make verify`，避免未安装审计工具时把编译验证误判为失败；需要本地复现时先安装与 CI 对齐的 `cargo-deny`，再运行 `cargo deny --manifest-path src-tauri/Cargo.toml check advisories`。
 
-### 内容同步
+## 开发运行约定
 
-- 文本可双向同步
-- 图片可双向同步
-- 文件/目录可双向同步，并在对端保持为可粘贴文件列表
-- `HTML / RTF` 优先于纯文本参与同步
+- 后端在 Tauri `setup()` 中加载配置并启动同步，不依赖窗口或前端 IPC。
+- 启动时只创建托盘/菜单栏；主窗口按需创建，关闭窗口只隐藏。
+- macOS 与 Windows 都使用 clipboard change token + 后台轮询；生产轮询从 `50ms` 活跃值退避到 `500ms` 空闲值。
+- `sync_status` 只读取状态；手动发现走 `discover_devices`，缓存读取走 `cached_devices`。
+- 保存只提交最小 `SettingsUpdate`；device UUID、端口、轮询字段和加密不由前端覆盖。
 
-### 可靠性
+显式选择的本机 IP 若格式错误或已不属于本机，运行时启动会失败并显示错误，不会静默改绑 `0.0.0.0`。自动网络模式才允许系统选择可用接口。
 
-- 远端写回后不会触发 A→B→A 回环
-- 部分送达、剪贴板被占用时会自动补重试
-- 若共享域当前只有本机，本地复制事件会直接丢弃，不再挂成“等待成员发现”的发送任务
-- 文件发送过程中若出现新的文本/图片任务，高优先级任务不会被长期饿死
-- 文件接收过程中若发送方中途下线，未完成文件流会被直接丢弃并标记失败
+## v4 配对与迁移
 
-## 当前实现要点
+- 应用 `2.0.0` 使用 TCP 协议 `v4`，不兼容 `v3`，也没有明文或旧协议 fallback。
+- 同一共享域的所有设备必须一起升级，并使用同一个应用生成的 26 位配对密钥。
+- 旧 6 位配置会精确备份为 `settings.legacy-v3*.json`，再生成新密钥。
+- 损坏或不安全配置会精确备份为 `settings.invalid-v4*.json`，再恢复安全默认值。
+- 备份用于取证与整体回退，不应复制回只升级了部分设备的混合环境。
 
-- 剪贴板变化当前在 macOS / Windows 都采用后台指纹轮询监听；`50ms` 轮询只负责发现“是否变成了新内容”，不再使用旧版“定时把当前剪贴板内容广播出去”的同步模型
-- 剪贴板观察、presence 注册和队列 worker 调度已经从 `net/lifecycle.rs` 拆到 `net/watch.rs`、`net/presence.rs`、`net/workers.rs`；后续改 worker 细节时不要回填到生命周期主循环
-- 前端样式已按 `src/styles/` 子模块拆分；新增界面样式时优先放入对应子模块，不要继续把所有规则堆回 `src/styles.css`
-- 发送队列调度规则：`新任务 > 旧重试`，`文本/富文本 > 图片 > 文件`
-- 网络层已拆成主调度循环、入站连接 worker、接收写回 worker、发送 worker
-- 文件发送端会边生成 `tar` bundle 边写入网络分帧；多 peer 广播会分别走各自的流式发送路径
-- 文件发送端源文件读取使用 `1MB` 归档读取缓冲；如果大文件 `profile file_send stream_ms` 仍偏高，下一步要继续拆分“文件读取 / tar 写入 / socket 阻塞”等子阶段
-- 发送/接收进度会展示类型、大小、方向和失败信息
-- 高级加密开关已改为 switch 形式，但行为仍然只是控制 `encryption_enabled`
-- 当前传输链路还没有把局域网带宽稳定吃满；如果回归目标包含高吞吐大文件传输，需要把“速度未拉满带宽”当成已知限制，而不是回归失败
-- `pnpm tauri dev` 使用 Rust debug profile；当前已对加密和 `bincode` 相关依赖启用局部 `opt-level=3`，否则大文件加密传输会被 debug 构建明显拖慢
-- 大文件体加密走 `ChaCha20-Poly1305`，控制帧仍走 `AES-GCM-SIV`；调试吞吐时需要确保双端都重新编译到同一线协议版本
-- 文件接收端当前会边收边解包到内部目录，不再先落完整临时 archive；如果大文件吞吐仍偏低，下一步优先检查多连接分片、加密数据面和系统剪贴板写回
+## 可调参数与快速测试
 
-## 调试入口
+用户可调的 `max_item_bytes` 默认 `256KiB`，范围 `1 byte..=1000MiB`。UI 以 MiB 展示，但提交与回读必须保持精确 byte 值。
 
-### 运行日志
+快速回归建议：
 
-- 应用内可查看最近日志
-- 运行日志会落盘到系统临时目录下的 `lan-clipboard/runtime.log`
+| 场景 | 测试值 | 预期 |
+| --- | ---: | --- |
+| byte 往返下界 | `1 B` | 保存后仍为 `1 B` |
+| 默认值 | `256 KiB` | 无关设置保存不放大到 `1 MiB` |
+| 边界前一位 | `1 MiB - 1 B` | 精确回读 |
+| 普通文件 | `1 MiB` | 小文件流成功 |
+| 用户上限 | `1000 MiB` | 配置可保存；无需在单测生成同体积 fixture |
+| 超限 | 当前上限 `+1 B` | 本地保留、不广播、显示错误 |
 
-### 重点日志关键字
+生产时间与并发值保留在代码常量中；测试通过 loopback、小 payload、直接 codec 和内部可注入期限覆盖状态转换，不修改生产值。关键生产值包括：握手绝对总期限/连接超时 `2s`、帧 idle `30s` 与按大小计算的 `8s..120s` 总期限、文件接收 idle `30s` 与 `31s..30min` 总期限、UDP `500ms`、后台发现 `3s`、后台/手动单次发现预算 `900/2200ms`、发送 peer 并发 `8`、入站连接 `16`/单 IP `4`、同时文件接收 `2`。
 
-- `profile local_clipboard ... read_snapshot_ms=... build_item_ms=... total_ms=...`
-  - 本机识别剪贴板和生成内容指纹耗时；文件场景下 `build_item_ms` 可反映文件指纹采样成本
+快速 timeout 回归使用 `ReadDeadline`、`FileReceiveTimeouts` 或 loopback trickle fixture 注入毫秒级测试值；切回生产不需要配置迁移，因为生产值仍由常量计算。回归至少覆盖：握手/帧 trickle 不延长绝对期限、小文件预算为 `31s`、超大声明被封顶为 `30min`。
 
-- `profile file_send ... connect_ms=... start_frame_ms=... stream_ms=... throughput_mib_s=...`
-  - 发送端大文件链路耗时；`stream_ms` 包含边打包、加密和 TCP 写入，适合先判断发送侧真实吞吐
-  - 若 `local_clipboard` 很快、`clipboard_apply` 也很快，但发送和接收吞吐都低，优先怀疑发送端 `tar` 打包读取或 socket 写入阻塞，而不是 UI 或剪贴板写回
+## 最小自动验证
 
-- `streamed file archive ... frame_count=... write_frame_ms=... write_frame_max_ms=...`
-  - 发送端文件流内部耗时；`write_frame_ms` 接近总耗时时，瓶颈更可能是 TCP 写入/接收端反压，否则优先看文件读取与 `tar` 打包
+macOS 或 Linux 开发机：
 
-- `profile file_recv ... stream_ms=... throughput_mib_s=...`
-  - 接收端收包与流式解包耗时；可与发送端 `throughput_mib_s` 对照判断瓶颈在发送侧还是接收侧
+```sh
+make verify
+pnpm exec tauri info
+git diff --check
+```
 
-- `profile clipboard_apply ... apply_ms=...`
-  - 接收端写入系统剪贴板耗时；如果网络速度正常但粘贴很晚，优先看这一项
+Windows 必须在实际 Windows 工作区再跑等价验证；本机缺少 Windows Rust target 标准库时，不能把失败的交叉检查记为 Windows 已通过。双端目录由 Syncthing 管理时，先等待同步收敛再验证，不手工复制仓库，也不把 `target/`、`node_modules/`、日志、配置或 staging 纳入同步。
 
-- `outbound item ... pending peers`
-  - 当前复制事件正在等待成员发现或补重试
+## 人工回归矩阵
 
-- `drop outbound item ... because shared domain only contains self`
-  - 当前共享域只有本机；本次本地复制事件已被直接丢弃，不会再反复重试
+自动测试不会改写用户剪贴板。发布前在隔离的测试剪贴板环境完成：
 
-- `apply retry queued`
-  - 接收端系统剪贴板暂时忙，已进入自动重试
+1. 同版本 macOS ↔ Windows 重新配对，错误密钥连接必须在握手阶段失败。
+2. 双向复制纯文本、PNG、HTML、RTF；rich target 与纯文本 target 都能粘贴。
+3. 双向复制小文件、目录、空目录；名称与层级保持，symlink/reparse point 明确拒绝。
+4. 传输中停止同步或修改网络；worker 有限退出，未完成 staging 被删除。
+5. 多 peer 中一台失败时，只重试失败 peer，成功 peer 不重复收到。
+6. 显式选择失效 IP 时保存/启动失败且旧运行配置恢复。
 
-- `write peer failed ... timeout_ms=...`
-  - 发送端 TCP 写入未完成；优先检查网络、防火墙、内容大小
+## 日志与定位
 
-- `discard incomplete inbound file ...`
-  - 接收文件时发送方中途断链；当前实现会直接丢弃半包
+- UI 的“高级 / 日志”读取内存日志并支持清空。
+- 文件日志位于运行时发现的 per-user app cache `runtime` 子目录，单文件最大 `2MiB` 并保留一份轮转；不要在文档或脚本中写死绝对路径。
+- 单条日志最多 `8KiB`，配对密钥、派生密钥、nonce 和完整剪贴板正文不得写日志。
 
-- `detected local clipboard kind=...`
-  - 本机已检测到一次剪贴板事件；可用来判断源应用到底提供了什么格式
+常用关键字：
 
-- `received item ...` 但没有 `applied item ...`
-  - 网络已经到达，问题更可能在接收端写剪贴板
+- `profile local_clipboard`：读取、建模与指纹耗时。
+- `profile file_send` / `profile file_recv`：文件数据面耗时与吞吐。
+- `profile clipboard_apply`：写回系统剪贴板耗时。
+- `peer handshake failed`：版本、密钥或认证不匹配。
+- `discard incomplete inbound file`：断链、停止或完整性失败后的丢弃。
+- `write peer failed`：连接或写超时。
 
-## 常见问题
+调试高负载或大文件时，先使用小 fixture 验证控制流，再逐级增大；正式启动与长时间压测由用户确认后执行。
 
-### 显示“已停止”
+## 发行一致性
 
-- 优先看是否端口被旧实例占用
-- 开发态先结束旧的 `pnpm tauri dev` 或旧 App 进程
+发布前必须保持以下版本一致：
 
-### 复制无反应
+- `package.json`
+- `src-tauri/Cargo.toml`
+- `src-tauri/tauri.conf.json`
+- `src-tauri/Cargo.lock` 中本包条目
 
-- 先确认双方共享码一致
-- 再确认双方都已启动应用
-- 再确认防火墙已放行 TCP `32910` 与 UDP `32911`
-
-### 成员扫描不到
-
-- 优先确认局域网、组播 / 广播和防火墙
-- 多网卡环境确认“使用网络”选择的是实际局域网 IP
-- 当前刷新过滤按 IPv4 `/24` 视角执行；如果两台机器不在同一前三段子网，界面会主动视为不同网络
-- 当前版本已移除手动兜底地址；如果自动发现失败，需要先修复网络发现链路本身
-
-### 图片不同步
-
-- 先看日志里是否出现 `detected local clipboard kind=image_png`
-- 如果没有，说明源应用可能没有提供当前已覆盖的系统图片格式
-
-### 文件只同步成名字或路径文本
-
-- 说明这次复制没有被系统识别成文件列表
-- 优先确认是从 Finder / Explorer 文件面板直接复制，而不是复制路径文本
-
-### 富文本退化成纯文本
-
-- 先确认源应用确实写入了 `HTML` 或 `RTF`
-- 某些应用只暴露私有格式时，当前版本会回退成纯文本
-- Windows 源应用如果走 `CF_HTML`，当前应直接传输 `StartHTML/EndHTML` 指向的真实 `HTML` 正文；如果目标端还能看到 `Version:...StartHTML...` 头，说明 `CF_HTML` 规范化链路回归了
-
-## 建议联调顺序
-
-1. 先测文本
-2. 再测图片
-3. 再测小文件
-4. 最后测大文件与断链场景
-
-## 资源
-
-- App 图标源文件：`docs/image/lan-clipboard-logo.svg`
+正式产物、升级说明、回退方法、双平台验证与人工 smoke 结果必须进入发布记录；本轮代码验证通过不等于已经发布。

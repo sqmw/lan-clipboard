@@ -45,25 +45,27 @@
 
 ## ✨ Features
 
-- **Shared-domain model**: devices with the same 6-digit shared code on the same LAN join one domain automatically
+- **Shared-domain model**: devices with the same high-entropy 26-character pairing key on the same LAN join one domain automatically
 - **Shared-domain debounce**: the same content is allowed only one effective send in the domain; duplicates are dropped both while the first send is still in flight and after it has already synced successfully
-- **Auto discovery**: `mDNS + UDP heartbeat` maintain a live member cache; click “Refresh” for an instant scan
+- **Auto discovery**: `mDNS + UDP heartbeat` maintain a bounded candidate cache; trust starts only after the fixed-size TCP handshake
 - **Event-driven sync**: clipboard changes are queued and pushed to peers via TCP binary frames
 - **Common payloads**: plain text / PNG image / files & folders / basic rich text (HTML/RTF)
-- **Encrypted transfer**: toggleable, derived from the shared code by default
+- **Authenticated encryption**: every connection gets independent session keys; control and file frames are always encrypted with no plaintext downgrade
 - **Multi-NIC support**: pick the correct local IP to avoid virtual adapters on Windows
 - **Debug friendly**: transfer progress, type, and previews; logs live under “Advanced / Logs”
 
 ## 🚀 Quick Start (Windows + macOS)
 
 1. Connect both devices to the same LAN and open the app.
-2. Set the same 6-digit shared code on both sides and click “Save”.
+2. Copy the app-generated 26-character pairing key from one device to the other, then click “Save”.
 3. If you have multiple NICs/virtual adapters, pick the correct local IP in “Network”, then save.
 4. Click “Refresh” and confirm the peer shows up in the members list.
 5. Copy text/images/files(or folders)/rich text on one device, then paste on the other.
 
 Additional note:
 If the same file or clipboard content is copied repeatedly in a short burst, the app guarantees only the first effective sync. Later duplicate copies are dropped before send to reduce loop risk and avoid wasting bandwidth.
+
+Upgrading from `1.x / v3` to `2.0.0 / v4` requires upgrading every device and pairing again. The old six-digit-code settings are backed up before migration; old and new protocols do not interoperate and never downgrade to plaintext.
 
 ## 📚 Docs
 
@@ -76,3 +78,4 @@ If the same file or clipboard content is copied repeatedly in a short burst, the
 
 - “Any type” does not mean perfect parity for app-private clipboard formats; we only promise a cross-platform supported set (see `docs/protocol.md`)
 - Throughput is not yet tuned to consistently saturate LAN bandwidth for large files/images; more data-plane optimizations are planned (see “Throughput” in `docs/status.md`)
+- Authentication is scoped to the group holding one pairing key, not per-device certificates. Share that key only with trusted devices (see `docs/security.md`)

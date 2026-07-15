@@ -1,129 +1,174 @@
 # Protocol
 
-## “任何类型”的定义（跨 macOS 与 Windows）
+## 承诺边界
 
-严格意义上的“任意剪贴板格式”在跨 OS 情况下不可保证等价（macOS UTI 与 Windows 原生格式不具备完整可逆映射）。
-
-因此本项目采用“**跨平台支持的格式集合**”作为承诺边界：
+跨 macOS 与 Windows 只承诺以下可移植格式：
 
 - `text/plain`
 - `image/png`
-- 文件列表 / 文件目录打包传输
+- 文件与目录组成的文件列表
 - `text/html`
 - `text/rtf`
 
-对于未知/不支持格式：
-- 规则：按策略 **跳过** 或 **降级**（例如只提取 `text/plain` 作为回退）
-- 必须带日志与 UI 提示（便于用户理解为什么没同步）
+应用私有对象、任意 UTI、任意 Windows clipboard format 和复杂富媒体嵌入不保证跨平台等价。未知格式会跳过或降级到纯文本，并留下可诊断状态。
 
-## 消息模型（M0）
+## 版本与兼容性
 
-`ClipboardItem`：
-- `id`：单次复制事件 ID（UUID）
-- `content_hash`：内容哈希（本地去抖 / 辅助判重）
-- `created_at_us`：时间戳（微秒）
-- `source_device_id`：来源设备
-- `payload`：内容（按类型编码）
-- `size_bytes`：内容大小（用于限额判定）
+- 应用版本：`2.0.0`
+- TCP 线协议：`v4`
+- UDP announcement：`v2`
+- `v4` 是从旧 `v3` 的不兼容升级；没有旧帧 fallback，也没有可关闭的加密路径。
+- 所有设备必须一起升级并使用新的 26 位配对密钥。
 
-`payload` 采用明确的可移植编码：
-- 文本：UTF-8
-- 图片：PNG bytes
-- 文件列表：`tar` 打包后的 bytes + 顶层名称列表
-- HTML/RTF：UTF-8 bytes（必要时附加编码字段）
-- 枚举序列化：使用 `bincode` 兼容的外部枚举表示；不要使用 JSON 内部 tag 表示，否则二进制解码会失败
+## 模型分层
 
-M0 线协议（当前实现）：
-- 传输：`TCP`
-- 控制帧格式：`4 bytes` big-endian 长度前缀 + `bincode(WireMessage)`；不再使用一行 JSON 或 base64 body
-- 文件体帧格式：`4 bytes` big-endian 长度前缀 + `version:u8` + `flags:u8` + raw bytes；加密开启时为 `version:u8` + `flags:u8` + `nonce:12 bytes` + `ChaCha20-Poly1305` encrypted bytes
-- 节点关系：每个节点监听本地端口，并向共享域内自动发现的设备主动推送
-- 本机触发：监听到本机剪贴板变化后，立即生成一条 `ClipboardItem` 放入发送队列
-- 远端触发：收到远端 `ClipboardItem` 后，先进入接收队列，再顺序写入本机剪贴板
-- 并发模型：主循环只负责监听与调度；TCP 入站连接独立线程处理，接收写回和发送分发也各自使用独立 worker
-- 发现信道：
-  - `mDNS` 服务类型 `_lan-clipboard._tcp.local.`
-  - UDP 广播心跳端口 `32911`（默认每 `500ms` 发送一次）
-- 发现筛选：仅接受 `shared_code` 相同的设备
-- 控制帧加密封装：`WireMessage`（raw body bytes + 可选 12 bytes nonce，当前为 `AES-GCM-SIV`）
+本机模型 `ClipboardPayload` 不实现 serde，可包含本机 `PathBuf`：
 
-`WireMessage` 字段：
-- `v`：协议版本（当前 `3`）
-- `encrypted`：是否加密
-- `source_device_id`：发送端设备 ID
-- `nonce`：加密随机数（加密时必填，12 bytes）
-- `body`：`bincode(ClipboardItem)` 明文或密文主体
+- `FileList`：发送端系统剪贴板返回的源路径。
+- `FileBundleDir`：接收端本机生成的 staging 路径。
 
-`ClipboardItem` 关键语义：
-- `id`：单次复制事件 ID，使用 `UUID`
-- `content_hash`：内容哈希，用于本地去抖和辅助判重
-- 对文件/目录内容，不再把本机临时路径或解包后路径纳入判重；当前会按“相对路径结构 + 文件字节内容”计算语义哈希，避免远端写回后又被本机误判成全新复制
-- `created_at_us` + `source_device_id` + `id`：冲突比较顺序；多设备同时复制时按该顺序收敛
-- 前端不直接展示原始时间戳；时间戳只用于协议内部排序、判旧和淘汰旧传输
+线上模型 `WireClipboardPayload` 只包含 UTF-8 字符串或 bytes，文件路径永不进入线上 DTO。文件只在线上传输顶层可移植名称和 tar 字节流。
 
-UDP 心跳字段：
-- `v`：发现协议版本（当前 `1`）
-- `app`：固定为 `lan-clipboard`
-- `device_id`：发送端设备 ID，用于避免自发现和成员去重
-- `device_name`：展示名
-- `shared_code`：共享域筛选字段
-- `tcp_port`：该设备的剪贴板 TCP 监听端口
+`ClipboardItem` 的公共语义：
 
-成员缓存策略：
-- mDNS 与 UDP 心跳都会合并进同一个共享域成员缓存
-- UI 的成员列表读取缓存；“刷新”只做补充扫描，不再把一次空扫描当作远端离线
-- 若 UI 当前显式选择了某个本机网络，刷新扫描结果与缓存展示都会按该 IPv4 所在 `/24` 子网做过滤
-- 远端停止发送发现信号后，成员缓存会在约 `30s` 后过期
+- `id`：非 nil UUID，标识一次复制事件。
+- `source_device_id`：非 nil UUID，必须与本连接认证的 peer 一致。
+- `content_hash`：64 位十六进制内容指纹。
+- `created_at_us`：事件时间；最多允许比接收端当前时间快 `5min`。
+- `size_bytes`：必须等于解码后的实际大小，且不能超过对应硬限制。
+- `payload`：可移植内容。
 
-队列策略：
-- 发送队列：本机每次监听到新的复制事件，就把该事件入队并顺序广播
-- 接收队列：远端事件先入队，再按顺序写入本机剪贴板
-- 传输展示：前端按“真实剪贴板事件”展示发送/接收状态，而不是按底层 TCP / wire frame 拆分展示
-- 发送重试：当前轮若已有远端成员但只送达部分成员，事件会短退避后重新入队
-- 若当前共享域只有本机，发送队列会直接丢弃这条本地事件，不再为“等待未来成员出现”保留重试项
-- 发送目标过滤：发送侧会显式排除 `source_device_id == 本机 device_id` 的成员，以及当前所选本机网络 IP 本身，避免“自己给自己发”
-- 接收重试：系统剪贴板短时被占用时，事件会短退避后重新尝试写入
-- 发送调度：发送端不再简单按 FIFO 出队；统一规则为“新任务优先于旧重试、文本/富文本优先于图片、图片优先于文件、同层内较新的复制事件优先”
-- 发送去重/防抖：若某个 `content_hash` 已经是共享域当前槽位，或同一 `content_hash` 已在发送中，新的本地复制会在发送前直接丢弃；文件的 `content_hash` 由结构信息与部分内容采样共同生成
-- 最新值语义：整个共享域按“单槽位最新值”运行；新的复制事件会更新全域最新标记，并淘汰仍在队列中或仍在传输中的旧事件
-- 回环抑制：远端写入本机剪贴板后，当前以“共享域当前槽位指纹 + 发送中指纹 + 短时 `content_hash` 忽略表”来抑制回写事件；文件场景再叠加内部接收目录路径硬拦截
+## 发现协议
 
-大内容传输策略：
-- 图片的 `size_bytes` 按原始 PNG 字节计算；协议和 TCP 帧都不再额外做 base64 膨胀
-- 文件/目录复制会在发送前打成 `tar` bundle，远端解包到临时目录后再写回系统剪贴板
-- 文件流采用独立 bulk worker 发送；控制帧仍走 `WireBody`，文件体改走约 `16MB` raw payload frame，避免每个大块再封装成 `FileStreamChunk` 结构体
-- raw payload frame 使用专用二进制小头部，不再对每个文件块做 `bincode(WireMessage)` 包装；文件体加密使用 `ChaCha20-Poly1305`，接收端按 `FileStreamRawStart.size_bytes` 把连续文件体帧直接喂给 `tar` reader，再读取 `FileStreamEnd`
-- 文件流在发送和接收过程中都会检查自己是否已被更新内容替代；若判定为旧事件，会尽快中止并丢弃
-- 文件/目录发送端会边生成 `tar` bundle 边写入 raw payload frame；不再先生成完整 outbound-cache 归档文件再二次读取发送
-- 文件/目录接收端会边收边解包到内部目录；不再先保留完整临时 archive，也不再在接收完成后把完整 archive 二次读回内存
-- 若文件流接收过程中发送方断链、下线或连接异常关闭，接收端会直接丢弃该未完成文件流并把这条传输标记为失败，不会继续保留半包状态
-- 若图片超出当前大小限制，发送前会自动等比缩小，直到进入限制范围或无法继续缩小
-- 图片重编码使用快速 PNG 压缩；Windows 源端若剪贴板已有原生 `PNG` bytes，则直接复用，避免无意义重编码
-- TCP 连接超时保持短超时；TCP 写超时按实际 wire payload 大小动态放宽，避免图片还在传输时被固定短超时中断
-- 发送端和接收端统一设置约 `16MB` 的 TCP 收发缓冲，并保留 `nodelay`，用于提升局域网内连续 raw payload frame 传输时的吞吐稳定性
-- 但当前实现仍未承诺“稳定拉满局域网带宽”；特别是文件归档准备、系统剪贴板交互和大内容广播时，吞吐还存在明显继续优化空间
+### mDNS
 
-低延迟参数：
-- 剪贴板监听内部间隔：`50ms`
-- 主同步循环空闲间隔：`10ms`
-- 队列首轮退避：`30ms`
-- 队列最大退避：`500ms`
+- service type：`_lan-clipboard._tcp.local.`
+- instance/device id：规范小写 UUID。
+- TXT：`device_id`、`device_name`、`domain_id`。
+- port：`1024..=65535`。
 
-富文本策略：
-- 当前优先识别 `HTML`，其次识别 `RTF`，最后才回退到纯文本
-- 富文本当前按 UTF-8 字符串载荷同步，适用于常见网页、文档和编辑器复制场景
-- Windows 侧 `CF_HDROP` 文件列表、`PNG` / `CF_DIBV5` / `CF_DIB` / `CF_BITMAP` 图片和 `HTML Format` 走原生剪贴板格式读取；`RTF` 仍保留兼容读取路径
-- Windows 侧图片写入当前会优先同时写入 `PNG` 自定义格式和 `CF_DIB`，避免小图场景下 `CF_BITMAP` 写入不稳定
-- 私有剪贴板格式、应用内自定义对象和复杂富媒体嵌入仍不在当前协议保证范围内
+### UDP
 
-默认密钥策略：
-- 直接使用 `shared_code`
-- 因此“同网段且共享码一致即可加入共享域”的产品语义，与“默认加密仍然存在”的安全语义可以同时成立
+- 端口：`32911`
+- announcement version：`2`
+- 字段：`app`、`device_id`、`device_name`、`domain_id`、`tcp_port`
+- 默认发送间隔：`500ms`
 
-## 大小限制
+`domain_id` 是配对密钥经域分离 SHA-256 后的 16-byte 十六进制摘要，只用于减少无关候选；发现结果不是认证结果。输入会验证 UUID、名称长度/控制字符、端口和可用 IPv4。
 
-设置项（可持久化）：
-- `max_item_bytes`：单条内容上限（默认 256 KiB，统一限制可发送内容大小；UI 以 MB 编辑，当前允许保存 `1-1000 MB`）
+发现资源限制：mDNS 每次最多消费 `256` 个 resolved 事件并保留 `100` 个候选；可达性探测最多 `8` 个线程且最多占 `400ms`，daemon shutdown 最多占 `100ms`；后台扫描总预算 `900ms`，手动扫描总预算 `2200ms`；UDP 每个主循环最多消费 `64` 包或 `3ms`。
 
-判定逻辑：
-- 若超限：本地仍可复制，但 **不对外广播**；记录 reason 与 size，供 UI 展示。
+多网卡推荐只把 RFC1918 地址按 `10/8`、`172.16/12`、`192.168/16` 做候选预筛，不伪造 `/24` 子网掩码。显式选择 IPv4 时，TCP connect/探测绑定该源地址；UDP 仍绑定共享 wildcard 端口接收广播，但在 macOS/Windows 由内核接口索引限制收发，约束失败即禁用 UDP，不静默退回任意接口。
+
+## TCP 会话
+
+连接角色由 TCP 决定：connector 永远是握手 client 和应用 sender，acceptor 永远是握手 server 和应用 receiver。双向同步使用两条独立连接，不按设备名或剪贴板方向猜角色。
+
+任何长度前缀之前先执行固定长度 PSK 握手：
+
+```text
+server -> client  Challenge  (88 bytes)
+client -> server  Response   (88 bytes)
+server -> client  Ack        (56 bytes)
+```
+
+消息头包含 `LCB4` magic、version、kind 和保留位；保留位必须为零。消息体绑定双方 UUID、32-byte 随机 nonce 和 HMAC-SHA256。完整 transcript 经 HKDF-SHA256 派生：
+
+- `session_id[16]`
+- client→server / server→client control key
+- client→server / server→client raw key
+
+生产握手完整 challenge/response/ack 共用一个 `2s` 绝对期限，握手 socket 缓冲约 `16KiB`。认证成功后才切换为按实际 payload 大小计算的 `8s..120s` 帧总期限和较大 socket 缓冲；帧读取另有 `30s` idle 上限，任一更短期限先到即失败。
+
+## 控制帧
+
+```text
+u32_be frame_len
+u8     version = 4
+u8     flags = encrypted
+bytes  session_id[16]
+u64_be control_sequence
+bytes  nonce[12]
+bytes  AES-256-GCM-SIV(ciphertext || tag)
+```
+
+AEAD AAD 是 version/flags/session/sequence 固定头。每条连接的 control sequence 从 `0` 开始，必须严格相等、成功认证与解析后才递增，溢出即关闭连接。
+
+密文内是有上限、拒绝 trailing bytes 的 `bincode(EncodedWireBody)`：
+
+- `ClipboardItem`
+- `FileStreamRawStart`
+- `FileStreamEnd`
+
+文本、图片和富文本的实际 payload 硬上限为 `8MiB`；控制帧只额外允许固定 `256KiB` 协议开销。该限制独立于文件总大小设置，用于避免单帧巨额内存分配。
+
+## 文件流
+
+文件传输顺序：
+
+```text
+control seq 0: FileStreamRawStart
+raw chunks 0..N-1
+control seq 1: FileStreamEnd
+```
+
+raw frame：
+
+```text
+u32_be frame_len
+u8     version = 4
+u8     flags = encrypted
+bytes  session_id[16]
+bytes  transfer_uuid[16]
+u64_be chunk_index
+bytes  nonce[12]
+bytes  ChaCha20-Poly1305(ciphertext || tag)
+```
+
+raw AAD 绑定固定头。chunk index 必须从 `0` 连续增长；每帧明文最多 `16MiB`。`FileStreamRawStart` 声明总大小、chunk 数、来源 UUID和顶层名称；结束帧再次提交 item id、实际 chunk 数和全流 SHA-256。
+
+发送端通过 no-follow 句柄边遍历源文件、生成 tar、计算逻辑文件树 hash、加密和写网；只有该 hash 与复制时捕获值一致才发送结束帧。tar 中 file/dir mode 固定为 `0644/0755`，`uid/gid/mtime` 固定为 `0`，目录分隔符固定为 `/`。接收端边解密、校验和解包，不生成完整 archive 临时文件；两端都会验证实际 tar 字节数等于声明值。
+
+单帧 idle 期限为 `30s`。整段文件接收另有绝对总期限：`30s + ceil(total_bytes / 1MiB/s)`，最小实际值 `31s`、最大 `30min`；trickle 数据只能刷新 idle 期限，不能延长总期限。
+
+归档限制：
+
+- 最大 `20,000` 个条目、深度 `32`、顶层名称 `256` 个。
+- 拒绝链接、reparse point、特殊文件、绝对路径、父级跳转、重复/折叠冲突路径。
+- 每个组件必须是 UTF-8 可移植名称；拒绝 Windows ADS、设备名和尾随点/空格。
+- 只允许发送端声明过的顶层名称，结束时声明集合必须全部出现。
+- 同时接收文件最多 `2` 个。
+
+## 队列与最新值
+
+共享域是单槽位最新值模型。比较键为：
+
+```text
+created_at_us -> source_device_id -> id
+```
+
+新事件会淘汰旧队列/旧传输；远端写回通过共享槽位指纹、inflight 指纹、短期忽略哈希和内部 staging 路径共同防回环。
+
+网络派生去重状态同样有硬上限：最近事件 UUID 保留 `120s`、最多 `4096` 条；已应用内容 hash 保留 `10s`、最多 `1024` 条。两者按 FIFO 淘汰，重复 key 不扩张 sidecar。
+
+发送调度：
+
+```text
+新任务 > 旧重试
+text/html/rtf > image > file
+同层较新事件优先
+```
+
+peer 广播并发最多 `8`。一轮只记录失败 peer；重试不会再次发送给已经成功的 peer。首轮退避 `30ms`，最大退避 `500ms`，最多 `24` 次且总年龄不超过 `30s`。
+
+接收写回遇到剪贴板短暂占用时使用同一有界退避；永久错误、过期事件和停止同步都会清理未使用的文件 staging。
+
+## 大小参数
+
+- 初始 `max_item_bytes`：`256KiB`。
+- 可配置范围：`1 byte..=1000MiB`；UI 以 MiB 显示但按字节精确往返。
+- 文件 tar 总流必须不超过 `max_item_bytes`。
+- 文本/PNG/HTML/RTF 还受 `8MiB` 单帧硬上限约束。
+- 超限内容保留在本地剪贴板，不广播，并记录明确错误。
+
+测试态使用小 payload、loopback、直接 codec 和可注入接收期限快速覆盖边界；生产大小、连接数、`2s` 握手总期限、`31s..30min` 文件总期限和 `30s` 重试总年龄不会为了测试而写死成更小值。

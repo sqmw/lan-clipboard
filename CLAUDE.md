@@ -1,77 +1,46 @@
-# CLAUDE.md
+# Agent Entry
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+这是给代码 Agent 的低上下文路由，不是第二套 TODO 或架构正文。
 
----
+## 先读
 
-## Development Commands
+1. 当前工作区/会话注入的 `AGENTS.md` 与全局规则；仓库没有同名文件时仍以已注入规则为准。
+2. `docs/todo.md`：唯一任务主记录、当前里程碑和验证状态。
+3. 按任务选择最小专题：
+   - 模块边界：`docs/architecture.md`
+   - 线协议/队列：`docs/protocol.md`
+   - 威胁模型/上限：`docs/security.md`
+   - 当前能力：`docs/status.md`
+   - 命令/测试/迁移：`docs/dev.md`
 
-Frontend & Tauri:
-- Install dependencies: `pnpm install`
-- Start development server: `pnpm tauri dev`
-- Build frontend: `pnpm build`
-- Preview production frontend: `pnpm preview`
-- Build full Tauri app: `pnpm tauri build`
+## 工程入口
 
-Testing & Logs:
-- Runtime logs are available via the `get_runtime_logs` Tauri command.
-- Sync progress via `get_transfer_progress`.
+- `Makefile`：安装、开发、构建、检查、测试与依赖审计的统一入口。
+- `mise.toml`：Node、pnpm、Rust 版本基线。
+- `src-tauri/src/lib.rs`：Tauri 初始化和 IPC 注册。
+- `src-tauri/src/commands.rs`：最小设置 DTO、状态、发现、日志与进度 IPC。
+- `src-tauri/src/settings.rs`：验证、原子保存和 v3→v4 配置迁移。
+- `src-tauri/src/net/`：发现、握手、wire、sender/inbound、队列与生命周期。
+- `src-tauri/src/clipboard/`：本机剪贴板格式、no-follow 文件访问、路径策略和平台适配。
+- `src/main.ts`：前端启动与 IPC 编排；表单、设备、进度和样式已拆到子模块。
 
-Running specific tasks in Rust/Tauri:
-- Start/stop sync: `start_sync` / `stop_sync`
-- Device discovery: `discover_devices`
-- Settings access: `get_settings` / `set_settings`
+## 不变量
 
----
+- 当前应用 `2.0.0` / TCP `v4`；不与 `v3` 互通，不允许明文 fallback。
+- 本机 `ClipboardPayload` 可含路径但不实现 serde；线上 DTO 永远不能包含 `PathBuf`。
+- 每条 TCP 连接必须先完成固定长度 PSK 握手，再读取任何长度前缀。
+- `source_device_id`、session、control sequence、transfer UUID 和 chunk index 必须绑定验证。
+- staging/log 使用 per-user app cache，不写仓库或同步工作区。
+- 修改代码必须同步文档、验证、review，并把后续事项回写 `docs/todo.md`。
 
-## High-Level Architecture
+## 常用验证
 
-### Rust Core (`src-tauri/src`)
-- **lib.rs**: Initializes modules, runs main Tauri setup.
-- **commands.rs**: Exposes Tauri commands to frontend (settings, clipboard, sync, device discovery, logs).
-- **protocol.rs**: Defines `ClipboardPayload` and serialization for clipboard items (text, image, files).
-- **state.rs**: Application runtime state, including `AppState` with `Arc<Mutex<...>>`.
-- **settings.rs**: User settings handling, serialization, path helpers.
-- **desktop.rs**: Handles desktop-specific behavior and shell interactions.
-- **net.rs**: Networking, mDNS discovery, UDP heartbeats, TCP transfer logic.
+```sh
+make check
+make test
+make audit-web
+pnpm exec tauri info
+git diff --check
+```
 
-### Frontend (`src`)
-- **main.ts**: Vite entry, initializes Tauri frontend, binds commands.
-- **i18n.ts**: Internationalization support.
-- **styles.css**: Global CSS.
-- Assets: SVGs, images, icons for tray and main UI.
-
-### Build & Config
-- **package.json / pnpm**: Frontend scripts, devDependencies, Tauri CLI.
-- **tsconfig.json**: TypeScript config.
-- **vite.config.ts**: Vite bundler config.
-- **src-tauri/Cargo.toml**: Rust crate, dependencies, Tauri plugins.
-- **src-tauri/tauri.conf.json**: Tauri configuration (tray, bundle, app windows).
-
-### Protocol & Network
-- Uses **mDNS** (`_lan-clipboard._tcp.local.`) and **UDP heartbeat** (port 32911) for local device discovery.
-- TCP connections for clipboard payload transfer, respecting size limits (~4MB buffer per connection).
-- Clipboard payload types: text, image (PNG), file.
-- Windows/macOS differences handled: polling vs callback, case-insensitive paths, tray initialization.
-
-### Frontend/Backend Interactions
-- Rust exposes commands via `#[tauri::command]`.
-- Frontend triggers sync, reads/writes clipboard, displays transfer status.
-- Commands include `start_sync`, `stop_sync`, `get_settings`, `set_settings`, `read_clipboard_snapshot`, `write_clipboard_item`, `discover_devices`.
-
-### Key Dev Notes
-- Main window not created by default; must use `WebviewWindowBuilder::new(...)` to show.
-- Windows: watch for `_.*` resource files; can break UTF-8 parsing.
-- Clipboard and file sync deduplicate content by fingerprint.
-- Logs and progress critical for debugging transfers.
-
-### References
-- `docs/dev.md` for detailed dev setup.
-- `docs/architecture.md` for module-level architecture.
-- `docs/protocol.md` for protocol details.
-- `docs/security.md` for security considerations.
-- `docs/status.md` for runtime status and debug info.
-
----
-
-This CLAUDE.md equips Claude Code with enough context to work effectively with the Rust+Tauri frontend app, understand modules, run development builds, and debug clipboard sync.
+Windows 无 `make` 时使用 `docs/dev.md` 中的等价命令。真实剪贴板 smoke 会覆盖用户当前剪贴板，未经明确授权不要自动执行。

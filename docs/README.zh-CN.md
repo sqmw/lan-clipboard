@@ -24,7 +24,7 @@
 
 ### 想看安全与环境
 
-- `docs/security.md`：共享码与加密策略
+- `docs/security.md`：配对密钥、威胁模型与认证加密策略
 - `docs/syncthing.md`：当前这套 macOS ↔ Windows 环境的 Syncthing 映射事实
 
 ## 文档职责分工
@@ -47,7 +47,7 @@
 
 - `docs/todo.md`
   - 项目进度主入口
-  - 只记录里程碑、未完成项、风险项
+  - 记录当前里程碑、未完成项、风险项和可检索 Done 索引
 
 ## 当前建议
 
