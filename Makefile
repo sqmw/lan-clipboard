@@ -4,7 +4,7 @@ PNPM ?= pnpm
 CARGO ?= cargo
 TAURI_MANIFEST := src-tauri/Cargo.toml
 
-.PHONY: help install dev dev-web preview build build-web check check-web check-rust test
+.PHONY: help install dev dev-web preview build build-web check check-web check-rust test audit-web verify
 
 help:
 	@printf '%s\n' \
@@ -15,11 +15,13 @@ help:
 		'  make preview     Preview the built frontend' \
 		'  make build       Build the Tauri release bundles' \
 		'  make build-web   Build only the frontend' \
-		'  make check       Run TypeScript and Rust compile checks' \
-		'  make test        Run the Rust test suite'
+		'  make check       Run frontend build, Rust fmt and strict clippy' \
+		'  make test        Run the Rust test suite' \
+		'  make audit-web   Audit frontend dependencies via the npm registry' \
+		'  make verify      Run check, test and dependency audit'
 
 install:
-	$(PNPM) install
+	$(PNPM) install --frozen-lockfile
 
 dev:
 	$(PNPM) tauri dev
@@ -31,7 +33,7 @@ preview:
 	$(PNPM) preview
 
 build:
-	$(PNPM) tauri build
+	$(PNPM) tauri build -- --locked
 
 build-web:
 	$(PNPM) build
@@ -39,10 +41,16 @@ build-web:
 check: check-web check-rust
 
 check-web:
-	$(PNPM) exec tsc --noEmit
+	$(PNPM) build
 
 check-rust:
-	$(CARGO) check --manifest-path $(TAURI_MANIFEST)
+	$(CARGO) fmt --manifest-path $(TAURI_MANIFEST) --all -- --check
+	$(CARGO) clippy --manifest-path $(TAURI_MANIFEST) --locked --all-targets --all-features -- -D warnings
 
 test:
-	$(CARGO) test --manifest-path $(TAURI_MANIFEST)
+	$(CARGO) test --manifest-path $(TAURI_MANIFEST) --locked --all-targets --all-features
+
+audit-web:
+	$(PNPM) audit --registry=https://registry.npmjs.org --audit-level moderate
+
+verify: check test audit-web
