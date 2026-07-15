@@ -1,6 +1,6 @@
 use super::dedupe::clear_content_inflight;
 use super::discovery::{
-    is_private_lan_ipv4, is_same_subnet, is_usable_ipv4, parse_selected_ipv4,
+    is_private_lan_ipv4, is_same_lan_scope, is_usable_ipv4, parse_selected_ipv4,
     selected_or_active_local_ip,
 };
 use super::logs::push_log;
@@ -9,6 +9,7 @@ use super::members::prune_stale_discovered_devices;
 use super::metrics::now_ms;
 use super::socket::is_self_socket_addr;
 use super::{RuntimeInner, Settings};
+use crate::protocol::ClipboardPayload;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
@@ -75,7 +76,7 @@ pub(super) fn collect_peer_targets(runtime: &RuntimeInner, settings: &Settings) 
             }
             if let Some(selected_ipv4) = selected_ipv4 {
                 if let Ok(peer_ipv4) = device.addr.parse::<std::net::Ipv4Addr>() {
-                    if !is_same_subnet(selected_ipv4, peer_ipv4) {
+                    if !is_same_lan_scope(selected_ipv4, peer_ipv4) {
                         continue;
                     }
                 }
@@ -108,6 +109,9 @@ pub(super) fn clear_member_cache(runtime: &RuntimeInner) {
         guard.clear();
     }
     if let Ok(mut guard) = runtime.inbound_queue.lock() {
+        for entry in guard.iter() {
+            remove_internal_file_payload(runtime, &entry.item.payload, "clear inbound queue");
+        }
         guard.clear();
     }
     if let Ok(mut guard) = runtime.latest_item.lock() {
@@ -158,6 +162,11 @@ pub(super) fn prune_stale_queue_entries(runtime: &RuntimeInner) {
             let keep = !compare_markers(&item_marker(&entry.item), &latest).is_lt();
             if !keep {
                 dropped_inbound += 1;
+                remove_internal_file_payload(
+                    runtime,
+                    &entry.item.payload,
+                    "prune stale inbound queue item",
+                );
             }
             keep
         });
@@ -175,18 +184,9 @@ pub(super) fn prune_stale_queue_entries(runtime: &RuntimeInner) {
     }
 }
 
-pub(super) fn sanitize_file_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
+fn remove_internal_file_payload(runtime: &RuntimeInner, payload: &ClipboardPayload, context: &str) {
+    if let Err(error) = crate::clipboard::remove_internal_file_payload(payload) {
+        push_log(runtime, "WARN", &format!("{context}: {error}"));
     }
 }
 

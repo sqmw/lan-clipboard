@@ -1,21 +1,16 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Application-local clipboard representation.
+///
+/// This type intentionally does not implement serde. Several variants contain
+/// machine-local paths and must never become part of a network or IPC schema.
+#[derive(Debug, Clone)]
 pub enum ClipboardPayload {
     Text {
         text: String,
     },
     ImagePng {
         png_bytes: Vec<u8>,
-    },
-    FileBundle {
-        archive_bytes: Vec<u8>,
-        top_level_names: Vec<String>,
-    },
-    FileBundlePath {
-        archive_path: PathBuf,
-        top_level_names: Vec<String>,
     },
     FileBundleDir {
         bundle_dir: PathBuf,
@@ -39,21 +34,19 @@ impl ClipboardPayload {
         match self {
             ClipboardPayload::Text { .. } => "text",
             ClipboardPayload::ImagePng { .. } => "image_png",
-            ClipboardPayload::FileBundle { .. }
-            | ClipboardPayload::FileBundlePath { .. }
-            | ClipboardPayload::FileBundleDir { .. }
-            | ClipboardPayload::FileList { .. } => "file_bundle",
+            ClipboardPayload::FileBundleDir { .. } | ClipboardPayload::FileList { .. } => {
+                "file_bundle"
+            }
             ClipboardPayload::Html { .. } => "html",
             ClipboardPayload::Rtf { .. } => "rtf",
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClipboardItem {
     pub id: String,
     pub content_hash: String,
-    #[serde(alias = "created_at_ms")]
     pub created_at_us: u64,
     pub source_device_id: String,
     pub size_bytes: u64,

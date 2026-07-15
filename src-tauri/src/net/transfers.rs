@@ -2,6 +2,7 @@ use super::metrics::{now_ms, percent_for};
 use super::RuntimeInner;
 use crate::protocol::ClipboardItem;
 use serde::Serialize;
+use std::cmp::Reverse;
 
 const TRANSFER_HISTORY_LIMIT: usize = 24;
 const TRANSFER_RETENTION_MS: u64 = 15_000;
@@ -31,7 +32,7 @@ pub(super) fn upsert_transfer(runtime: &RuntimeInner, transfer: TransferProgress
         } else {
             guard.push(transfer);
         }
-        guard.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+        guard.sort_by_key(|entry| Reverse(entry.updated_at_ms));
         if guard.len() > TRANSFER_HISTORY_LIMIT {
             guard.truncate(TRANSFER_HISTORY_LIMIT);
         }

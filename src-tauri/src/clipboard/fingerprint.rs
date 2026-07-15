@@ -1,12 +1,13 @@
+use super::file_access::VerifiedPath;
+use super::path_policy::{resolve_restored_paths, MAX_ARCHIVE_DEPTH, MAX_ARCHIVE_ENTRIES};
 use super::ClipboardError;
 use crate::protocol::ClipboardPayload;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Cursor, Read};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use tar::Archive;
 
-const FILE_HASH_SAMPLE_BYTES: usize = 64 * 1024;
+const FILE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String, ClipboardError> {
     match payload {
@@ -15,12 +16,6 @@ pub(crate) fn payload_content_hash(payload: &ClipboardPayload) -> Result<String,
         ClipboardPayload::Html { html } => Ok(hex_hash(html.as_bytes())),
         ClipboardPayload::Rtf { rtf } => Ok(hex_hash(rtf.as_bytes())),
         ClipboardPayload::FileList { paths, .. } => hash_file_list(paths),
-        ClipboardPayload::FileBundle { archive_bytes, .. } => {
-            hash_file_bundle_archive(archive_bytes)
-        }
-        ClipboardPayload::FileBundlePath { archive_path, .. } => {
-            hash_file_bundle_archive_path(archive_path)
-        }
         ClipboardPayload::FileBundleDir {
             bundle_dir,
             top_level_names,
@@ -43,105 +38,83 @@ pub(super) fn hash_file_list(file_paths: &[PathBuf]) -> Result<String, Clipboard
         .collect::<Result<Vec<_>, ClipboardError>>()?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut records = Vec::new();
+    let mut records = FileTreeHash::new();
+    let mut entry_count = 0usize;
     for (name, path) in entries {
-        collect_path_hash_records(&path, Path::new(&name), &mut records)?;
+        collect_path_hash_records(&path, Path::new(&name), &mut records, 1, &mut entry_count)?;
     }
-    Ok(finalize_hash_records(records))
+    Ok(records.finalize())
 }
 
 fn collect_path_hash_records(
     source: &Path,
     relative_path: &Path,
-    records: &mut Vec<HashRecord>,
+    records: &mut FileTreeHash,
+    depth: usize,
+    entry_count: &mut usize,
 ) -> Result<(), ClipboardError> {
-    let metadata = fs::metadata(source).map_err(|e| ClipboardError::Backend(e.to_string()))?;
+    collect_verified_path_hash_records(source, relative_path, records, depth, entry_count, None)
+}
+
+fn collect_verified_path_hash_records(
+    source: &Path,
+    relative_path: &Path,
+    records: &mut FileTreeHash,
+    depth: usize,
+    entry_count: &mut usize,
+    parent: Option<(&VerifiedPath, &Path)>,
+) -> Result<(), ClipboardError> {
+    if depth > MAX_ARCHIVE_DEPTH || *entry_count >= MAX_ARCHIVE_ENTRIES {
+        return Err(ClipboardError::Backend(
+            "file fingerprint traversal limit exceeded".to_string(),
+        ));
+    }
+    *entry_count = entry_count.saturating_add(1);
+    let mut verified = VerifiedPath::open(source)?;
+    if let Some((parent, parent_path)) = parent {
+        parent.verify_still_at(parent_path)?;
+    }
+    let metadata = verified.metadata().clone();
     let normalized_path = normalize_hash_path(relative_path);
-    if metadata.is_dir() {
-        records.push(HashRecord {
-            kind: "dir".to_string(),
-            path: normalized_path,
-            size_bytes: 0,
-            sample_hash: None,
-        });
+    if verified.is_dir() {
+        records.push_directory_normalized(normalized_path);
 
         let mut children = fs::read_dir(source)
             .map_err(|e| ClipboardError::Backend(e.to_string()))?
-            .map(|child| child.map_err(|e| ClipboardError::Backend(e.to_string())))
+            .map(|child| {
+                child
+                    .map(|child| (child.file_name(), child.path()))
+                    .map_err(|e| ClipboardError::Backend(e.to_string()))
+            })
             .collect::<Result<Vec<_>, ClipboardError>>()?;
-        children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
-        for child in children {
-            let child_path = child.path();
-            let child_relative_path = relative_path.join(child.file_name());
-            collect_path_hash_records(&child_path, &child_relative_path, records)?;
+        verified.verify_unchanged_at(source)?;
+        children.sort_by(|left, right| left.0.cmp(&right.0));
+        for (child_name, child_path) in children {
+            let child_relative_path = relative_path.join(child_name);
+            collect_verified_path_hash_records(
+                &child_path,
+                &child_relative_path,
+                records,
+                depth + 1,
+                entry_count,
+                Some((&verified, source)),
+            )?;
         }
+        verified.verify_unchanged_at(source)?;
         return Ok(());
     }
 
-    records.push(HashRecord {
-        kind: "file".to_string(),
-        path: normalized_path,
-        size_bytes: metadata.len(),
-        sample_hash: Some(sample_file_prefix_hash(source)?),
-    });
+    let content_hash = hash_reader_contents(verified.file_mut()?)?;
+    verified.verify_unchanged_at(source)?;
+    records.push_file_normalized(normalized_path, metadata.len(), content_hash);
     Ok(())
-}
-
-fn hash_file_bundle_archive(archive_bytes: &[u8]) -> Result<String, ClipboardError> {
-    let cursor = Cursor::new(archive_bytes);
-    hash_file_bundle_archive_reader(cursor)
-}
-
-fn hash_file_bundle_archive_path(archive_path: &Path) -> Result<String, ClipboardError> {
-    let file = File::open(archive_path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
-    hash_file_bundle_archive_reader(file)
-}
-
-fn hash_file_bundle_archive_reader<R: Read>(reader: R) -> Result<String, ClipboardError> {
-    let mut archive = Archive::new(reader);
-    let mut records = Vec::new();
-
-    let entries = archive
-        .entries()
-        .map_err(|e| ClipboardError::Backend(e.to_string()))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| ClipboardError::Backend(e.to_string()))?;
-        let path = entry
-            .path()
-            .map_err(|e| ClipboardError::Backend(e.to_string()))?
-            .into_owned();
-        let normalized_path = normalize_hash_path(&path);
-        if entry.header().entry_type().is_dir() {
-            records.push(HashRecord {
-                kind: "dir".to_string(),
-                path: normalized_path,
-                size_bytes: 0,
-                sample_hash: None,
-            });
-            continue;
-        }
-
-        let size_bytes = entry.header().size().unwrap_or(0);
-        records.push(HashRecord {
-            kind: "file".to_string(),
-            path: normalized_path,
-            size_bytes,
-            sample_hash: Some(sample_reader_prefix_hash(&mut entry)?),
-        });
-    }
-
-    Ok(finalize_hash_records(records))
 }
 
 fn hash_file_bundle_dir(
     bundle_dir: &Path,
     top_level_names: &[String],
 ) -> Result<String, ClipboardError> {
-    let restored_paths = top_level_names
-        .iter()
-        .map(|name| bundle_dir.join(name))
-        .filter(|path| path.exists())
-        .collect::<Vec<_>>();
+    let restored_paths = resolve_restored_paths(bundle_dir, top_level_names)?;
     if restored_paths.is_empty() {
         return Err(ClipboardError::Backend(
             "restored clipboard file bundle is empty".to_string(),
@@ -155,52 +128,82 @@ struct HashRecord {
     kind: String,
     path: String,
     size_bytes: u64,
-    sample_hash: Option<String>,
+    content_hash: Option<String>,
 }
 
-fn finalize_hash_records(mut records: Vec<HashRecord>) -> String {
-    records.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.kind.cmp(&right.kind))
-    });
+pub(super) struct FileTreeHash {
+    records: Vec<HashRecord>,
+}
 
-    let mut hasher = Sha256::new();
-    for record in records {
-        hasher.update(record.kind.as_bytes());
-        hasher.update([0]);
-        hasher.update(record.path.as_bytes());
-        hasher.update([0]);
-        hasher.update(record.size_bytes.to_le_bytes());
-        hasher.update([0]);
-        if let Some(sample_hash) = record.sample_hash {
-            hasher.update(sample_hash.as_bytes());
+impl FileTreeHash {
+    pub(super) fn new() -> Self {
+        Self {
+            records: Vec::new(),
         }
-        hasher.update([0xff]);
     }
-    format!("{:x}", hasher.finalize())
+
+    pub(super) fn push_directory(&mut self, path: &Path) {
+        self.push_directory_normalized(normalize_hash_path(path));
+    }
+
+    fn push_directory_normalized(&mut self, path: String) {
+        self.records.push(HashRecord {
+            kind: "dir".to_string(),
+            path,
+            size_bytes: 0,
+            content_hash: None,
+        });
+    }
+
+    pub(super) fn push_file(&mut self, path: &Path, size_bytes: u64, content_hash: String) {
+        self.push_file_normalized(normalize_hash_path(path), size_bytes, content_hash);
+    }
+
+    fn push_file_normalized(&mut self, path: String, size_bytes: u64, content_hash: String) {
+        self.records.push(HashRecord {
+            kind: "file".to_string(),
+            path,
+            size_bytes,
+            content_hash: Some(content_hash),
+        });
+    }
+
+    pub(super) fn finalize(mut self) -> String {
+        self.records.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+
+        let mut hasher = Sha256::new();
+        for record in self.records {
+            hasher.update(record.kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(record.path.as_bytes());
+            hasher.update([0]);
+            hasher.update(record.size_bytes.to_le_bytes());
+            hasher.update([0]);
+            if let Some(content_hash) = record.content_hash {
+                hasher.update(content_hash.as_bytes());
+            }
+            hasher.update([0xff]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
 }
 
-fn sample_file_prefix_hash(path: &Path) -> Result<String, ClipboardError> {
-    let mut file = File::open(path).map_err(|e| ClipboardError::Backend(e.to_string()))?;
-    sample_reader_prefix_hash(&mut file)
-}
-
-fn sample_reader_prefix_hash<R: Read>(reader: &mut R) -> Result<String, ClipboardError> {
-    let mut remaining = FILE_HASH_SAMPLE_BYTES;
-    let mut buffer = [0u8; 8 * 1024];
+fn hash_reader_contents<R: Read>(reader: &mut R) -> Result<String, ClipboardError> {
+    let mut buffer = [0u8; FILE_HASH_BUFFER_BYTES];
     let mut hasher = Sha256::new();
 
-    while remaining > 0 {
-        let read_limit = remaining.min(buffer.len());
+    loop {
         let read_bytes = reader
-            .read(&mut buffer[..read_limit])
+            .read(&mut buffer)
             .map_err(|e| ClipboardError::Backend(e.to_string()))?;
         if read_bytes == 0 {
             break;
         }
         hasher.update(&buffer[..read_bytes]);
-        remaining -= read_bytes;
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -217,4 +220,45 @@ fn hex_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn full_reader_hash_detects_changes_after_the_old_sample_boundary() {
+        let mut original = vec![b'a'; FILE_HASH_BUFFER_BYTES + 1];
+        let mut changed = original.clone();
+        changed[FILE_HASH_BUFFER_BYTES] = b'b';
+
+        let original_hash = hash_reader_contents(&mut Cursor::new(&original)).unwrap();
+        let changed_hash = hash_reader_contents(&mut Cursor::new(&changed)).unwrap();
+
+        assert_ne!(original_hash, changed_hash);
+
+        original[FILE_HASH_BUFFER_BYTES] = b'b';
+        let matching_hash = hash_reader_contents(&mut Cursor::new(&original)).unwrap();
+        assert_eq!(matching_hash, changed_hash);
+    }
+
+    #[test]
+    fn file_list_hash_rejects_excessive_directory_depth() {
+        let root = std::env::temp_dir().join(format!(
+            "lan-clipboard-fingerprint-depth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let top = root.join("payload");
+        fs::create_dir_all(&top).expect("create top-level fixture");
+        let mut current = top.clone();
+        for index in 0..MAX_ARCHIVE_DEPTH {
+            current = current.join(format!("d{index}"));
+            fs::create_dir(&current).expect("create nested fixture");
+        }
+
+        let error = hash_file_list(&[top]).expect_err("depth limit must be enforced");
+        assert!(error.to_string().contains("traversal limit"));
+        fs::remove_dir_all(root).expect("remove depth fixture");
+    }
 }

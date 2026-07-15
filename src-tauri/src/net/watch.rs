@@ -11,6 +11,7 @@ use super::metrics::{elapsed_ms, now_ms};
 use super::state::RuntimeInner;
 use super::{build_item, enqueue_outbound_item};
 use crate::clipboard;
+use crate::clipboard::clipboard_change_token;
 use crate::settings::{Settings, SizeLimits};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -191,10 +192,20 @@ fn run_clipboard_watch_poll_loop(
     device_id: String,
     poll_interval: Duration,
 ) {
-    seed_local_clipboard_baseline(&runtime, &limits);
+    let mut last_change_token = clipboard_change_token();
+    if last_change_token.is_none() {
+        seed_local_clipboard_baseline(&runtime, &limits);
+    }
     let mut current_interval = poll_interval;
     while !runtime.stop_flag.load(Ordering::SeqCst) {
-        let changed = process_local_clipboard_observation(&runtime, &limits, &device_id);
+        let current_change_token = clipboard_change_token();
+        let should_read_snapshot = match (last_change_token, current_change_token) {
+            (Some(previous), Some(current)) => current != previous,
+            _ => true,
+        };
+        last_change_token = current_change_token;
+        let changed = should_read_snapshot
+            && process_local_clipboard_observation(&runtime, &limits, &device_id);
         if changed {
             current_interval = poll_interval;
         } else {

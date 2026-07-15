@@ -14,6 +14,7 @@ pub(super) struct QueueEntry {
     pub(super) item: ClipboardItem,
     pub(super) attempts: u32,
     pub(super) queued_at_ms: u64,
+    pub(super) pending_peers: Option<Vec<String>>,
     next_attempt_at_ms: u64,
 }
 
@@ -94,10 +95,9 @@ fn outbound_lane(entry: &QueueEntry) -> QueueLane {
         | ClipboardPayload::Html { .. }
         | ClipboardPayload::Rtf { .. } => QueueLane::Realtime,
         ClipboardPayload::ImagePng { .. } => QueueLane::Visual,
-        ClipboardPayload::FileBundle { .. }
-        | ClipboardPayload::FileBundlePath { .. }
-        | ClipboardPayload::FileBundleDir { .. }
-        | ClipboardPayload::FileList { .. } => QueueLane::Bulk,
+        ClipboardPayload::FileBundleDir { .. } | ClipboardPayload::FileList { .. } => {
+            QueueLane::Bulk
+        }
     }
 }
 
@@ -122,6 +122,7 @@ pub(super) fn new_queue_entry(item: ClipboardItem) -> QueueEntry {
         item,
         attempts: 0,
         queued_at_ms,
+        pending_peers: None,
         next_attempt_at_ms: queued_at_ms,
     }
 }

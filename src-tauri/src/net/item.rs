@@ -15,10 +15,6 @@ pub fn build_item(
         } => *estimated_archive_bytes,
         ClipboardPayload::Text { text } => text.len() as u64,
         ClipboardPayload::ImagePng { png_bytes } => png_bytes.len() as u64,
-        ClipboardPayload::FileBundle { archive_bytes, .. } => archive_bytes.len() as u64,
-        ClipboardPayload::FileBundlePath { archive_path, .. } => std::fs::metadata(archive_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
         ClipboardPayload::FileBundleDir { bundle_dir, .. } => dir_size_bytes(bundle_dir),
         ClipboardPayload::Html { html } => html.len() as u64,
         ClipboardPayload::Rtf { rtf } => rtf.len() as u64,

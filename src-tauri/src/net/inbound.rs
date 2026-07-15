@@ -1,34 +1,67 @@
 use super::display::{file_stream_label, file_stream_summary, payload_label, payload_summary};
-use super::file_stream::RawFileStreamReader;
+use super::file_stream::{FileStreamTransfer, RawFileStreamReader};
+use super::handshake::{server_handshake, Session};
 use super::logs::{push_log, set_error};
-use super::marker::{file_stream_marker, is_stale_marker, update_latest_marker};
+use super::marker::{file_stream_marker, is_stale_marker};
 use super::members::mark_known_member;
 use super::metrics::{elapsed_ms, format_mib_per_second, now_ms};
+use super::socket::tune_stream_for_receive;
 use super::transfers::{
-    canonical_receive_transfer_id, mark_transfer_failed, update_transfer_progress, upsert_transfer,
-    TransferProgress,
+    canonical_receive_transfer_id, mark_transfer_failed, upsert_transfer, TransferProgress,
 };
 use super::wire::{
     decode_wire_body_bytes, read_wire_body_from_stream, read_wire_frame, FileStreamStart, WireBody,
 };
 use super::{
-    enqueue_inbound_item, prune_stale_queue_entries, remember_active_local_ip,
-    sanitize_file_component, should_skip_remote_item, RuntimeInner,
+    enqueue_inbound_item, remember_active_local_ip, should_skip_remote_item, RuntimeInner,
 };
 use crate::clipboard;
 use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
-use std::collections::HashMap;
-use std::net::TcpStream;
-use std::path::PathBuf;
+use std::net::{IpAddr, Shutdown, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-struct IncomingFileStream {
-    meta: FileStreamStart,
-    archive_path: PathBuf,
-    received_bytes: u64,
-    peer: String,
+const MAX_INCOMING_CONNECTIONS: usize = 16;
+const MAX_INCOMING_CONNECTIONS_PER_IP: usize = 4;
+const MAX_ACTIVE_FILE_RECEIVES: usize = 2;
+
+struct IncomingConnectionGuard {
+    runtime: Arc<RuntimeInner>,
+    connection_id: u64,
+}
+
+impl Drop for IncomingConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sockets) = self.runtime.incoming_sockets.lock() {
+            sockets.remove(&self.connection_id);
+        }
+    }
+}
+
+struct ActiveFileReceiveGuard<'a> {
+    runtime: &'a RuntimeInner,
+}
+
+impl<'a> ActiveFileReceiveGuard<'a> {
+    fn acquire(runtime: &'a RuntimeInner) -> anyhow::Result<Self> {
+        runtime
+            .active_file_receives
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_ACTIVE_FILE_RECEIVES).then_some(active + 1)
+            })
+            .map_err(|_| anyhow::anyhow!("concurrent file receive limit reached"))?;
+        Ok(Self { runtime })
+    }
+}
+
+impl Drop for ActiveFileReceiveGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime
+            .active_file_receives
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(super) fn spawn_incoming_connection_worker(
@@ -37,13 +70,116 @@ pub(super) fn spawn_incoming_connection_worker(
     device_id: String,
     stream: TcpStream,
 ) {
-    let _ = std::thread::Builder::new()
+    prune_finished_incoming_workers(&runtime);
+    let peer_ip = stream.peer_addr().ok().map(|address| address.ip());
+    let connection_id = runtime.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let tracked_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(error) => {
+            set_error(&runtime, format!("clone incoming socket failed: {error}"));
+            return;
+        }
+    };
+    let registered = runtime
+        .incoming_sockets
+        .lock()
+        .map(|mut sockets| {
+            let peer_count = peer_ip
+                .map(|target| sockets.values().filter(|(ip, _)| *ip == target).count())
+                .unwrap_or(0);
+            if sockets.len() >= MAX_INCOMING_CONNECTIONS
+                || peer_count >= MAX_INCOMING_CONNECTIONS_PER_IP
+            {
+                return false;
+            }
+            sockets.insert(
+                connection_id,
+                (
+                    peer_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    tracked_stream,
+                ),
+            );
+            true
+        })
+        .unwrap_or(false);
+    if !registered {
+        let _ = stream.shutdown(Shutdown::Both);
+        push_log(&runtime, "WARN", "incoming connection limit reached");
+        return;
+    }
+
+    let worker_runtime = Arc::clone(&runtime);
+    let spawn_result = std::thread::Builder::new()
         .name("lan-clipboard-incoming".to_string())
         .spawn(move || {
-            if let Err(error) = handle_incoming(&runtime, &settings, stream, &device_id) {
-                set_error(&runtime, format!("incoming handler failed: {error}"));
+            let guard = IncomingConnectionGuard {
+                runtime: Arc::clone(&worker_runtime),
+                connection_id,
+            };
+            if let Err(error) = handle_incoming(&guard.runtime, &settings, stream, &device_id) {
+                if !guard.runtime.stop_flag.load(Ordering::SeqCst) {
+                    push_log(
+                        &guard.runtime,
+                        "DEBUG",
+                        &format!("incoming connection closed: {error}"),
+                    );
+                }
             }
         });
+    match spawn_result {
+        Ok(handle) => {
+            if let Ok(mut workers) = runtime.incoming_workers.lock() {
+                workers.push(handle);
+            }
+        }
+        Err(error) => {
+            if let Ok(mut sockets) = runtime.incoming_sockets.lock() {
+                sockets.remove(&connection_id);
+            }
+            set_error(&runtime, format!("spawn incoming worker failed: {error}"));
+        }
+    }
+}
+
+pub(super) fn shutdown_incoming_workers(runtime: &RuntimeInner) {
+    if let Ok(sockets) = runtime.incoming_sockets.lock() {
+        for (_, stream) in sockets.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+    let workers = runtime
+        .incoming_workers
+        .lock()
+        .map(|mut workers| workers.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for worker in workers {
+        let _ = worker.join();
+    }
+    if let Ok(mut sockets) = runtime.incoming_sockets.lock() {
+        sockets.clear();
+    }
+}
+
+fn prune_finished_incoming_workers(runtime: &RuntimeInner) {
+    let finished = runtime
+        .incoming_workers
+        .lock()
+        .map(|mut workers| {
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            finished
+        })
+        .unwrap_or_default();
+    for worker in finished {
+        let _ = worker.join();
+    }
 }
 
 fn handle_incoming(
@@ -52,34 +188,21 @@ fn handle_incoming(
     stream: TcpStream,
     device_id: &str,
 ) -> anyhow::Result<()> {
+    let mut stream = stream;
+    let mut session = server_handshake(&mut stream, &settings.sync.shared_code, device_id)?;
+    tune_stream_for_receive(&stream, settings.limits.max_item_bytes);
     let remote_addr = stream.peer_addr().ok().map(|addr| addr.to_string());
     if let Ok(local_addr) = stream.local_addr() {
         remember_active_local_ip(runtime, local_addr.ip());
     }
-    let mut stream = stream;
-    let mut incoming_files: HashMap<String, IncomingFileStream> = HashMap::new();
-    loop {
-        let Some(frame_bytes) = (match read_wire_frame(&mut stream) {
-            Ok(frame) => Ok(frame),
-            Err(error) => {
-                discard_incomplete_incoming_files(
-                    runtime,
-                    &mut incoming_files,
-                    "发送方连接中断，已丢弃未完成传输",
-                );
-                Err(error)
-            }
-        })?
-        else {
-            discard_incomplete_incoming_files(
-                runtime,
-                &mut incoming_files,
-                "发送方已下线，已丢弃未完成传输",
-            );
+    while !runtime.stop_flag.load(Ordering::SeqCst) {
+        let Some(frame_bytes) = read_wire_frame(&mut stream, settings)? else {
             break;
         };
-        let body = decode_wire_body_bytes(&frame_bytes, settings)?;
-        match body {
+        if runtime.stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        match decode_wire_body_bytes(&frame_bytes, settings, &mut session)? {
             WireBody::ClipboardItem(item) => {
                 handle_incoming_item(
                     runtime,
@@ -88,177 +211,19 @@ fn handle_incoming(
                     device_id,
                 );
             }
-            WireBody::FileStreamStart(meta) => {
-                let canonical_transfer_id =
-                    format!("recv:{}:{}", meta.source_device_id, meta.item_id);
-                upsert_transfer(
-                    runtime,
-                    TransferProgress {
-                        id: canonical_transfer_id.clone(),
-                        direction: "receive".to_string(),
-                        peer: remote_addr.as_deref().unwrap_or("未知来源").to_string(),
-                        item_kind: "file_bundle".to_string(),
-                        item_label: file_stream_label(&meta.top_level_names),
-                        item_summary: file_stream_summary(&meta.top_level_names),
-                        item_id: meta.item_id.clone(),
-                        transferred_bytes: 0,
-                        total_bytes: meta.size_bytes,
-                        percent: 0,
-                        status: "receiving".to_string(),
-                        updated_at_ms: now_ms(),
-                        error: None,
-                    },
-                );
-                let marker = file_stream_marker(&meta);
-                if is_stale_marker(runtime, &marker) {
-                    mark_transfer_failed(
-                        runtime,
-                        &canonical_transfer_id,
-                        "已被更新内容替代".to_string(),
-                    );
-                    push_log(
-                        runtime,
-                        "DEBUG",
-                        &format!(
-                            "drop stale inbound file stream start item={} source_device_id={}",
-                            meta.item_id, meta.source_device_id
-                        ),
-                    );
-                    continue;
-                }
-                if update_latest_marker(runtime, marker) {
-                    prune_stale_queue_entries(runtime);
-                }
-
-                if let Some(previous) = incoming_files.remove(&meta.item_id) {
-                    let _ = std::fs::remove_file(&previous.archive_path);
-                }
-
-                let safe_source = sanitize_file_component(&meta.source_device_id);
-                let safe_item = sanitize_file_component(&meta.item_id);
-                let archive_path = std::env::temp_dir().join(format!(
-                    "lan-clipboard-incoming-{safe_source}-{safe_item}.archive"
-                ));
-                let _ = std::fs::remove_file(&archive_path);
-                if let Err(error) = std::fs::File::create(&archive_path) {
-                    mark_transfer_failed(runtime, &canonical_transfer_id, error.to_string());
-                    push_log(
-                        runtime,
-                        "WARN",
-                        &format!(
-                            "create inbound temp archive failed item={} path={} error={}",
-                            meta.item_id,
-                            archive_path.display(),
-                            error
-                        ),
-                    );
-                    continue;
-                }
-
-                incoming_files.insert(
-                    meta.item_id.clone(),
-                    IncomingFileStream {
-                        meta,
-                        archive_path,
-                        received_bytes: 0,
-                        peer: remote_addr.as_deref().unwrap_or("未知来源").to_string(),
-                    },
-                );
-            }
-            WireBody::FileStreamChunk { item_id, bytes } => {
-                if let Some(file_stream) = incoming_files.get_mut(&item_id) {
-                    let transfer_id = format!(
-                        "recv:{}:{}",
-                        file_stream.meta.source_device_id, file_stream.meta.item_id
-                    );
-                    match std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&file_stream.archive_path)
-                        .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
-                    {
-                        Ok(()) => {
-                            file_stream.received_bytes = file_stream
-                                .received_bytes
-                                .saturating_add(bytes.len() as u64);
-                            update_transfer_progress(
-                                runtime,
-                                &transfer_id,
-                                file_stream.received_bytes,
-                                file_stream.meta.size_bytes,
-                            );
-                        }
-                        Err(error) => {
-                            mark_transfer_failed(runtime, &transfer_id, error.to_string());
-                            push_log(
-                                runtime,
-                                "WARN",
-                                &format!(
-                                    "write inbound file chunk failed item={} path={} error={}",
-                                    file_stream.meta.item_id,
-                                    file_stream.archive_path.display(),
-                                    error
-                                ),
-                            );
-                            let _ = std::fs::remove_file(&file_stream.archive_path);
-                            incoming_files.remove(&item_id);
-                        }
-                    }
-                }
-            }
-            WireBody::FileStreamEnd { item_id } => {
-                if let Some(file_stream) = incoming_files.remove(&item_id) {
-                    let transfer_id = format!(
-                        "recv:{}:{}",
-                        file_stream.meta.source_device_id, file_stream.meta.item_id
-                    );
-                    if file_stream.received_bytes != file_stream.meta.size_bytes {
-                        mark_transfer_failed(
-                            runtime,
-                            &transfer_id,
-                            format!(
-                                "文件接收不完整：已接收 {} 字节，期望 {} 字节",
-                                file_stream.received_bytes, file_stream.meta.size_bytes
-                            ),
-                        );
-                        push_log(
-                            runtime,
-                            "WARN",
-                            &format!(
-                                "incomplete inbound file stream item={} received_bytes={} expected_bytes={} peer={}",
-                                file_stream.meta.item_id,
-                                file_stream.received_bytes,
-                                file_stream.meta.size_bytes,
-                                file_stream.peer
-                            ),
-                        );
-                        let _ = std::fs::remove_file(&file_stream.archive_path);
-                        continue;
-                    }
-
-                    let item = ClipboardItem {
-                        id: file_stream.meta.item_id.clone(),
-                        content_hash: file_stream.meta.content_hash,
-                        created_at_us: file_stream.meta.created_at_us,
-                        source_device_id: file_stream.meta.source_device_id,
-                        size_bytes: file_stream.meta.size_bytes,
-                        payload: ClipboardPayload::FileBundlePath {
-                            archive_path: file_stream.archive_path,
-                            top_level_names: file_stream.meta.top_level_names,
-                        },
-                    };
-                    handle_incoming_item(runtime, &file_stream.peer, item, device_id);
-                }
-            }
             WireBody::FileStreamRawStart(meta) => {
                 receive_raw_file_stream(
                     runtime,
                     settings,
+                    &mut session,
                     &mut stream,
                     remote_addr.as_deref().unwrap_or("未知来源"),
                     meta,
                     device_id,
                 )?;
+            }
+            WireBody::FileStreamEnd(_) => {
+                return Err(anyhow::anyhow!("unexpected file stream end frame"));
             }
         }
     }
@@ -268,11 +233,16 @@ fn handle_incoming(
 fn receive_raw_file_stream(
     runtime: &RuntimeInner,
     settings: &Settings,
+    session: &mut Session,
     stream: &mut TcpStream,
     peer: &str,
     meta: FileStreamStart,
     device_id: &str,
 ) -> anyhow::Result<()> {
+    if runtime.stop_flag.load(Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("sync stopped"));
+    }
+    let _active_receive = ActiveFileReceiveGuard::acquire(runtime)?;
     let receive_started = Instant::now();
     let transfer_id = format!("recv:{}:{}", meta.source_device_id, meta.item_id);
     upsert_transfer(
@@ -299,58 +269,51 @@ fn receive_raw_file_stream(
         mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
         return Err(anyhow::anyhow!("stale inbound raw file stream"));
     }
-    if update_latest_marker(runtime, marker) {
-        prune_stale_queue_entries(runtime);
-    }
-
-    let safe_source = sanitize_file_component(&meta.source_device_id);
-    let safe_item = sanitize_file_component(&meta.item_id);
-    let safe_bundle_id = format!("{safe_source}-{safe_item}");
 
     let stream_started = Instant::now();
     let mut reader = RawFileStreamReader::new(
         runtime,
         settings,
+        session,
         stream,
-        &transfer_id,
-        meta.size_bytes,
-        file_stream_marker(&meta),
+        FileStreamTransfer::new(&transfer_id, &meta.item_id, meta.size_bytes, marker),
     );
-    let bundle_dir =
-        match clipboard::unpack_file_bundle_archive_reader(&mut reader, &safe_bundle_id) {
-            Ok(bundle_dir) => bundle_dir,
-            Err(error) => {
-                mark_transfer_failed(runtime, &transfer_id, error.to_string());
-                return Err(error.into());
-            }
-        };
+    let received_bundle = match clipboard::unpack_file_bundle_archive_reader(
+        &mut reader,
+        &meta.top_level_names,
+        settings.limits.max_item_bytes,
+    ) {
+        Ok(bundle_dir) => bundle_dir,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            return Err(error.into());
+        }
+    };
     if let Err(error) = reader.ensure_complete() {
-        let _ = std::fs::remove_dir_all(&bundle_dir);
         mark_transfer_failed(runtime, &transfer_id, error.to_string());
         return Err(error);
     }
+    let received_chunk_count = reader.chunk_count();
+    let received_digest = reader.digest_sha256();
     drop(reader);
     let stream_ms = elapsed_ms(stream_started);
 
     let end_frame_started = Instant::now();
-    match read_wire_body_from_stream(stream, settings)? {
-        Some(WireBody::FileStreamEnd { item_id }) if item_id == meta.item_id => {}
-        Some(_) => {
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            mark_transfer_failed(runtime, &transfer_id, "文件流结束帧不匹配".to_string());
-            return Err(anyhow::anyhow!("unexpected raw file stream end frame"));
+    let valid_end = match read_wire_body_from_stream(stream, settings, session)? {
+        Some(WireBody::FileStreamEnd(end)) => {
+            end.item_id == meta.item_id
+                && end.chunk_count == meta.chunk_count
+                && end.chunk_count == received_chunk_count
+                && end.digest_sha256 == received_digest
         }
-        None => {
-            let _ = std::fs::remove_dir_all(&bundle_dir);
-            mark_transfer_failed(
-                runtime,
-                &transfer_id,
-                "发送方已下线，已丢弃未完成传输".to_string(),
-            );
-            return Err(anyhow::anyhow!(
-                "sender disconnected before raw file stream end"
-            ));
-        }
+        _ => false,
+    };
+    if !valid_end {
+        mark_transfer_failed(runtime, &transfer_id, "文件流完整性校验失败".to_string());
+        return Err(anyhow::anyhow!("file stream integrity check failed"));
+    }
+    if runtime.stop_flag.load(Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("sync stopped"));
     }
     let end_frame_ms = elapsed_ms(end_frame_started);
     push_log(
@@ -369,6 +332,11 @@ fn receive_raw_file_stream(
         ),
     );
 
+    let bundle_dir = received_bundle.into_path();
+    let cleanup_payload = ClipboardPayload::FileBundleDir {
+        bundle_dir: bundle_dir.clone(),
+        top_level_names: meta.top_level_names.clone(),
+    };
     let item = ClipboardItem {
         id: meta.item_id,
         content_hash: meta.content_hash,
@@ -380,45 +348,31 @@ fn receive_raw_file_stream(
             top_level_names: meta.top_level_names,
         },
     };
-    handle_incoming_item(runtime, peer, item, device_id);
+    if !handle_incoming_item(runtime, peer, item, device_id) {
+        if let Err(error) = crate::clipboard::remove_internal_file_payload(&cleanup_payload) {
+            push_log(
+                runtime,
+                "WARN",
+                &format!("failed to remove rejected inbound file payload: {error}"),
+            );
+        }
+    }
     Ok(())
 }
 
-fn discard_incomplete_incoming_files(
+fn handle_incoming_item(
     runtime: &RuntimeInner,
-    incoming_files: &mut HashMap<String, IncomingFileStream>,
-    reason: &str,
-) {
-    for (_, file_stream) in incoming_files.drain() {
-        let _ = std::fs::remove_file(&file_stream.archive_path);
-        let transfer_id = format!(
-            "recv:{}:{}",
-            file_stream.meta.source_device_id, file_stream.meta.item_id
-        );
-        mark_transfer_failed(runtime, &transfer_id, reason.to_string());
-        push_log(
-            runtime,
-            "WARN",
-            &format!(
-                "discard incomplete inbound file item={} received_bytes={} expected_bytes={} peer={} reason={}",
-                file_stream.meta.item_id,
-                file_stream.received_bytes,
-                file_stream.meta.size_bytes,
-                file_stream.peer,
-                reason
-            ),
-        );
-    }
-}
-
-fn handle_incoming_item(runtime: &RuntimeInner, peer: &str, item: ClipboardItem, device_id: &str) {
+    peer: &str,
+    item: ClipboardItem,
+    device_id: &str,
+) -> bool {
     let canonical_transfer_id = canonical_receive_transfer_id(&item);
-    if item.source_device_id == device_id {
-        return;
+    if runtime.stop_flag.load(Ordering::SeqCst) || item.source_device_id == device_id {
+        return false;
     }
     mark_known_member(runtime, "device", &item.source_device_id);
     if should_skip_remote_item(runtime, &item) {
-        return;
+        return false;
     }
     upsert_transfer(
         runtime,
@@ -450,4 +404,5 @@ fn handle_incoming_item(runtime: &RuntimeInner, peer: &str, item: ClipboardItem,
         ),
     );
     enqueue_inbound_item(runtime, item, &canonical_transfer_id, peer);
+    true
 }

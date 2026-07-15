@@ -19,18 +19,23 @@ use super::transfers::{
 };
 use super::RuntimeInner;
 use crate::clipboard;
-use crate::protocol::ClipboardItem;
+use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub(super) fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings) -> bool {
     let mut did_work = false;
     loop {
+        if runtime.stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(mut entry) = pop_ready_queue_entry(&runtime.inbound_queue) else {
             break;
         };
         did_work = true;
         if is_stale_marker(runtime, &item_marker(&entry.item)) {
+            remove_internal_file_payload(runtime, &entry.item.payload, "drop stale inbound item");
             if let Some(transfer_id) = find_receive_transfer_id(runtime, &entry.item.id) {
                 mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
             }
@@ -53,10 +58,11 @@ pub(super) fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings)
         let apply_started = Instant::now();
         match clipboard::write_item(&entry.item, &settings.limits) {
             Ok(applied) => {
+                retire_internal_file_payload(runtime, &entry.item.payload);
                 let apply_ms = elapsed_ms(apply_started);
                 mark_shared_fingerprint(runtime, &entry.item.content_hash);
                 if let Some(local_content_hash) = applied.content_hash.as_deref() {
-                    register_ignored_local_hash(runtime, &local_content_hash);
+                    register_ignored_local_hash(runtime, local_content_hash);
                     mark_shared_fingerprint(runtime, local_content_hash);
                 }
                 if let Some(transfer_id) = transfer_id.as_deref() {
@@ -121,6 +127,11 @@ pub(super) fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings)
                     );
                     push_queue_entry(&runtime.inbound_queue, entry);
                 } else {
+                    remove_internal_file_payload(
+                        runtime,
+                        &entry.item.payload,
+                        "discard failed inbound item",
+                    );
                     if let Some(transfer_id) = transfer_id.as_deref() {
                         mark_transfer_failed(runtime, transfer_id, error.clone());
                     }
@@ -134,6 +145,11 @@ pub(super) fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings)
                 }
             }
             Err(error) => {
+                remove_internal_file_payload(
+                    runtime,
+                    &entry.item.payload,
+                    "discard invalid inbound item",
+                );
                 let apply_ms = elapsed_ms(apply_started);
                 push_log(
                     runtime,
@@ -164,6 +180,22 @@ pub(super) fn process_inbound_queue(runtime: &RuntimeInner, settings: &Settings)
     did_work
 }
 
+fn retire_internal_file_payload(runtime: &RuntimeInner, payload: &ClipboardPayload) {
+    if let Err(error) = clipboard::retire_internal_file_payload(payload) {
+        push_log(
+            runtime,
+            "WARN",
+            &format!("failed to retire applied file payload: {error}"),
+        );
+    }
+}
+
+fn remove_internal_file_payload(runtime: &RuntimeInner, payload: &ClipboardPayload, context: &str) {
+    if let Err(error) = clipboard::remove_internal_file_payload(payload) {
+        push_log(runtime, "WARN", &format!("{context}: {error}"));
+    }
+}
+
 pub(super) fn process_outbound_queue(
     runtime: &RuntimeInner,
     settings: &Settings,
@@ -171,6 +203,9 @@ pub(super) fn process_outbound_queue(
 ) -> bool {
     let mut did_work = false;
     loop {
+        if runtime.stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(mut entry) = pop_ready_outbound_entry(&runtime.outbound_queue, allowed_lanes)
         else {
             break;
@@ -186,7 +221,12 @@ pub(super) fn process_outbound_queue(
             continue;
         }
 
-        let report = send_to_all_peers(runtime, settings, &entry.item);
+        let report = send_to_all_peers(
+            runtime,
+            settings,
+            &entry.item,
+            entry.pending_peers.as_deref(),
+        );
         if report.attempted == 0 {
             clear_content_inflight(runtime, &entry.item.content_hash);
             push_log(
@@ -207,14 +247,16 @@ pub(super) fn process_outbound_queue(
             );
             continue;
         }
-        if report.delivered < report.attempted {
+        if !report.failed_peers.is_empty() {
+            entry.pending_peers = Some(report.failed_peers);
             if schedule_retry(&mut entry) {
                 push_log(
                     runtime,
                     "DEBUG",
                     &format!(
-                        "outbound item {} pending peers delivered={delivered} attempted={attempted} retry={}",
+                        "outbound item {} pending peers delivered={delivered} attempted={attempted} remaining={} retry={}",
                         entry.item.id,
+                        entry.pending_peers.as_ref().map_or(0, Vec::len),
                         entry.attempts,
                         delivered = report.delivered,
                         attempted = report.attempted

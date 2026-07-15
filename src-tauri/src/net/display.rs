@@ -11,13 +11,7 @@ pub(super) fn payload_summary(payload: &ClipboardPayload) -> String {
             }
         }
         ClipboardPayload::ImagePng { .. } => "图片 PNG".to_string(),
-        ClipboardPayload::FileBundle {
-            top_level_names, ..
-        }
-        | ClipboardPayload::FileBundlePath {
-            top_level_names, ..
-        }
-        | ClipboardPayload::FileBundleDir {
+        ClipboardPayload::FileBundleDir {
             top_level_names, ..
         }
         | ClipboardPayload::FileList {
@@ -59,13 +53,7 @@ pub(super) fn payload_label(payload: &ClipboardPayload) -> String {
     match payload {
         ClipboardPayload::Text { .. } => "直接复制文字".to_string(),
         ClipboardPayload::ImagePng { .. } => "图片".to_string(),
-        ClipboardPayload::FileBundle {
-            top_level_names, ..
-        }
-        | ClipboardPayload::FileBundlePath {
-            top_level_names, ..
-        }
-        | ClipboardPayload::FileBundleDir {
+        ClipboardPayload::FileBundleDir {
             top_level_names, ..
         }
         | ClipboardPayload::FileList {

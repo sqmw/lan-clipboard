@@ -5,6 +5,7 @@ mod net;
 mod protocol;
 mod settings;
 mod state;
+mod storage;
 
 use tauri::Manager;
 
@@ -19,7 +20,6 @@ pub fn run() {
             let _ = desktop::ensure_tray_icon(app);
             desktop::hide_main_window(app);
         }))
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None::<Vec<&str>>,
@@ -34,10 +34,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::set_settings,
-            commands::read_clipboard_snapshot,
-            commands::write_clipboard_item,
-            commands::start_sync,
-            commands::stop_sync,
+            commands::generate_pairing_key,
             commands::sync_status,
             commands::discover_devices,
             commands::cached_devices,
@@ -45,7 +42,6 @@ pub fn run() {
             commands::get_runtime_logs,
             commands::get_transfer_progress,
             commands::clear_runtime_logs,
-            commands::ensure_desktop_shell,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

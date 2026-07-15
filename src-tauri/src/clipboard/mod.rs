@@ -3,22 +3,23 @@ use crate::settings::SizeLimits;
 use std::thread;
 use std::time::Duration;
 
+mod file_access;
 mod files;
 mod fingerprint;
 mod image_payload;
+mod path_policy;
 mod platform;
 mod rich_text;
 mod types;
 
-use files::{
-    encode_file_bundle_payload, read_file_list, write_file_bundle, write_file_bundle_from_dir,
-    write_file_bundle_from_path,
-};
+use files::{encode_file_bundle_payload, read_file_list, write_file_bundle_from_dir};
 pub(crate) use files::{
-    is_internal_file_payload, stream_file_bundle_archive, unpack_file_bundle_archive_reader,
+    is_internal_file_payload, remove_internal_file_payload, retire_internal_file_payload,
+    stream_file_bundle_archive, unpack_file_bundle_archive_reader,
 };
 pub(crate) use fingerprint::payload_content_hash;
 use image_payload::{encode_image_payload, read_image_payload, write_image_payload};
+pub(crate) use platform::clipboard_change_token;
 use rich_text::{read_rich_text_payload, write_rich_text_payload};
 use types::AppliedClipboardWrite;
 pub use types::ClipboardError;
@@ -58,7 +59,7 @@ fn read_snapshot_once(limits: &SizeLimits) -> Result<ClipboardPayload, Clipboard
     }
 
     if let Ok(text) = clipboard.get_text() {
-        let size_bytes = text.as_bytes().len() as u64;
+        let size_bytes = text.len() as u64;
         if size_bytes > limits.max_item_bytes {
             return Err(ClipboardError::TooLarge {
                 size_bytes,
@@ -102,18 +103,10 @@ fn write_item_once(
             write_image_payload(png_bytes, limits)?;
             Ok(AppliedClipboardWrite::default())
         }
-        ClipboardPayload::FileBundle {
-            archive_bytes,
-            top_level_names,
-        } => write_file_bundle(item, archive_bytes, top_level_names, limits),
-        ClipboardPayload::FileBundlePath {
-            archive_path,
-            top_level_names,
-        } => write_file_bundle_from_path(item, archive_path, top_level_names, limits),
         ClipboardPayload::FileBundleDir {
             bundle_dir,
             top_level_names,
-        } => write_file_bundle_from_dir(bundle_dir, top_level_names),
+        } => write_file_bundle_from_dir(bundle_dir, top_level_names, limits),
         ClipboardPayload::FileList { .. } => Err(ClipboardError::Unsupported),
         ClipboardPayload::Html { html } => {
             write_rich_text_payload("html", html)?;

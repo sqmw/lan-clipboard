@@ -1,22 +1,41 @@
+use super::crypto::discovery_domain_id_from_secret;
 use super::presence::PresenceConfig;
+use super::socket::connect_tcp_from;
 use super::{DiscoveredDevice, NetworkInterfaceOption};
 use crate::settings::Settings;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::collections::{HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub(super) const SERVICE_TYPE: &str = "_lan-clipboard._tcp.local.";
 pub(super) const UDP_DISCOVERY_PORT: u16 = 32911;
+pub(super) const DISCOVERED_DEVICE_LIMIT: usize = 100;
+pub(super) const DEVICE_NAME_MAX_BYTES: usize = 128;
+const MDNS_RESOLVED_EVENT_LIMIT: usize = 256;
+const DISCOVERY_REACHABILITY_WORKER_LIMIT: usize = 8;
 const DISCOVERY_REACHABILITY_TIMEOUT_MS: u64 = 220;
+const DISCOVERY_REACHABILITY_MAX_BUDGET_MS: u64 = 400;
+const DISCOVERY_SHUTDOWN_EVENT_LIMIT: usize = 64;
+const DISCOVERY_SHUTDOWN_BUDGET_MS: u64 = 100;
 
 pub(super) fn build_service_info(config: &PresenceConfig) -> anyhow::Result<ServiceInfo> {
+    if !is_valid_device_id(&config.device_id)
+        || !is_valid_discovery_domain_id(&config.domain_id)
+        || config.listen_port < 1024
+    {
+        return Err(anyhow::anyhow!("invalid local discovery identity"));
+    }
+    let device_name = normalize_device_name(&config.device_name)
+        .ok_or_else(|| anyhow::anyhow!("invalid local discovery device name"))?;
     let local_ip = resolve_local_ip_override(&config.local_ip)?.unwrap_or(pick_local_ip()?);
     let host_name = format!("lan-clipboard-{}.local.", config.device_id);
     let properties = [
         ("device_id", config.device_id.as_str()),
-        ("shared_code", config.shared_code.as_str()),
-        ("device_name", config.device_name.as_str()),
+        ("domain_id", config.domain_id.as_str()),
+        ("device_name", device_name.as_str()),
     ];
     Ok(ServiceInfo::new(
         SERVICE_TYPE,
@@ -30,37 +49,61 @@ pub(super) fn build_service_info(config: &PresenceConfig) -> anyhow::Result<Serv
 
 pub fn discover_devices(
     device_id: &str,
-    shared_code: &str,
+    shared_secret: &str,
     selected_local_ip: Option<&str>,
     timeout_ms: u64,
 ) -> anyhow::Result<Vec<DiscoveredDevice>> {
+    let started_at = Instant::now();
+    let total_budget = Duration::from_millis(timeout_ms);
+    let deadline = started_at + total_budget;
+    let reachability_budget =
+        Duration::from_millis((timeout_ms / 3).min(DISCOVERY_REACHABILITY_MAX_BUDGET_MS));
+    let shutdown_budget = Duration::from_millis(
+        timeout_ms
+            .saturating_sub(reachability_budget.as_millis() as u64)
+            .min(DISCOVERY_SHUTDOWN_BUDGET_MS),
+    );
+    let browse_budget = total_budget
+        .saturating_sub(reachability_budget)
+        .saturating_sub(shutdown_budget);
+    let browse_deadline = started_at + browse_budget;
+    let shutdown_deadline = browse_deadline + shutdown_budget;
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut devices = Vec::new();
     let mut seen = HashSet::new();
+    let mut resolved_events = 0usize;
     let selected_ipv4 = parse_selected_ipv4(selected_local_ip)?;
+    let domain_id = discovery_domain_id_from_secret(shared_secret);
 
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+    while Instant::now() < browse_deadline {
+        let remaining = browse_deadline.saturating_duration_since(Instant::now());
         let event = match receiver.recv_timeout(remaining) {
             Ok(value) => value,
             Err(_) => break,
         };
         if let ServiceEvent::ServiceResolved(info) = event {
-            if let Some(found) = info_to_device(&info, device_id, shared_code, selected_ipv4) {
+            resolved_events += 1;
+            if resolved_events > MDNS_RESOLVED_EVENT_LIMIT {
+                break;
+            }
+            if let Some(found) = info_to_device(&info, device_id, &domain_id, selected_ipv4) {
                 let dedupe_key = format!("{}:{}:{}", found.device_id, found.addr, found.port);
                 if seen.insert(dedupe_key) {
                     devices.push(found);
+                    if devices.len() >= DISCOVERED_DEVICE_LIMIT {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    shutdown_discovery_daemon(&mdns, receiver);
+    shutdown_discovery_daemon(&mdns, receiver, shutdown_deadline);
     Ok(filter_reachable_discovered_devices(
         devices,
-        DISCOVERY_REACHABILITY_TIMEOUT_MS,
+        selected_ipv4,
+        deadline,
     ))
 }
 
@@ -155,7 +198,7 @@ pub(super) fn filter_devices_for_local_ip(
 
     devices
         .into_iter()
-        .filter(|device| device_matches_selected_subnet(device, selected_ipv4))
+        .filter(|device| device_matches_selected_scope(device, selected_ipv4))
         .collect()
 }
 
@@ -232,10 +275,14 @@ pub(super) fn parse_selected_ipv4(
     }
 }
 
-pub(super) fn is_same_subnet(left: std::net::Ipv4Addr, right: std::net::Ipv4Addr) -> bool {
-    let left = left.octets();
-    let right = right.octets();
-    left[0] == right[0] && left[1] == right[1] && left[2] == right[2]
+pub(super) fn is_same_lan_scope(left: std::net::Ipv4Addr, right: std::net::Ipv4Addr) -> bool {
+    match (private_lan_scope(left), private_lan_scope(right)) {
+        (Some(left_scope), Some(right_scope)) => left_scope == right_scope,
+        (Some(_), None) | (None, Some(_)) => false,
+        // Without an OS-provided netmask, non-RFC1918 addresses are not
+        // prefiltered. Source binding and the reachability probe are decisive.
+        (None, None) => true,
+    }
 }
 
 pub(super) fn is_usable_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
@@ -248,102 +295,236 @@ pub(super) fn is_usable_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
 }
 
 pub(super) fn is_private_lan_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
-    let [a, b, _, _] = ipv4.octets();
-    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+    private_lan_scope(ipv4).is_some()
 }
 
-pub(super) fn device_matches_selected_subnet(
+pub(super) fn device_matches_selected_scope(
     device: &DiscoveredDevice,
     selected_ipv4: std::net::Ipv4Addr,
 ) -> bool {
     device
         .addr
         .parse::<std::net::Ipv4Addr>()
-        .map(|peer_ipv4| is_same_subnet(selected_ipv4, peer_ipv4))
+        .map(|peer_ipv4| is_same_lan_scope(selected_ipv4, peer_ipv4))
         .unwrap_or(false)
+}
+
+fn private_lan_scope(ipv4: std::net::Ipv4Addr) -> Option<u8> {
+    let [a, b, _, _] = ipv4.octets();
+    if a == 10 {
+        Some(10)
+    } else if a == 172 && (16..=31).contains(&b) {
+        Some(172)
+    } else if a == 192 && b == 168 {
+        Some(192)
+    } else {
+        None
+    }
 }
 
 fn filter_reachable_discovered_devices(
     devices: Vec<DiscoveredDevice>,
-    timeout_ms: u64,
+    selected_local_ip: Option<std::net::Ipv4Addr>,
+    deadline: Instant,
 ) -> Vec<DiscoveredDevice> {
-    let handles = devices
-        .into_iter()
-        .map(|device| {
-            std::thread::spawn(move || {
-                if discovered_device_is_reachable(&device, timeout_ms) {
-                    Some(device)
-                } else {
-                    None
+    let selected_local_ip = selected_local_ip.map(|ip| ip.to_string());
+    filter_reachable_with(devices, deadline, move |device, remaining| {
+        discovered_device_is_reachable(
+            device,
+            selected_local_ip.as_deref(),
+            remaining.min(Duration::from_millis(DISCOVERY_REACHABILITY_TIMEOUT_MS)),
+        )
+    })
+}
+
+fn filter_reachable_with<F>(
+    devices: Vec<DiscoveredDevice>,
+    deadline: Instant,
+    is_reachable: F,
+) -> Vec<DiscoveredDevice>
+where
+    F: Fn(&DiscoveredDevice, Duration) -> bool + Send + Sync + 'static,
+{
+    let worker_count = devices.len().min(DISCOVERY_REACHABILITY_WORKER_LIMIT);
+    if worker_count == 0 {
+        return Vec::new();
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(devices)));
+    let reachable = Arc::new(Mutex::new(Vec::new()));
+    let is_reachable = Arc::new(is_reachable);
+    let handles = (0..worker_count)
+        .map(|_| {
+            let queue = Arc::clone(&queue);
+            let reachable = Arc::clone(&reachable);
+            let is_reachable = Arc::clone(&is_reachable);
+            std::thread::spawn(move || loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                let device = match queue.lock() {
+                    Ok(mut queue) => queue.pop_front(),
+                    Err(_) => return,
+                };
+                let Some(device) = device else {
+                    return;
+                };
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                if is_reachable(&device, remaining) {
+                    if let Ok(mut reachable) = reachable.lock() {
+                        reachable.push(device);
+                    } else {
+                        return;
+                    }
                 }
             })
         })
         .collect::<Vec<_>>();
 
-    handles
-        .into_iter()
-        .filter_map(|handle| handle.join().ok().flatten())
-        .collect()
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let mut devices = reachable
+        .lock()
+        .map(|devices| devices.clone())
+        .unwrap_or_default();
+    devices.sort_by(|left, right| {
+        left.device_name
+            .cmp(&right.device_name)
+            .then_with(|| left.device_id.cmp(&right.device_id))
+    });
+    devices
 }
 
-fn discovered_device_is_reachable(device: &DiscoveredDevice, timeout_ms: u64) -> bool {
+fn discovered_device_is_reachable(
+    device: &DiscoveredDevice,
+    selected_local_ip: Option<&str>,
+    timeout: Duration,
+) -> bool {
     let Ok(ip) = device.addr.parse::<IpAddr>() else {
         return false;
     };
     let socket_addr = SocketAddr::new(ip, device.port);
-    TcpStream::connect_timeout(&socket_addr, Duration::from_millis(timeout_ms)).is_ok()
+    connect_tcp_from(&socket_addr, selected_local_ip, timeout).is_ok()
 }
 
-fn shutdown_discovery_daemon(mdns: &ServiceDaemon, receiver: mdns_sd::Receiver<ServiceEvent>) {
+fn shutdown_discovery_daemon(
+    mdns: &ServiceDaemon,
+    receiver: mdns_sd::Receiver<ServiceEvent>,
+    deadline: Instant,
+) {
     let _ = mdns.stop_browse(SERVICE_TYPE);
-    while let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
+    for _ in 0..DISCOVERY_SHUTDOWN_EVENT_LIMIT {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(event) = receiver.recv_timeout(remaining.min(Duration::from_millis(100))) else {
+            break;
+        };
         if matches!(event, ServiceEvent::SearchStopped(_)) {
             break;
         }
     }
     if let Ok(status_rx) = mdns.shutdown() {
-        let _ = status_rx.recv_timeout(Duration::from_millis(300));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = status_rx.recv_timeout(remaining);
+        }
     }
 }
 
 fn info_to_device(
     info: &ServiceInfo,
     self_device_id: &str,
-    shared_code: &str,
+    domain_id: &str,
     selected_local_ip: Option<std::net::Ipv4Addr>,
 ) -> Option<DiscoveredDevice> {
     let device_id = info.get_fullname().split('.').next()?.to_string();
-    if device_id == self_device_id {
+    let property_device_id = info.get_properties().get_property_val_str("device_id")?;
+    if device_id != property_device_id
+        || device_id == self_device_id
+        || !is_valid_device_id(&device_id)
+        || info.get_port() < 1024
+    {
         return None;
     }
 
-    let found_shared_code = info
+    let found_domain_id = info
         .get_properties()
-        .get_property_val_str("shared_code")
+        .get_property_val_str("domain_id")
         .unwrap_or("");
-    if found_shared_code != shared_code {
+    if found_domain_id != domain_id
+        || !is_valid_discovery_domain_id(found_domain_id)
+        || !is_valid_discovery_domain_id(domain_id)
+    {
         return None;
     }
 
     let addr = pick_ipv4(info.get_addresses())?;
     if let Some(selected_ipv4) = selected_local_ip {
         let addr_ipv4: std::net::Ipv4Addr = addr.parse().ok()?;
-        if !is_same_subnet(selected_ipv4, addr_ipv4) {
+        if !is_same_lan_scope(selected_ipv4, addr_ipv4) {
             return None;
         }
     }
-    let device_name = info
-        .get_properties()
-        .get_property_val_str("device_name")
-        .unwrap_or("局域网设备")
-        .to_string();
+    let device_name = normalize_device_name(
+        info.get_properties()
+            .get_property_val_str("device_name")
+            .unwrap_or_default(),
+    )?;
 
-    Some(DiscoveredDevice {
+    let device = DiscoveredDevice {
         device_id,
         device_name,
         addr,
         port: info.get_port(),
-    })
+    };
+    validate_discovered_device(&device).then_some(device)
+}
+
+pub(super) fn is_valid_device_id(value: &str) -> bool {
+    value.len() == 36
+        && Uuid::parse_str(value)
+            .map(|uuid| !uuid.is_nil() && uuid.hyphenated().to_string() == value)
+            .unwrap_or(false)
+}
+
+pub(super) fn is_valid_discovery_domain_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(super) fn normalize_device_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()
+        && trimmed.len() <= DEVICE_NAME_MAX_BYTES
+        && !trimmed.chars().any(char::is_control))
+    .then(|| trimmed.to_string())
+}
+
+pub(super) fn validate_discovered_device(device: &DiscoveredDevice) -> bool {
+    if !is_valid_device_id(&device.device_id)
+        || normalize_device_name(&device.device_name).as_deref()
+            != Some(device.device_name.as_str())
+        || device.port < 1024
+    {
+        return false;
+    }
+    device
+        .addr
+        .parse::<IpAddr>()
+        .map(|address| match address {
+            IpAddr::V4(ipv4) => is_usable_ipv4(ipv4),
+            IpAddr::V6(_) => false,
+        })
+        .unwrap_or(false)
 }
 
 fn pick_ipv4(addresses: &HashSet<IpAddr>) -> Option<String> {
@@ -372,7 +553,7 @@ fn is_likely_virtual_interface(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     #[cfg(target_os = "windows")]
     {
-        return lower.contains("vethernet")
+        lower.contains("vethernet")
             || lower.contains("hyper-v")
             || lower.contains("virtual")
             || lower.contains("vmware")
@@ -382,7 +563,7 @@ fn is_likely_virtual_interface(name: &str) -> bool {
             || lower.contains("hamachi")
             || lower.contains("tap")
             || lower.contains("tun")
-            || lower.contains("loopback");
+            || lower.contains("loopback")
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -430,4 +611,114 @@ fn is_benchmark_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
 fn is_multicast_ipv4(ipv4: std::net::Ipv4Addr) -> bool {
     let [a, _, _, _] = ipv4.octets();
     (224..=239).contains(&a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_device(index: usize) -> DiscoveredDevice {
+        DiscoveredDevice {
+            device_id: Uuid::from_u128(index as u128 + 1).hyphenated().to_string(),
+            device_name: format!("device-{index}"),
+            addr: "192.168.1.20".to_string(),
+            port: 32910,
+        }
+    }
+
+    #[test]
+    fn validates_discovery_identity_fields() {
+        assert!(is_valid_device_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!is_valid_device_id("550E8400-E29B-41D4-A716-446655440000"));
+        assert!(!is_valid_device_id("not-a-uuid"));
+        assert!(is_valid_discovery_domain_id(
+            "0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_valid_discovery_domain_id(
+            "0123456789ABCDEF0123456789ABCDEF"
+        ));
+        assert_eq!(normalize_device_name(" laptop ").as_deref(), Some("laptop"));
+        assert!(normalize_device_name("bad\nname").is_none());
+        assert!(normalize_device_name(&"x".repeat(DEVICE_NAME_MAX_BYTES + 1)).is_none());
+    }
+
+    #[test]
+    fn validates_complete_discovered_device() {
+        assert!(validate_discovered_device(&test_device(1)));
+        let mut invalid = test_device(2);
+        invalid.port = 0;
+        assert!(!validate_discovered_device(&invalid));
+        invalid = test_device(3);
+        invalid.addr = "127.0.0.1".to_string();
+        assert!(!validate_discovered_device(&invalid));
+    }
+
+    #[test]
+    fn private_scope_prefilter_does_not_assume_a_slash_24_netmask() {
+        assert!(is_same_lan_scope(
+            "10.20.1.4".parse().expect("left /16 address"),
+            "10.20.200.9".parse().expect("right /16 address"),
+        ));
+        assert!(is_same_lan_scope(
+            "192.168.0.4".parse().expect("left /23 address"),
+            "192.168.1.9".parse().expect("right /23 address"),
+        ));
+        assert!(!is_same_lan_scope(
+            "10.20.1.4".parse().expect("10/8 address"),
+            "192.168.1.9".parse().expect("192.168/16 address"),
+        ));
+        assert!(is_same_lan_scope(
+            "100.64.0.4".parse().expect("non-RFC1918 left address"),
+            "100.64.8.9".parse().expect("non-RFC1918 right address"),
+        ));
+    }
+
+    #[test]
+    fn reachability_probe_uses_bounded_worker_pool() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let active_for_probe = Arc::clone(&active);
+        let peak_for_probe = Arc::clone(&peak);
+        let devices = (0..32).map(test_device).collect::<Vec<_>>();
+
+        let found = filter_reachable_with(
+            devices,
+            Instant::now() + Duration::from_secs(1),
+            move |_, _| {
+                let current = active_for_probe.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_for_probe.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+                active_for_probe.fetch_sub(1, Ordering::SeqCst);
+                true
+            },
+        );
+
+        assert_eq!(found.len(), 32);
+        assert!(peak.load(Ordering::SeqCst) <= DISCOVERY_REACHABILITY_WORKER_LIMIT);
+    }
+
+    #[test]
+    fn reachability_probe_stops_dequeuing_when_total_budget_expires() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_probe = Arc::clone(&attempts);
+        let devices = (0..DISCOVERED_DEVICE_LIMIT)
+            .map(test_device)
+            .collect::<Vec<_>>();
+        let started_at = Instant::now();
+
+        let found = filter_reachable_with(
+            devices,
+            started_at + Duration::from_millis(30),
+            move |_, remaining| {
+                attempts_for_probe.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining.min(Duration::from_millis(30)));
+                false
+            },
+        );
+
+        assert!(found.is_empty());
+        assert!(attempts.load(Ordering::SeqCst) <= DISCOVERY_REACHABILITY_WORKER_LIMIT);
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+    }
 }
