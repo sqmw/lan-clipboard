@@ -5,10 +5,10 @@
   --line: #d1d1d6;
   --line-strong: #c7c7cc;
   --text: #1c1c1e;
-  --text-secondary: #8e8e93;
-  --accent: #007aff;
-  --accent-hover: #0051d5;
-  --success: #34c759;
+  --text-secondary: #636366;
+  --accent: #0066cc;
+  --accent-hover: #004f9e;
+  --success: #1f7a38;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
   --shadow-hover: 0 4px 12px rgba(0, 0, 0, 0.12);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;

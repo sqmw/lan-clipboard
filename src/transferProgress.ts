@@ -47,19 +47,20 @@ export function renderTransferProgress(
       transferPreviewScrollTops.set(id, element.scrollTop);
     }
   });
+  pruneTransferUiState(transfers);
   if (!transfers.length) {
     container.innerHTML = `<p class="empty-members">${escapeHtml(t("app.transfer.empty"))}</p>`;
     transferPreviewScrollTops.clear();
     return;
   }
 
-  pruneTransferUiState(transfers);
   container.innerHTML = transfers.map(renderTransferCard).join("");
   bindTransferPreviewToggles(container, transfers);
   bindTransferPreviewScroll(container);
 }
 
 function renderTransferCard(transfer: TransferProgress): string {
+  const percent = Math.max(0, Math.min(100, Number.isFinite(transfer.percent) ? transfer.percent : 0));
   const error = transfer.error ? `<p class="transfer-error">${escapeHtml(transfer.error)}</p>` : "";
   return `
     <article class="transfer-card">
@@ -75,7 +76,9 @@ function renderTransferCard(transfer: TransferProgress): string {
           transfer.total_bytes,
         )}`,
       )}</p>
-      <div class="transfer-bar"><span style="width: ${transfer.percent}%"></span></div>
+      <progress class="transfer-bar" aria-label="${escapeHtml(
+        t("app.transfer.progress_label"),
+      )}" max="100" value="${percent}">${percent}%</progress>
       <p class="transfer-meta">${escapeHtml(renderTransferStatsLine(transfer))}</p>
       ${error}
     </article>
@@ -92,6 +95,11 @@ function pruneTransferUiState(transfers: TransferProgress[]): void {
   transferPreviewScrollTops.forEach((_, id) => {
     if (!activeTransferIds.has(id)) {
       transferPreviewScrollTops.delete(id);
+    }
+  });
+  transferStatsById.forEach((_, id) => {
+    if (!activeTransferIds.has(id)) {
+      transferStatsById.delete(id);
     }
   });
 }
@@ -116,11 +124,14 @@ function bindTransferPreviewScroll(container: HTMLElement): void {
     const id = element.dataset.transferId;
     if (!id) return;
     element.scrollTop = transferPreviewScrollTops.get(id) ?? 0;
-    element.addEventListener("mouseenter", () => holdTransferPreviewRefresh());
-    element.addEventListener("mouseleave", () => releaseTransferPreviewRefresh());
-    element.addEventListener("focus", () => holdTransferPreviewRefresh());
-    element.addEventListener("blur", () => releaseTransferPreviewRefresh(150));
-    element.addEventListener("wheel", () => holdTransferPreviewRefresh(), { passive: true });
+    element.addEventListener(
+      "wheel",
+      () => {
+        holdTransferPreviewRefresh();
+        releaseTransferPreviewRefresh(250);
+      },
+      { passive: true },
+    );
     element.addEventListener("scroll", () => {
       holdTransferPreviewRefresh();
       transferPreviewScrollTops.set(id, element.scrollTop);

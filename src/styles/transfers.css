@@ -129,6 +129,9 @@
 }
 
 .transfer-bar {
+  display: block;
+  appearance: none;
+  border: 0;
   margin-top: 8px;
   width: 100%;
   height: 7px;
@@ -137,9 +140,16 @@
   overflow: hidden;
 }
 
-.transfer-bar span {
-  display: block;
-  height: 100%;
+.transfer-bar::-webkit-progress-bar {
+  background: #e9edf5;
+}
+
+.transfer-bar::-webkit-progress-value {
   border-radius: 999px;
-  background: linear-gradient(90deg, #4a90ff 0%, #007aff 100%);
+  background: linear-gradient(90deg, #3984e6 0%, var(--accent) 100%);
+}
+
+.transfer-bar::-moz-progress-bar {
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3984e6 0%, var(--accent) 100%);
 }

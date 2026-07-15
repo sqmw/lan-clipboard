@@ -19,13 +19,26 @@ export type Settings = {
   };
 };
 
+export type SettingsUpdate = {
+  max_item_bytes: number;
+  shared_code: string;
+  local_ip: string;
+  language: string;
+  launch_at_login: boolean;
+};
+
+export type SettingsNotice = {
+  kind: "legacy_pairing_migrated" | "invalid_settings_recovered";
+  backup_file: string;
+};
+
 export type RuntimeStatus = {
   running: boolean;
   device_id: string;
   device_name: string;
   local_ip?: string | null;
-  shared_code: string;
   last_error: string | null;
+  settings_notice: SettingsNotice | null;
   recent_log_count: number;
   peer_count: number;
 };

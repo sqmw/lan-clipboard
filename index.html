@@ -29,8 +29,8 @@
                 </div>
                 <div class="connect-box connect-list">
                     <div class="label" id="i18n-devices-label">设备列表</div>
-                    <div id="discovered-devices"></div>
-                    <p class="list-feedback" id="scan-feedback">
+                    <div id="discovered-devices" role="region" aria-labelledby="i18n-devices-label"></div>
+                    <p class="list-feedback" id="scan-feedback" role="status" aria-live="polite" aria-atomic="true">
                         当前没有发现其他共享域成员。
                     </p>
                 </div>
@@ -47,18 +47,26 @@
                         <span class="status-label" id="i18n-status-label"
                             >状态</span
                         >
-                        <strong id="status-running">-</strong>
+                        <strong id="status-running" role="status" aria-live="polite">-</strong>
                     </article>
                     <article class="status-card">
                         <span class="status-label" id="i18n-members-label"
                             >共享域成员（含本机）</span
                         >
-                        <strong id="status-peer-count">-</strong>
+                        <strong id="status-peer-count" role="status" aria-live="polite">-</strong>
                     </article>
                 </div>
+                <p
+                    class="list-feedback"
+                    id="runtime-notice"
+                    role="alert"
+                    aria-live="assertive"
+                    aria-atomic="true"
+                    hidden
+                ></p>
                 <div class="connect-box connect-list">
                     <div class="label" id="i18n-transfer-label">传输进度</div>
-                    <div id="transfer-progress-list"></div>
+                    <div id="transfer-progress-list" role="region" aria-labelledby="i18n-transfer-label"></div>
                 </div>
             </section>
 
@@ -74,36 +82,55 @@
                         class="primary-button"
                         id="save-settings"
                         type="button"
+                        disabled
                     >
                         保存配置
                     </button>
                 </div>
                 <div class="settings-grid">
                     <label>
-                        <span id="i18n-shared-code-label">共享码</span>
-                        <input
-                            id="shared-code"
-                            placeholder="6位数字"
-                            maxlength="6"
-                            inputmode="numeric"
-                        />
+                        <span id="i18n-shared-code-label">配对密钥</span>
+                        <span class="inline-form">
+                            <input
+                                id="shared-code"
+                                placeholder="26 位配对密钥"
+                                maxlength="31"
+                                pattern="[A-HJ-NP-Z2-9]{26}"
+                                inputmode="text"
+                                autocomplete="off"
+                                autocapitalize="characters"
+                                spellcheck="false"
+                                aria-describedby="i18n-settings-hint config-feedback"
+                                disabled
+                            />
+                            <button
+                                class="ghost-button"
+                                id="generate-pairing-key"
+                                type="button"
+                                disabled
+                            >
+                                生成 / 轮换
+                            </button>
+                        </span>
                     </label>
                     <label>
                         <span id="i18n-language-label">语言</span>
-                        <select id="language"></select>
+                        <select id="language" disabled></select>
                     </label>
                     <label>
                         <span id="i18n-network-label">使用网络</span>
-                        <select id="network-ip"></select>
+                        <select id="network-ip" disabled></select>
                     </label>
                     <label>
                         <span id="i18n-max-mb-label">最大发送大小（MB）</span>
                         <input
                             id="max-item-mb"
                             type="number"
-                            min="1"
+                            min="0.00000095367431640625"
                             max="1000"
-                            step="1"
+                            step="any"
+                            required
+                            disabled
                         />
                     </label>
                 </div>
@@ -124,7 +151,7 @@
                             >
                         </span>
                         <span class="switch">
-                            <input id="launch-at-login" type="checkbox" />
+                            <input id="launch-at-login" type="checkbox" disabled />
                             <span
                                 class="switch-slider"
                                 aria-hidden="true"
@@ -133,11 +160,11 @@
                     </label>
                 </div>
                 <p class="hint" id="i18n-settings-hint">
-                    推荐家庭或小团队共用一个 6
-                    位码；同网段内填写相同共享码的设备都会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。
+                    只与可信设备共享同一个 26
+                    位配对密钥；密钥相同的设备会加入同一个共享域。多网卡场景可明确指定使用哪一个本机网络。
                 </p>
-                <p class="save-feedback" id="config-feedback">
-                    修改共享码、同步配置或高级设置后，点击“保存配置”才会生效。
+                <p class="save-feedback" id="config-feedback" role="status" aria-live="polite" aria-atomic="true">
+                    修改配对密钥、同步配置或高级设置后，点击“保存配置”才会生效。
                 </p>
                 <details class="advanced">
                     <summary id="i18n-advanced-summary">高级 / 日志</summary>
@@ -147,12 +174,13 @@
                             <span
                                 class="compact-toggle-label"
                                 id="i18n-encrypt-label"
-                                >加密传输（加密会降低速度）</span
+                                >强制加密传输（安全协议要求）</span
                             >
                             <span class="switch">
                                 <input
                                     id="encryption-enabled"
                                     type="checkbox"
+                                    disabled
                                 />
                                 <span
                                     class="switch-slider"

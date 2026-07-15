@@ -1,10 +1,15 @@
 import { t } from "./i18n";
 import { escapeHtml } from "./html";
 import { isPrivateIpv4 } from "./deviceList";
-import type { NetworkInterfaceOption, Settings } from "./types";
+import type { NetworkInterfaceOption, Settings, SettingsUpdate } from "./types";
 
-const MIN_MAX_ITEM_MB = 1;
-const MAX_MAX_ITEM_MB = 1000;
+const BYTES_PER_MIB = 1024 * 1024;
+const MIN_MAX_ITEM_BYTES = 1;
+const MAX_MAX_ITEM_BYTES = 1000 * BYTES_PER_MIB;
+const MIN_SHARED_CODE_UNIQUE_CHARACTERS = 10;
+const OBVIOUS_SEQUENCE_LENGTH = 8;
+const SHARED_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const SHARED_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{26}$/;
 
 export function getInput(id: string): HTMLInputElement {
   return document.querySelector(`#${id}`) as HTMLInputElement;
@@ -15,11 +20,11 @@ export function getText(id: string): HTMLElement {
 }
 
 export function populateSettingsForm(settings: Settings): { selectedNetworkIp: string; language: string } {
-  getInput("encryption-enabled").checked = settings.security.encryption_enabled;
+  getInput("encryption-enabled").checked = true;
+  getInput("encryption-enabled").disabled = true;
   getInput("launch-at-login").checked = Boolean(settings.ui?.launch_at_login);
   getInput("shared-code").value = settings.sync.shared_code;
-  const mb = Math.max(1, Math.round(settings.limits.max_item_bytes / (1024 * 1024)));
-  getInput("max-item-mb").value = String(mb);
+  getInput("max-item-mb").value = formatMaxItemMib(settings.limits.max_item_bytes);
   return {
     selectedNetworkIp: settings.sync.local_ip,
     language: (settings.ui?.language || "auto").trim() || "auto",
@@ -61,6 +66,7 @@ export function applyI18nStatic(): void {
   setText("i18n-settings-kicker", "app.settings.kicker");
   setText("i18n-settings-title", "app.settings.title");
   setText("save-settings", "app.settings.save");
+  setText("generate-pairing-key", "app.settings.generate_key");
   setText("i18n-shared-code-label", "app.settings.shared_code");
   setText("i18n-network-label", "app.settings.network");
   setText("i18n-max-mb-label", "app.settings.max_mb");
@@ -88,7 +94,7 @@ export function renderNetworkOptions(
 ): void {
   const select = document.querySelector("#network-ip") as HTMLSelectElement;
   const normalized = selectedIp.trim();
-  const effectiveSelected = normalized || recommendedIp || "";
+  const effectiveSelected = normalized;
   const orderedOptions = [...networkOptions].sort((left, right) =>
     compareNetworkOptions(left, right, effectiveSelected, activeIp, recommendedIp),
   );
@@ -112,35 +118,16 @@ export function renderNetworkOptions(
   select.innerHTML = options.join("");
 }
 
-export function collectSettings(settings: Settings): Settings {
-  const mb = Number(getInput("max-item-mb").value);
-  const normalizedMb = Math.max(
-    MIN_MAX_ITEM_MB,
-    Math.min(MAX_MAX_ITEM_MB, Number.isFinite(mb) ? Math.round(mb) : MIN_MAX_ITEM_MB),
-  );
-  getInput("max-item-mb").value = String(normalizedMb);
-  const max_item_bytes = normalizedMb * 1024 * 1024;
+export function collectSettingsUpdate(_settings: Settings): SettingsUpdate {
+  const max_item_bytes = readMaxItemBytes();
+  getInput("max-item-mb").value = formatMaxItemMib(max_item_bytes);
 
   return {
-    ...settings,
-    limits: {
-      max_item_bytes,
-    },
-    sync: {
-      ...settings.sync,
-      shared_code: getInput("shared-code").value.trim(),
-      enabled: true,
-      local_ip: (document.querySelector("#network-ip") as HTMLSelectElement).value.trim(),
-    },
-    security: {
-      ...settings.security,
-      encryption_enabled: getInput("encryption-enabled").checked,
-    },
-    ui: {
-      ...settings.ui,
-      language: (document.querySelector("#language") as HTMLSelectElement).value.trim() || "auto",
-      launch_at_login: getInput("launch-at-login").checked,
-    },
+    max_item_bytes,
+    shared_code: normalizeSharedCode(getInput("shared-code").value),
+    local_ip: (document.querySelector("#network-ip") as HTMLSelectElement).value.trim(),
+    language: (document.querySelector("#language") as HTMLSelectElement).value.trim() || "auto",
+    launch_at_login: getInput("launch-at-login").checked,
   };
 }
 
@@ -149,13 +136,114 @@ export function markConfigDirty(): void {
 }
 
 export function validateSharedCode(): boolean {
-  const code = getInput("shared-code").value.trim();
-  if (!/^\d{6}$/.test(code)) {
+  const input = getInput("shared-code");
+  const code = normalizeSharedCode(input.value);
+  input.value = code;
+  if (!SHARED_CODE_PATTERN.test(code)) {
+    input.setAttribute("aria-invalid", "true");
     getText("scan-feedback").textContent = t("app.settings.code_invalid");
     getText("config-feedback").textContent = t("app.settings.code_invalid_save");
     return false;
   }
+  if (!isStrongSharedCode(code)) {
+    input.setAttribute("aria-invalid", "true");
+    getText("scan-feedback").textContent = t("app.settings.code_weak");
+    getText("config-feedback").textContent = t("app.settings.code_weak_save");
+    return false;
+  }
+  input.setAttribute("aria-invalid", "false");
   return true;
+}
+
+export function validateMaxItemSize(): boolean {
+  const input = getInput("max-item-mb");
+  try {
+    readMaxItemBytes();
+    input.setAttribute("aria-invalid", "false");
+    return true;
+  } catch {
+    input.setAttribute("aria-invalid", "true");
+    getText("config-feedback").textContent = t("app.settings.max_mb_invalid");
+    return false;
+  }
+}
+
+export function normalizeSharedCode(value: string): string {
+  return value.replace(/[\s-]+/g, "").toUpperCase();
+}
+
+export function isStrongSharedCode(value: string): boolean {
+  // This is only an obvious-pattern filter, not an entropy estimate. Keys
+  // generated by the backend get their unpredictability from its CSPRNG.
+  if (new Set(value).size < MIN_SHARED_CODE_UNIQUE_CHARACTERS) {
+    return false;
+  }
+  for (let period = 1; period < value.length; period += 1) {
+    let repeats = true;
+    for (let index = period; index < value.length; index += 1) {
+      if (value[index] !== value[index % period]) {
+        repeats = false;
+        break;
+      }
+    }
+    if (repeats) {
+      return false;
+    }
+  }
+  return !hasObviousAlphabetSequence(value);
+}
+
+function hasObviousAlphabetSequence(value: string): boolean {
+  const indices = [...value].map((character) => SHARED_CODE_ALPHABET.indexOf(character));
+  if (indices.some((index) => index < 0)) {
+    return true;
+  }
+  for (let start = 0; start + OBVIOUS_SEQUENCE_LENGTH <= indices.length; start += 1) {
+    const window = indices.slice(start, start + OBVIOUS_SEQUENCE_LENGTH);
+    const ascending = window
+      .slice(1)
+      .every(
+        (index, offset) =>
+          index === (window[offset] + 1) % SHARED_CODE_ALPHABET.length,
+      );
+    const descending = window
+      .slice(1)
+      .every(
+        (index, offset) =>
+          index ===
+          (window[offset] + SHARED_CODE_ALPHABET.length - 1) % SHARED_CODE_ALPHABET.length,
+      );
+    if (ascending || descending) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readMaxItemBytes(): number {
+  const input = getInput("max-item-mb");
+  if (!input.value.trim()) {
+    throw new Error("max item size is required");
+  }
+  const requestedMib = input.valueAsNumber;
+  const requestedBytes = requestedMib * BYTES_PER_MIB;
+  if (
+    !Number.isFinite(requestedMib) ||
+    !Number.isFinite(requestedBytes) ||
+    requestedBytes < MIN_MAX_ITEM_BYTES ||
+    requestedBytes > MAX_MAX_ITEM_BYTES
+  ) {
+    throw new Error("max item size is outside the supported range");
+  }
+  const roundedBytes = Math.round(requestedBytes);
+  if (!Number.isSafeInteger(roundedBytes)) {
+    throw new Error("max item size cannot be represented safely");
+  }
+  return roundedBytes;
+}
+
+function formatMaxItemMib(bytes: number): string {
+  return (bytes / BYTES_PER_MIB).toFixed(20).replace(/\.?0+$/, "");
 }
 
 function compareNetworkOptions(

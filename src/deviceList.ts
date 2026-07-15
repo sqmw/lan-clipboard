@@ -98,6 +98,12 @@ export function discoveredDevices(): DiscoveredDevice[] {
   return lastDiscovered.values();
 }
 
+export function clearDiscoveredDevices(): void {
+  lastDiscovered.clear();
+  membersExpanded = false;
+  resetDeviceRenderCache();
+}
+
 export function resetDeviceRenderCache(): void {
   lastDevicesKey = "";
   lastRenderedSelfKey = "";
@@ -106,7 +112,10 @@ export function resetDeviceRenderCache(): void {
 export function renderDevices(context: DeviceRenderContext): number {
   const devices = lastDiscovered.values();
   const observedMemberCount = Math.max(1, devices.length + 1);
-  context.memberCount.textContent = `${t("app.status.members")}: ${observedMemberCount}`;
+  const memberCountText = `${t("app.status.members")}: ${observedMemberCount}`;
+  if (context.memberCount.textContent !== memberCountText) {
+    context.memberCount.textContent = memberCountText;
+  }
 
   const selfName = getLocalDeviceDisplayName(context.status, context.settings);
   const selfIp = context.status?.local_ip?.trim();
@@ -166,14 +175,16 @@ export function selectRecommendedNetworkIp(
   networkOptions: NetworkInterfaceOption[],
   status: RuntimeStatus | null,
 ): string {
-  const peerSubnets = new Set(
+  const peerScopes = new Set(
     lastDiscovered
       .values()
-      .map((device) => subnetKey(device.addr))
+      .map((device) => privateLanScopeKey(device.addr))
       .filter((value): value is string => Boolean(value)),
   );
-  if (peerSubnets.size > 0) {
-    const matching = networkOptions.find((option) => peerSubnets.has(subnetKey(option.ip)));
+  if (peerScopes.size > 0) {
+    const matching = networkOptions.find((option) =>
+      peerScopes.has(privateLanScopeKey(option.ip)),
+    );
     if (matching) {
       return matching.ip;
     }
@@ -181,27 +192,33 @@ export function selectRecommendedNetworkIp(
   return status?.local_ip?.trim() || "";
 }
 
-export function subnetKey(ip: string): string {
-  const parts = ip.trim().split(".");
-  if (parts.length !== 4) {
+export function privateLanScopeKey(ip: string): string {
+  const parts = ip.trim().split(".").map(Number);
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
     return "";
   }
-  return parts.slice(0, 3).join(".");
+  const [a, b] = parts;
+  if (a === 10) return "rfc1918-10";
+  if (a === 172 && b >= 16 && b <= 31) return "rfc1918-172";
+  if (a === 192 && b === 168) return "rfc1918-192";
+  // Do not invent a subnet for non-RFC1918 addresses without a real netmask.
+  return "";
 }
 
 export function isPrivateIpv4(ip: string): boolean {
-  const parts = ip.trim().split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => Number.isNaN(part))) {
-    return false;
-  }
-  const [a, b] = parts;
-  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  return Boolean(privateLanScopeKey(ip));
 }
 
 function updateDeviceFeedback(feedback: HTMLElement, remoteCount: number): void {
-  feedback.textContent = remoteCount
+  const message = remoteCount
     ? t("app.domain.online_total", { count: remoteCount + 1 })
     : t("app.domain.only_self");
+  if (feedback.textContent !== message) {
+    feedback.textContent = message;
+  }
 }
 
 function renderDeviceRow(title: string, subtitle: string, tag: string, className = ""): string {
