@@ -299,20 +299,26 @@ fn receive_raw_file_stream(
     let stream_ms = elapsed_ms(stream_started);
 
     let end_frame_started = Instant::now();
-    let valid_end = match read_wire_body_from_stream(stream, settings, session)? {
-        Some(WireBody::FileStreamEnd(end)) => {
+    let valid_end = match read_wire_body_from_stream(stream, settings, session) {
+        Ok(Some(WireBody::FileStreamEnd(end))) => {
             end.item_id == meta.item_id
                 && end.chunk_count == meta.chunk_count
                 && end.chunk_count == received_chunk_count
                 && end.digest_sha256 == received_digest
         }
-        _ => false,
+        Ok(_) => false,
+        Err(error) => {
+            let message = format!("文件流结束通知丢失: {error}");
+            mark_transfer_failed(runtime, &transfer_id, message);
+            return Err(error);
+        }
     };
     if !valid_end {
         mark_transfer_failed(runtime, &transfer_id, "文件流完整性校验失败".to_string());
         return Err(anyhow::anyhow!("file stream integrity check failed"));
     }
     if runtime.stop_flag.load(Ordering::SeqCst) {
+        mark_transfer_failed(runtime, &transfer_id, "同步已停止".to_string());
         return Err(anyhow::anyhow!("sync stopped"));
     }
     let end_frame_ms = elapsed_ms(end_frame_started);
