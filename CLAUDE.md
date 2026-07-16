@@ -26,7 +26,7 @@
 
 ## 不变量
 
-- 当前应用 `2.0.0` / TCP `v5`；不与 `v4` 互通，不允许明文 fallback。
+- 当前应用 `2.0.1` / TCP `v5`；不与 `v4` 互通，不允许明文 fallback。
 - 本机 `ClipboardPayload` 可含路径但不实现 serde；线上 DTO 永远不能包含 `PathBuf`。
 - 每条 TCP 连接必须先完成固定长度 PSK 握手，再读取任何长度前缀。
 - `source_device_id`、session、control sequence、transfer UUID 和 chunk index 必须绑定验证。
