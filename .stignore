@@ -11,12 +11,14 @@ Thumbs.db
 Desktop.ini
 
 # Frontend / packaging outputs
-node_modules/
-dist/
+(?d)node_modules/
+(?d)dist/
+.pnpm-store/
+pnpm-workspace.yaml
 
 # Rust / Tauri generated artifacts
-src-tauri/target/
-src-tauri/gen/schemas/
+(?d)src-tauri/target/
+(?d)src-tauri/gen/schemas/
 
 # Logs and temp files
 *.log

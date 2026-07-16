@@ -13,15 +13,17 @@ Keep this repo synced from macOS to the Windows build machine through the existi
 - macOS mode:
   `sendonly`
 - Windows target host:
-  `19519@192.168.0.106`
+  `sunqin_lenovo_2026@192.168.124.233`
 - Windows target path:
-  `F:\language\rust\code\lan-clipboard`
+  `D:\language\rust\code\lan-clipboard`
 - Windows mode:
   `receiveonly`
 
 ## Device IDs
 
-- Windows:
+- Current Windows:
+  `FJ2K2WT-VOS463P-4HZSNCL-AUWFWRY-P6STDGG-Z4YPR3Z-U4ITU22-42G5UQM`
+- Historical Windows:
   `AZ6L4MU-4PCBRJY-3P3TJR7-C7GF2FM-MHHLFNG-QU3I5MJ-4UW4UOX-7BFPNQC`
 - macOS:
   `LNTEQPR-BYQRI4J-MPO573U-WOJHQVZ-RNSSOM7-H3NFZSM-PSW4ZDL-RMKREAX`
@@ -50,24 +52,52 @@ ssh 19519@192.168.0.106 "powershell -ExecutionPolicy Bypass -File C:\\Users\\195
 ## Verification
 
 - Windows `config.xml` contains folder `lan-clipboard-src`
-- Windows path `F:\language\rust\code\lan-clipboard` exists
+- Windows path `D:\language\rust\code\lan-clipboard` exists
 - Syncthing GUI on Windows shows the folder and remote peer connected
 - a file created under this repo on macOS appears on Windows after sync
 
-## Current Blocker
+## Ignore Rules
 
-As of `2026-05-16`, Windows already contains the new folder entry, but the device session is not staying connected.
+Windows is a build machine, so generated local artifacts must stay ignored and deletable.
 
-Observed evidence on Windows:
+- Use `(?d)` for ignored build directories that Syncthing may need to delete after the macOS sender removes or does not have them.
+- Current important ignored generated paths:
+  `node_modules/`
+  `dist/`
+  `src-tauri/target/`
+  `src-tauri/gen/schemas/`
+  `.pnpm-store/`
+  `pnpm-workspace.yaml`
 
-- `lan-clipboard-src` is present in `config.xml`
-- `F:\language\rust\code\lan-clipboard` has been created
-- Syncthing REST status for `lan-clipboard-src` is `idle` with `globalTotalItems = 0`
-- the device connection to the Mac is currently `connected = false`
-- `syncthing.log` shows the reconnect is being broken by an existing folder mismatch:
-  `codex-global-agents` fails with `remote expects to exchange plain data, but local data is encrypted`
+## Current Status
 
-Implication:
+As of `2026-07-10`, new Lenovo Windows is connected and this folder is configured as receive-only.
 
-- this repo's Syncthing folder is configured on Windows
-- actual file transfer will not start until the pre-existing `codex-global-agents` encryption mismatch is resolved or that folder is paused/removed from the pair
+Observed evidence:
+
+- macOS and `DESKTOP-F4B6E6C` are connected.
+- `lan-clipboard-src` exists on Windows at `D:\language\rust\code\lan-clipboard`.
+- Windows mode is `receiveonly`.
+- A build created `src-tauri\target` and local `pnpm-workspace.yaml`; Syncthing reported that `src-tauri\target` needed a deletable ignore prefix.
+- `.stignore` was updated so generated build directories use `(?d)` and the local pnpm approval file is ignored.
+- After the ignore fix, the remaining Windows-side Syncthing error was not a missing ignore rule: `pnpm tauri dev` was still running and `target\debug\lan-clipboard.exe` was locked, so Syncthing could not delete the previously indexed `src-tauri\target` directory. Stop the dev process or close the running app, then rescan `lan-clipboard-src`.
+- On `2026-07-10`, after the app process was stopped, the remaining `src-tauri\target` cache was still hard to delete in place. The folder was temporarily paused in Syncthing, then the stale target directory was moved out of the synced tree to:
+  `D:\build-cache\syncthing-quarantine\lan-clipboard\target-20260710-154707`
+- Final verification on Windows after rescan:
+  `state=idle`
+  `errors=0`
+  `needFiles=0`
+  `localChanged=0`
+
+## Build Artifact Recovery
+
+If Windows build output makes `lan-clipboard-src` appear locally changed again:
+
+1. Stop the running Tauri app or dev command first.
+2. Keep generated output ignored through `.stignore`; `src-tauri/target/` must keep the `(?d)` prefix.
+3. If Windows cannot delete `src-tauri\target` in place, move it to a non-synced cache or quarantine directory such as:
+   `D:\build-cache\syncthing-quarantine\lan-clipboard\...`
+4. Trigger a Syncthing rescan for `lan-clipboard-src` and verify:
+   `errors=0`
+   `needFiles=0`
+   `localChanged=0`
