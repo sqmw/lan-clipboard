@@ -20,8 +20,6 @@ export function getText(id: string): HTMLElement {
 }
 
 export function populateSettingsForm(settings: Settings): { selectedNetworkIp: string; language: string } {
-  getInput("encryption-enabled").checked = true;
-  getInput("encryption-enabled").disabled = true;
   getInput("launch-at-login").checked = Boolean(settings.ui?.launch_at_login);
   getInput("shared-code").value = settings.sync.shared_code;
   getInput("max-item-mb").value = formatMaxItemMib(settings.limits.max_item_bytes);
@@ -79,6 +77,7 @@ export function applyI18nStatic(): void {
   setText("i18n-advanced-summary", "app.advanced.summary");
   setText("i18n-security-title", "app.security.title");
   setText("i18n-encrypt-label", "app.security.encrypt");
+  setText("i18n-encrypt-status", "app.security.status");
   setText("i18n-logs-title", "app.logs.title");
   setText("refresh-logs", "app.logs.refresh");
   setText("clear-logs", "app.logs.clear");

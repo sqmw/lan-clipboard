@@ -87,7 +87,7 @@
 - 设置使用同目录临时文件、`fsync` 和原子替换；Unix 文件权限为 `0600`。
 - 旧 6 位共享码升级时，原文件先备份为 `settings.legacy-v3*.json`，再生成新密钥。
 - JSON 损坏或验证失败时，原字节先备份为 `settings.invalid-v4*.json`，再恢复安全默认配置。
-- UI 只能提交 `SettingsUpdate` 中的用户字段，不能覆盖 device UUID、监听端口、轮询参数或安全开关。
+- UI 只能提交 `SettingsUpdate` 中的用户字段，不能覆盖 device UUID、监听端口、轮询参数或安全开关；加密状态仅以只读徽标展示。
 - 运行时重配失败会回滚旧设置和旧运行状态；保存成功后再更新内存 revision。
 - autostart 与 JSON 分属 OS/后端两个提交点；IPC 报错后先回读核验全部用户字段，确定未提交才回滚 OS 状态，无法核验时明确报告未知状态与回滚结果。
 

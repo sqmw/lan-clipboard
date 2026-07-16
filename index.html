@@ -139,7 +139,7 @@
                     <label class="compact-toggle-row">
                         <span class="compact-toggle-copy">
                             <span
-                                class="compact-toggle-label"
+                                class="compact-status-label"
                                 id="i18n-launch-at-login-label"
                                 >开机启动</span
                             >
@@ -170,24 +170,14 @@
                     <summary id="i18n-advanced-summary">高级 / 日志</summary>
                     <div class="panel-sub">
                         <h3 id="i18n-security-title">高级加密</h3>
-                        <label class="compact-toggle-row">
+                        <div class="compact-status-row" role="status">
                             <span
                                 class="compact-toggle-label"
                                 id="i18n-encrypt-label"
-                                >强制加密传输（安全协议要求）</span
+                                >加密传输（v4 协议要求）</span
                             >
-                            <span class="switch">
-                                <input
-                                    id="encryption-enabled"
-                                    type="checkbox"
-                                    disabled
-                                />
-                                <span
-                                    class="switch-slider"
-                                    aria-hidden="true"
-                                ></span>
-                            </span>
-                        </label>
+                            <span class="status-chip" id="i18n-encrypt-status">已启用</span>
+                        </div>
                     </div>
                     <div class="panel-sub">
                         <h3 id="i18n-logs-title">运行日志</h3>
