@@ -14,8 +14,8 @@ use super::transfers::{
     upsert_transfer, TransferProgress,
 };
 use super::wire::{
-    encode_wire_message, write_wire_body_to_stream, FileStreamEnd, FileStreamStart, WireBody,
-    RAW_PAYLOAD_PLAIN_BYTES,
+    encode_wire_message, write_wire_body_to_stream, FileStreamStart, ImageStreamStart,
+    PayloadStreamEnd, WireBody, RAW_PAYLOAD_PLAIN_BYTES,
 };
 use super::{collect_peer_targets, remember_active_local_ip, RuntimeInner};
 use crate::clipboard;
@@ -144,8 +144,14 @@ pub(super) fn send_to_all_peers(
         .unwrap_or_else(|| collect_peer_targets(runtime, settings));
     peers.sort();
     peers.dedup();
-    if matches!(item.payload, ClipboardPayload::FileList { .. }) {
-        return send_file_list_to_all_peers(runtime, settings, item, peers);
+    match item.payload {
+        ClipboardPayload::FileList { .. } => {
+            return send_file_list_to_all_peers(runtime, settings, item, peers)
+        }
+        ClipboardPayload::ImagePng { .. } => {
+            return send_image_to_all_peers(runtime, settings, item, peers)
+        }
+        _ => {}
     }
 
     let attempted = peers.len();
@@ -199,6 +205,43 @@ fn send_file_list_to_all_peers(
         ),
     );
 
+    BroadcastReport {
+        attempted,
+        delivered,
+        failed_peers,
+        deferred: false,
+    }
+}
+
+fn send_image_to_all_peers(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    item: &ClipboardItem,
+    peers: Vec<String>,
+) -> BroadcastReport {
+    let attempted = peers.len();
+    if attempted == 0 {
+        return BroadcastReport {
+            attempted,
+            delivered: 0,
+            failed_peers: Vec::new(),
+            deferred: false,
+        };
+    }
+    let (delivered, failed_peers) = run_peer_workers(peers, |peer| {
+        send_image_to_peer(runtime, settings, item, peer)
+    });
+    if delivered > 0 {
+        mark_shared_fingerprint(runtime, &item.content_hash);
+    }
+    push_log(
+        runtime,
+        "DEBUG",
+        &format!(
+            "image stream completed item={} delivered={} attempted={}",
+            item.id, delivered, attempted
+        ),
+    );
     BroadcastReport {
         attempted,
         delivered,
@@ -304,6 +347,181 @@ fn send_payload_to_peer(
         );
         false
     }
+}
+
+fn send_image_to_peer(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    item: &ClipboardItem,
+    peer: &str,
+) -> bool {
+    let ClipboardPayload::ImagePng { png_bytes } = &item.payload else {
+        return false;
+    };
+    let send_started = Instant::now();
+    let socket_addr: SocketAddr = match peer.parse() {
+        Ok(socket_addr) => socket_addr,
+        Err(error) => {
+            push_log(
+                runtime,
+                "WARN",
+                &format!("skip bad image peer addr peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    let transfer_id = send_transfer_id(peer, item);
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "send".to_string(),
+            peer: peer.to_string(),
+            item_kind: item.payload.kind().to_string(),
+            item_label: payload_label(&item.payload),
+            item_summary: payload_summary(&item.payload),
+            item_id: item.id.clone(),
+            transferred_bytes: 0,
+            total_bytes: item.size_bytes,
+            percent: 0,
+            status: "sending".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
+    let connect_started = Instant::now();
+    let mut stream = match connect_tcp_from(
+        &socket_addr,
+        Some(&settings.sync.local_ip),
+        Duration::from_millis(CONNECT_TIMEOUT_MS),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("connect image peer failed peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    let connect_ms = elapsed_ms(connect_started);
+    let _connection_guard = match register_outbound_connection(runtime, &stream) {
+        Ok(guard) => guard,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            return false;
+        }
+    };
+    if let Ok(local_addr) = stream.local_addr() {
+        remember_active_local_ip(runtime, local_addr.ip());
+    }
+    let mut session = match client_handshake(
+        &mut stream,
+        &settings.sync.shared_code,
+        &settings.sync_device_id(),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("image peer handshake failed peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    tune_stream_for_send(&stream, item.size_bytes);
+    let start = WireBody::ImageStreamRawStart(ImageStreamStart {
+        item_id: item.id.clone(),
+        content_hash: item.content_hash.clone(),
+        created_at_us: item.created_at_us,
+        source_device_id: item.source_device_id.clone(),
+        size_bytes: item.size_bytes,
+        chunk_count: item.size_bytes.div_ceil(RAW_PAYLOAD_PLAIN_BYTES as u64),
+    });
+    if let Err(error) = write_wire_body_to_stream(&mut stream, settings, &mut session, &start) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!("stream image start failed peer={peer} error={error}"),
+        );
+        return false;
+    }
+
+    let stream_started = Instant::now();
+    let stream_result = {
+        let transfer =
+            FileStreamTransfer::new(&transfer_id, &item.id, item.size_bytes, item_marker(item));
+        let mut writer =
+            FileStreamNetworkWriter::new(runtime, settings, &session, &mut stream, transfer);
+        (|| -> anyhow::Result<CompletedFileStream> {
+            writer.write_all(png_bytes)?;
+            writer.finish()?;
+            if writer.sent_bytes() != item.size_bytes {
+                return Err(anyhow::anyhow!(
+                    "streamed image size mismatch: sent {} bytes, expected {} bytes",
+                    writer.sent_bytes(),
+                    item.size_bytes
+                ));
+            }
+            Ok(CompletedFileStream {
+                chunk_count: writer.frame_count(),
+                digest_sha256: writer.digest_sha256(),
+            })
+        })()
+    };
+    let stream_result = match stream_result {
+        Ok(result) => result,
+        Err(error) => {
+            mark_transfer_failed(runtime, &transfer_id, error.to_string());
+            push_log(
+                runtime,
+                "DEBUG",
+                &format!("stream image payload failed peer={peer} error={error}"),
+            );
+            return false;
+        }
+    };
+    if let Err(error) = write_wire_body_to_stream(
+        &mut stream,
+        settings,
+        &mut session,
+        &WireBody::PayloadStreamEnd(PayloadStreamEnd {
+            item_id: item.id.clone(),
+            chunk_count: stream_result.chunk_count,
+            digest_sha256: stream_result.digest_sha256,
+        }),
+    ) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        push_log(
+            runtime,
+            "DEBUG",
+            &format!("stream image end failed peer={peer} error={error}"),
+        );
+        return false;
+    }
+    mark_transfer_completed(runtime, &transfer_id);
+    mark_known_member(runtime, "addr", peer);
+    push_log(
+        runtime,
+        "DEBUG",
+        &format!(
+            "profile image_send item={} peer={} encryption={} size_bytes={} connect_ms={} stream_ms={} total_ms={} throughput_mib_s={}",
+            item.id,
+            peer,
+            settings.security.encryption_enabled,
+            item.size_bytes,
+            connect_ms,
+            elapsed_ms(stream_started),
+            elapsed_ms(send_started),
+            format_mib_per_second(item.size_bytes, elapsed_ms(stream_started)),
+        ),
+    );
+    true
 }
 
 fn send_file_list_to_peer(
@@ -455,7 +673,7 @@ fn send_file_list_to_peer(
         &mut stream,
         settings,
         &mut session,
-        &WireBody::FileStreamEnd(FileStreamEnd {
+        &WireBody::PayloadStreamEnd(PayloadStreamEnd {
             item_id: item.id.clone(),
             chunk_count: stream_result.chunk_count,
             digest_sha256: stream_result.digest_sha256,

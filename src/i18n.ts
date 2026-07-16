@@ -42,7 +42,8 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.network.auto": "自动选择最合适的局域网网络",
     "app.settings.network.recommended": "推荐",
     "app.settings.network.active": "当前使用",
-    "app.settings.max_mb": "最大发送大小（MB）",
+    "app.settings.max_mb": "最大同步内容大小（MB）",
+    "app.settings.max_mb_hint": "文件受此设置限制；PNG 图片还有 80 MB 解码安全边界。",
     "app.settings.language": "语言",
     "app.settings.startup": "后台与启动",
     "app.settings.launch_at_login": "开机启动",
@@ -73,7 +74,7 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.launch_restored": "系统开机启动状态已恢复为保存前状态。",
     "app.settings.launch_unchanged": "系统开机启动状态未发生变化。",
     "app.settings.max_mb_invalid":
-      "最大发送大小必须填写为至少 1 字节且不超过 1000 MB 的有效数值，配置未保存。",
+      "最大同步内容大小必须填写为至少 1 字节且不超过 1000 MB 的有效数值，配置未保存。",
     "app.settings.code_invalid": "配对密钥必须是 26 位大写字母或数字（不含 I、O、0、1）。",
     "app.settings.code_invalid_save": "配对密钥格式无效，配置未保存。",
     "app.settings.code_weak": "配对密钥强度不足，请使用应用生成的随机密钥。",
@@ -81,7 +82,7 @@ const DICTS: Record<Locale, Dict> = {
 
     "app.advanced.summary": "高级 / 日志",
     "app.security.title": "高级加密",
-    "app.security.encrypt": "加密传输（v4 协议要求）",
+    "app.security.encrypt": "加密传输（v5 协议要求）",
     "app.security.status": "已启用",
     "app.logs.title": "运行日志",
     "app.logs.refresh": "刷新",
@@ -173,7 +174,8 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.network.auto": "Auto select best LAN network",
     "app.settings.network.recommended": "Recommended",
     "app.settings.network.active": "In use",
-    "app.settings.max_mb": "Max send size (MB)",
+    "app.settings.max_mb": "Maximum sync content size (MB)",
+    "app.settings.max_mb_hint": "Files use this limit; PNG images also have an 80 MB decode safety boundary.",
     "app.settings.language": "Language",
     "app.settings.startup": "Background & Startup",
     "app.settings.launch_at_login": "Launch at login",
@@ -209,7 +211,7 @@ const DICTS: Record<Locale, Dict> = {
     "app.settings.launch_restored": "Launch at login was restored to its previous state.",
     "app.settings.launch_unchanged": "Launch at login was unchanged.",
     "app.settings.max_mb_invalid":
-      "Max send size must be a valid value from 1 byte through 1000 MB. Settings were not saved.",
+      "Maximum sync content size must be a valid value from 1 byte through 1000 MB. Settings were not saved.",
     "app.settings.code_invalid":
       "Pairing key must be 26 uppercase letters or digits (excluding I, O, 0, and 1).",
     "app.settings.code_invalid_save": "Invalid pairing key. Settings were not saved.",
@@ -219,7 +221,7 @@ const DICTS: Record<Locale, Dict> = {
 
     "app.advanced.summary": "Advanced / Logs",
     "app.security.title": "Encryption",
-    "app.security.encrypt": "Encrypted transfers (required by v4)",
+    "app.security.encrypt": "Encrypted transfers (required by v5)",
     "app.security.status": "Enabled",
     "app.logs.title": "Runtime Logs",
     "app.logs.refresh": "Refresh",

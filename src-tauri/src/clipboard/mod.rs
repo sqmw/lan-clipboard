@@ -18,6 +18,7 @@ pub(crate) use files::{
     stream_file_bundle_archive, unpack_file_bundle_archive_reader,
 };
 pub(crate) use fingerprint::payload_content_hash;
+pub(crate) use image_payload::MAX_IMAGE_SOURCE_BYTES;
 use image_payload::{encode_image_payload, read_image_payload, write_image_payload};
 pub(crate) use platform::clipboard_change_token;
 use rich_text::{read_rich_text_payload, write_rich_text_payload};

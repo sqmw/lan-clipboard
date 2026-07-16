@@ -1,4 +1,4 @@
-use super::wire::FileStreamStart;
+use super::wire::{FileStreamStart, ImageStreamStart};
 use super::RuntimeInner;
 use crate::protocol::ClipboardItem;
 
@@ -18,6 +18,14 @@ pub(super) fn item_marker(item: &ClipboardItem) -> ItemMarker {
 }
 
 pub(super) fn file_stream_marker(meta: &FileStreamStart) -> ItemMarker {
+    ItemMarker {
+        id: meta.item_id.clone(),
+        created_at_us: meta.created_at_us,
+        source_device_id: meta.source_device_id.clone(),
+    }
+}
+
+pub(super) fn image_stream_marker(meta: &ImageStreamStart) -> ItemMarker {
     ItemMarker {
         id: meta.item_id.clone(),
         created_at_us: meta.created_at_us,

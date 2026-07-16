@@ -9,8 +9,8 @@ use std::net::TcpStream;
 use std::time::Instant;
 use uuid::Uuid;
 
-const HANDSHAKE_MAGIC: [u8; 4] = *b"LCB4";
-const HANDSHAKE_VERSION: u8 = 4;
+const HANDSHAKE_MAGIC: [u8; 4] = *b"LCB5";
+const HANDSHAKE_VERSION: u8 = 5;
 const CHALLENGE_KIND: u8 = 1;
 const RESPONSE_KIND: u8 = 2;
 const ACK_KIND: u8 = 3;
@@ -25,9 +25,9 @@ const CHALLENGE_BYTES: usize = CHALLENGE_PREFIX_BYTES + MAC_BYTES;
 const RESPONSE_BYTES: usize = RESPONSE_PREFIX_BYTES + MAC_BYTES;
 const ACK_BYTES: usize = ACK_PREFIX_BYTES + MAC_BYTES;
 const TRANSCRIPT_BYTES: usize = CHALLENGE_BYTES + RESPONSE_BYTES;
-const CHALLENGE_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/challenge/v4";
-const RESPONSE_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/response/v4";
-const ACK_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/ack/v4";
+const CHALLENGE_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/challenge/v5";
+const RESPONSE_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/response/v5";
+const ACK_MAC_CONTEXT: &[u8] = b"lan-clipboard/handshake/ack/v5";
 
 type HmacSha256 = Hmac<Sha256>;
 

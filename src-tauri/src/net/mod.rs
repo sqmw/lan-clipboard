@@ -192,7 +192,7 @@ impl SyncEngine {
     pub fn start(&self, settings: Settings, device_id: String) -> anyhow::Result<()> {
         if !settings.security.encryption_enabled {
             return Err(anyhow::anyhow!(
-                "protocol v4 requires encrypted authenticated sessions"
+                "protocol v5 requires encrypted authenticated sessions"
             ));
         }
         if self.inner.running.load(Ordering::SeqCst) {
@@ -215,7 +215,7 @@ impl SyncEngine {
         self.log(
             "INFO",
             &format!(
-                "sync starting protocol=v4 port={} encryption={}",
+                "sync starting protocol=v5 port={} encryption={}",
                 settings.sync.listen_port, settings.security.encryption_enabled
             ),
         );

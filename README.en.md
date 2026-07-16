@@ -65,7 +65,7 @@
 Additional note:
 If the same file or clipboard content is copied repeatedly in a short burst, the app guarantees only the first effective sync. Later duplicate copies are dropped before send to reduce loop risk and avoid wasting bandwidth.
 
-Upgrading from `1.x / v3` to `2.0.0 / v4` requires upgrading every device and pairing again. The old six-digit-code settings are backed up before migration; old and new protocols do not interoperate and never downgrade to plaintext.
+Upgrading from `1.x / v3` or `v4` to `2.0.0 / v5` requires upgrading every device. `v4` devices can keep the same 26-character pairing key; old six-digit-code settings are backed up before migration. Old and new protocols do not interoperate and never downgrade to plaintext.
 
 ## 📚 Docs
 

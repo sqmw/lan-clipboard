@@ -2,7 +2,7 @@ use super::display::{file_stream_label, file_stream_summary, payload_label, payl
 use super::file_stream::{FileStreamTransfer, RawFileStreamReader};
 use super::handshake::{server_handshake, Session};
 use super::logs::{push_log, set_error};
-use super::marker::{file_stream_marker, is_stale_marker};
+use super::marker::{file_stream_marker, image_stream_marker, is_stale_marker};
 use super::members::mark_known_member;
 use super::metrics::{elapsed_ms, format_mib_per_second, now_ms};
 use super::socket::tune_stream_for_receive;
@@ -10,7 +10,8 @@ use super::transfers::{
     canonical_receive_transfer_id, mark_transfer_failed, upsert_transfer, TransferProgress,
 };
 use super::wire::{
-    decode_wire_body_bytes, read_wire_body_from_stream, read_wire_frame, FileStreamStart, WireBody,
+    decode_wire_body_bytes, read_wire_body_from_stream, read_wire_frame, FileStreamStart,
+    ImageStreamStart, WireBody,
 };
 use super::{
     enqueue_inbound_item, remember_active_local_ip, should_skip_remote_item, RuntimeInner,
@@ -18,6 +19,7 @@ use super::{
 use crate::clipboard;
 use crate::protocol::{ClipboardItem, ClipboardPayload};
 use crate::settings::Settings;
+use std::io::Read;
 use std::net::{IpAddr, Shutdown, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,7 +27,7 @@ use std::time::Instant;
 
 const MAX_INCOMING_CONNECTIONS: usize = 16;
 const MAX_INCOMING_CONNECTIONS_PER_IP: usize = 4;
-const MAX_ACTIVE_FILE_RECEIVES: usize = 2;
+const MAX_ACTIVE_PAYLOAD_RECEIVES: usize = 2;
 
 struct IncomingConnectionGuard {
     runtime: Arc<RuntimeInner>,
@@ -40,26 +42,26 @@ impl Drop for IncomingConnectionGuard {
     }
 }
 
-struct ActiveFileReceiveGuard<'a> {
+struct ActivePayloadReceiveGuard<'a> {
     runtime: &'a RuntimeInner,
 }
 
-impl<'a> ActiveFileReceiveGuard<'a> {
+impl<'a> ActivePayloadReceiveGuard<'a> {
     fn acquire(runtime: &'a RuntimeInner) -> anyhow::Result<Self> {
         runtime
-            .active_file_receives
+            .active_payload_receives
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_ACTIVE_FILE_RECEIVES).then_some(active + 1)
+                (active < MAX_ACTIVE_PAYLOAD_RECEIVES).then_some(active + 1)
             })
-            .map_err(|_| anyhow::anyhow!("concurrent file receive limit reached"))?;
+            .map_err(|_| anyhow::anyhow!("concurrent payload receive limit reached"))?;
         Ok(Self { runtime })
     }
 }
 
-impl Drop for ActiveFileReceiveGuard<'_> {
+impl Drop for ActivePayloadReceiveGuard<'_> {
     fn drop(&mut self) {
         self.runtime
-            .active_file_receives
+            .active_payload_receives
             .fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -222,8 +224,19 @@ fn handle_incoming(
                     device_id,
                 )?;
             }
-            WireBody::FileStreamEnd(_) => {
-                return Err(anyhow::anyhow!("unexpected file stream end frame"));
+            WireBody::ImageStreamRawStart(meta) => {
+                receive_raw_image_stream(
+                    runtime,
+                    settings,
+                    &mut session,
+                    &mut stream,
+                    remote_addr.as_deref().unwrap_or("未知来源"),
+                    meta,
+                    device_id,
+                )?;
+            }
+            WireBody::PayloadStreamEnd(_) => {
+                return Err(anyhow::anyhow!("unexpected payload stream end frame"));
             }
         }
     }
@@ -242,7 +255,7 @@ fn receive_raw_file_stream(
     if runtime.stop_flag.load(Ordering::SeqCst) {
         return Err(anyhow::anyhow!("sync stopped"));
     }
-    let _active_receive = ActiveFileReceiveGuard::acquire(runtime)?;
+    let _active_receive = ActivePayloadReceiveGuard::acquire(runtime)?;
     let receive_started = Instant::now();
     let transfer_id = format!("recv:{}:{}", meta.source_device_id, meta.item_id);
     upsert_transfer(
@@ -300,7 +313,7 @@ fn receive_raw_file_stream(
 
     let end_frame_started = Instant::now();
     let valid_end = match read_wire_body_from_stream(stream, settings, session) {
-        Ok(Some(WireBody::FileStreamEnd(end))) => {
+        Ok(Some(WireBody::PayloadStreamEnd(end))) => {
             end.item_id == meta.item_id
                 && end.chunk_count == meta.chunk_count
                 && end.chunk_count == received_chunk_count
@@ -363,6 +376,118 @@ fn receive_raw_file_stream(
             );
         }
     }
+    Ok(())
+}
+
+fn receive_raw_image_stream(
+    runtime: &RuntimeInner,
+    settings: &Settings,
+    session: &mut Session,
+    stream: &mut TcpStream,
+    peer: &str,
+    meta: ImageStreamStart,
+    device_id: &str,
+) -> anyhow::Result<()> {
+    if runtime.stop_flag.load(Ordering::SeqCst) {
+        return Err(anyhow::anyhow!("sync stopped"));
+    }
+    let _active_receive = ActivePayloadReceiveGuard::acquire(runtime)?;
+    let transfer_id = format!("recv:{}:{}", meta.source_device_id, meta.item_id);
+    upsert_transfer(
+        runtime,
+        TransferProgress {
+            id: transfer_id.clone(),
+            direction: "receive".to_string(),
+            peer: peer.to_string(),
+            item_kind: "image_png".to_string(),
+            item_label: "图片".to_string(),
+            item_summary: "图片 PNG".to_string(),
+            item_id: meta.item_id.clone(),
+            transferred_bytes: 0,
+            total_bytes: meta.size_bytes,
+            percent: 0,
+            status: "receiving".to_string(),
+            updated_at_ms: now_ms(),
+            error: None,
+        },
+    );
+
+    let marker = image_stream_marker(&meta);
+    if is_stale_marker(runtime, &marker) {
+        mark_transfer_failed(runtime, &transfer_id, "已被更新内容替代".to_string());
+        return Err(anyhow::anyhow!("stale inbound raw image stream"));
+    }
+
+    let mut reader = RawFileStreamReader::new(
+        runtime,
+        settings,
+        session,
+        stream,
+        FileStreamTransfer::new(&transfer_id, &meta.item_id, meta.size_bytes, marker),
+    );
+    let capacity = usize::try_from(meta.size_bytes)
+        .map_err(|_| anyhow::anyhow!("image stream size cannot fit memory"))?;
+    let mut png_bytes = Vec::new();
+    if let Err(error) = png_bytes.try_reserve_exact(capacity) {
+        let message = format!("无法为图片流分配内存: {error}");
+        mark_transfer_failed(runtime, &transfer_id, message);
+        return Err(anyhow::anyhow!("image stream allocation failed"));
+    }
+    if let Err(error) = reader.read_to_end(&mut png_bytes) {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        return Err(error.into());
+    }
+    if let Err(error) = reader.ensure_complete() {
+        mark_transfer_failed(runtime, &transfer_id, error.to_string());
+        return Err(error);
+    }
+    let received_chunk_count = reader.chunk_count();
+    let received_digest = reader.digest_sha256();
+    drop(reader);
+
+    let valid_end = match read_wire_body_from_stream(stream, settings, session) {
+        Ok(Some(WireBody::PayloadStreamEnd(end))) => {
+            end.item_id == meta.item_id
+                && end.chunk_count == meta.chunk_count
+                && end.chunk_count == received_chunk_count
+                && end.digest_sha256 == received_digest
+        }
+        Ok(_) => false,
+        Err(error) => {
+            mark_transfer_failed(
+                runtime,
+                &transfer_id,
+                format!("图片流结束通知丢失: {error}"),
+            );
+            return Err(error);
+        }
+    };
+    if !valid_end {
+        mark_transfer_failed(runtime, &transfer_id, "图片流完整性校验失败".to_string());
+        return Err(anyhow::anyhow!("image stream integrity check failed"));
+    }
+    let actual_hash = received_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if actual_hash != meta.content_hash {
+        mark_transfer_failed(runtime, &transfer_id, "图片内容摘要不匹配".to_string());
+        return Err(anyhow::anyhow!("image stream content hash mismatch"));
+    }
+    if runtime.stop_flag.load(Ordering::SeqCst) {
+        mark_transfer_failed(runtime, &transfer_id, "同步已停止".to_string());
+        return Err(anyhow::anyhow!("sync stopped"));
+    }
+
+    let item = ClipboardItem {
+        id: meta.item_id,
+        content_hash: meta.content_hash,
+        created_at_us: meta.created_at_us,
+        source_device_id: meta.source_device_id,
+        size_bytes: meta.size_bytes,
+        payload: ClipboardPayload::ImagePng { png_bytes },
+    };
+    handle_incoming_item(runtime, peer, item, device_id);
     Ok(())
 }
 

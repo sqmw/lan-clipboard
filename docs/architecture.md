@@ -94,7 +94,7 @@ Tauri main thread
 
 - `RuntimeInner` 由 `Arc` 持有；禁止 detached raw pointer 或超出 owner 生命周期的引用。
 - 每条 TCP 连接独占 `Session`，session key/sequence 不进入全局缓存，也不跨 peer 复用。
-- 入站 socket 总计 `16`、单 IP `4`；同时文件接收 `2`；发送 peer 并发 `8`。
+- 入站 socket 总计 `16`、单 IP `4`；同时大载荷（PNG 或文件）接收 `2`；发送 peer 并发 `8`。
 - incoming/outbound socket 都登记可关闭 clone。`stop()` 先置 stop flag 并 `Shutdown::Both`，再 join。
 - worker 创建或 readiness 失败由 startup guard 回滚 `running/stop/worker` 状态。
 - discovery 和 connect 都有绝对总期限；握手、帧读取和文件接收不能靠少量 trickle 流量无限续期；主循环的 UDP 消费有包数/时间预算。
@@ -115,7 +115,7 @@ system clipboard change
   -> record only failed peers for retry
 ```
 
-文件 payload 在握手后发送 start control frame，然后通过 no-follow 已打开句柄边生成可移植 tar、边计算逻辑文件树 hash、边发 raw frame。只有流式 hash 与复制时捕获的 `content_hash` 一致才 flush 尾帧并发送 end frame；源文件变化、特殊文件、链接或传输被新事件替代都会终止本次流。
+文件与 PNG payload 在握手后发送各自的 start control frame，再走同一条认证 raw 分片通道。文件通过 no-follow 已打开句柄边生成可移植 tar、边计算逻辑文件树 hash、边发 raw frame；PNG 从内存字节切片写入同一 writer。只有流式 hash 与复制时捕获的 `content_hash` 一致才发送 end frame；源文件变化、特殊文件、链接或传输被新事件替代都会终止本次流。
 
 ## 接收数据流
 
@@ -130,7 +130,7 @@ TCP accept
   -> system clipboard
 ```
 
-文件 start frame 先取得 active receive permit，再创建本机 `ReceivedBundle`。raw reader 直接喂给受限 tar 解包；任何错误由 RAII 删除 bundle。完整性通过后才把本机路径装入 `FileBundleDir` 入队，成功写回后转为有限期保留，失败/过期/停止则删除。
+文件或图片 start frame 先取得 active receive permit。文件 raw reader 直接喂给受限 tar 解包；PNG 则按声明总量收集字节。两类流都会校验 chunk 数、SHA-256 和结束帧，PNG 额外核对 `content_hash`；任一错误都精确标记传输失败。文件完整性通过后才把本机路径装入 `FileBundleDir` 入队，PNG 则作为 `ImagePng` 入队写回。
 
 ## 配置事务
 

@@ -122,7 +122,7 @@
                         <select id="network-ip" disabled></select>
                     </label>
                     <label>
-                        <span id="i18n-max-mb-label">最大发送大小（MB）</span>
+                        <span id="i18n-max-mb-label">最大同步内容大小（MB）</span>
                         <input
                             id="max-item-mb"
                             type="number"
@@ -132,6 +132,8 @@
                             required
                             disabled
                         />
+                        <span class="field-hint" id="i18n-max-mb-hint"
+                            >文件受此设置限制；PNG 图片还有 80 MB 解码安全边界。</span>
                     </label>
                 </div>
                 <div class="panel-sub settings-subpanel">
@@ -174,7 +176,7 @@
                             <span
                                 class="compact-toggle-label"
                                 id="i18n-encrypt-label"
-                                >加密传输（v4 协议要求）</span
+                                >加密传输（v5 协议要求）</span
                             >
                             <span class="status-chip" id="i18n-encrypt-status">已启用</span>
                         </div>

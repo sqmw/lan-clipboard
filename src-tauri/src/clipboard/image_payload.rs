@@ -13,7 +13,10 @@ const IMAGE_SCALE_DENOMINATOR: u32 = 100;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DECODE_BYTES: u64 = 80 * 1024 * 1024;
-const MAX_IMAGE_SOURCE_BYTES: u64 = 80 * 1024 * 1024;
+/// Security bound for encoded image input before decoding. This is separate
+/// from the user-selected sync size because decoded clipboard bitmaps can
+/// require substantially more memory than their PNG representation.
+pub(crate) const MAX_IMAGE_SOURCE_BYTES: u64 = 80 * 1024 * 1024;
 
 pub(super) fn encode_image_payload(
     mut rgba: RgbaImage,

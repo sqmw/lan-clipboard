@@ -9,9 +9,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
-const DISCOVERY_CONTEXT: &[u8] = b"lan-clipboard/discovery/v4";
-const SESSION_SALT_CONTEXT: &[u8] = b"lan-clipboard/session-salt/v4";
-const SESSION_KEYS_CONTEXT: &[u8] = b"lan-clipboard/session-keys/v4";
+const DISCOVERY_CONTEXT: &[u8] = b"lan-clipboard/discovery/v5";
+const SESSION_SALT_CONTEXT: &[u8] = b"lan-clipboard/session-salt/v5";
+const SESSION_KEYS_CONTEXT: &[u8] = b"lan-clipboard/session-keys/v5";
 
 pub(super) struct SessionKeyMaterial {
     pub(super) session_id: [u8; 16],

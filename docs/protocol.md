@@ -15,10 +15,10 @@
 ## 版本与兼容性
 
 - 应用版本：`2.0.0`
-- TCP 线协议：`v4`
+- TCP 线协议：`v5`
 - UDP announcement：`v2`
-- `v4` 是从旧 `v3` 的不兼容升级；没有旧帧 fallback，也没有可关闭的加密路径。
-- 所有设备必须一起升级并使用新的 26 位配对密钥。
+- `v5` 是从旧 `v4` 的不兼容升级；没有旧帧 fallback，也没有可关闭的加密路径。共享域所有设备必须整体升级。
+- 所有设备必须一起升级并使用同一 26 位配对密钥；从 v4 升级时可保留现有密钥。
 
 ## 模型分层
 
@@ -74,7 +74,7 @@ client -> server  Response   (88 bytes)
 server -> client  Ack        (56 bytes)
 ```
 
-消息头包含 `LCB4` magic、version、kind 和保留位；保留位必须为零。消息体绑定双方 UUID、32-byte 随机 nonce 和 HMAC-SHA256。完整 transcript 经 HKDF-SHA256 派生：
+消息头包含 `LCB5` magic、version、kind 和保留位；保留位必须为零。消息体绑定双方 UUID、32-byte 随机 nonce 和 HMAC-SHA256。完整 transcript 经 HKDF-SHA256 派生：
 
 - `session_id[16]`
 - client→server / server→client control key
@@ -86,7 +86,7 @@ server -> client  Ack        (56 bytes)
 
 ```text
 u32_be frame_len
-u8     version = 4
+u8     version = 5
 u8     flags = encrypted
 bytes  session_id[16]
 u64_be control_sequence
@@ -100,25 +100,26 @@ AEAD AAD 是 version/flags/session/sequence 固定头。每条连接的 control 
 
 - `ClipboardItem`
 - `FileStreamRawStart`
-- `FileStreamEnd`
+- `ImageStreamRawStart`
+- `PayloadStreamEnd`
 
-文本、图片和富文本的实际 payload 硬上限为 `8MiB`；控制帧只额外允许固定 `256KiB` 协议开销。该限制独立于文件总大小设置，用于避免单帧巨额内存分配。
+文本、HTML 和 RTF 的实际 payload 硬上限为 `8MiB`；控制帧只额外允许固定 `256KiB` 协议开销。PNG 不进入控制帧，始终走 raw 分片流，因此不受该单帧总量限制。
 
 ## 文件流
 
-文件传输顺序：
+文件和 PNG 图片都使用相同的 raw 数据通道。文件传输顺序：
 
 ```text
 control seq 0: FileStreamRawStart
 raw chunks 0..N-1
-control seq 1: FileStreamEnd
+control seq 1: PayloadStreamEnd
 ```
 
 raw frame：
 
 ```text
 u32_be frame_len
-u8     version = 4
+u8     version = 5
 u8     flags = encrypted
 bytes  session_id[16]
 bytes  transfer_uuid[16]
@@ -127,7 +128,7 @@ bytes  nonce[12]
 bytes  ChaCha20-Poly1305(ciphertext || tag)
 ```
 
-raw AAD 绑定固定头。chunk index 必须从 `0` 连续增长；每帧明文最多 `16MiB`。`FileStreamRawStart` 声明总大小、chunk 数、来源 UUID和顶层名称；结束帧再次提交 item id、实际 chunk 数和全流 SHA-256。
+raw AAD 绑定固定头。chunk index 必须从 `0` 连续增长；每帧明文最多 `1MiB`。`FileStreamRawStart` 声明总大小、chunk 数、来源 UUID 和顶层名称；`ImageStreamRawStart` 声明 PNG 的同类元数据；结束帧再次提交 item id、实际 chunk 数和全流 SHA-256。图片接收端还会将流 SHA-256 与 `content_hash` 比较后才入队写回剪贴板。
 
 发送端通过 no-follow 句柄边遍历源文件、生成 tar、计算逻辑文件树 hash、加密和写网；只有该 hash 与复制时捕获值一致才发送结束帧。tar 中 file/dir mode 固定为 `0644/0755`，`uid/gid/mtime` 固定为 `0`，目录分隔符固定为 `/`。接收端边解密、校验和解包，不生成完整 archive 临时文件；两端都会验证实际 tar 字节数等于声明值。
 
@@ -174,7 +175,7 @@ peer 广播并发最多 `8`。一轮只记录失败 peer；重试不会再次发
 - 初始 `max_item_bytes`：`256KiB`。
 - 可配置范围：`1 byte..=1000MiB`；UI 以 MiB 显示但按字节精确往返。
 - 文件 tar 总流必须不超过 `max_item_bytes`。
-- 文本/PNG/HTML/RTF 还受 `8MiB` 单帧硬上限约束。
+- 文本/HTML/RTF 还受 `8MiB` 单帧硬上限约束；PNG 和文件由 raw 分片流承载。文件只受 `max_item_bytes` 总量上限约束；PNG 还受固定 `80MiB` 编码输入安全边界约束。
 - 超限内容保留在本地剪贴板，不广播，并记录明确错误。
 
 测试态使用小 payload、loopback、直接 codec 和可注入接收期限快速覆盖边界；生产大小、连接数、`2s` 握手总期限、`31s..30min` 文件总期限和 `30s` 重试总年龄不会为了测试而写死成更小值。

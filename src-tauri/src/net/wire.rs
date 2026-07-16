@@ -15,7 +15,7 @@ use std::path::{Component, Path};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const WIRE_VERSION: u8 = 4;
+const WIRE_VERSION: u8 = 5;
 const CONTROL_ENCRYPTED_FLAG: u8 = 1;
 const RAW_PAYLOAD_ENCRYPTED_FLAG: u8 = 1;
 const TRANSFER_READ_CHUNK_BYTES: usize = 1024 * 1024;
@@ -30,7 +30,10 @@ const MAX_TOP_LEVEL_NAME_BYTES: usize = 255;
 const MAX_FUTURE_CLOCK_SKEW_US: u64 = 5 * 60 * 1_000_000;
 const FRAME_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) const RAW_PAYLOAD_PLAIN_BYTES: usize = 16 * 1024 * 1024;
+/// Bounded raw chunk size for file and image streams. 1 MiB keeps cancellation
+/// latency and concurrent memory use predictable while remaining large enough
+/// to avoid per-packet protocol overhead on a LAN.
+pub(super) const RAW_PAYLOAD_PLAIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) struct ReadDeadline {
@@ -51,14 +54,16 @@ impl ReadDeadline {
 pub(super) enum WireBody {
     ClipboardItem(ClipboardItem),
     FileStreamRawStart(FileStreamStart),
-    FileStreamEnd(FileStreamEnd),
+    ImageStreamRawStart(ImageStreamStart),
+    PayloadStreamEnd(PayloadStreamEnd),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum EncodedWireBody {
     ClipboardItem(WireClipboardItem),
     FileStreamRawStart(FileStreamStart),
-    FileStreamEnd(FileStreamEnd),
+    ImageStreamRawStart(ImageStreamStart),
+    PayloadStreamEnd(PayloadStreamEnd),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +79,6 @@ struct WireClipboardItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireClipboardPayload {
     Text { text: String },
-    ImagePng { png_bytes: Vec<u8> },
     Html { html: String },
     Rtf { rtf: String },
 }
@@ -91,7 +95,17 @@ pub(super) struct FileStreamStart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct FileStreamEnd {
+pub(super) struct ImageStreamStart {
+    pub item_id: String,
+    pub content_hash: String,
+    pub created_at_us: u64,
+    pub source_device_id: String,
+    pub size_bytes: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PayloadStreamEnd {
     pub item_id: String,
     pub chunk_count: u64,
     pub digest_sha256: [u8; 32],
@@ -443,9 +457,13 @@ fn encode_wire_body(
             meta.validate(settings)?;
             EncodedWireBody::FileStreamRawStart(meta.clone())
         }
-        WireBody::FileStreamEnd(end) => {
+        WireBody::ImageStreamRawStart(meta) => {
+            meta.validate(settings)?;
+            EncodedWireBody::ImageStreamRawStart(meta.clone())
+        }
+        WireBody::PayloadStreamEnd(end) => {
             end.validate()?;
-            EncodedWireBody::FileStreamEnd(end.clone())
+            EncodedWireBody::PayloadStreamEnd(end.clone())
         }
     };
     let frame_limit = control_frame_limit(settings);
@@ -485,9 +503,14 @@ fn decode_wire_body(
             ensure_source_matches_session(&meta.source_device_id, session)?;
             Ok(WireBody::FileStreamRawStart(meta))
         }
-        EncodedWireBody::FileStreamEnd(end) => {
+        EncodedWireBody::ImageStreamRawStart(meta) => {
+            meta.validate(settings)?;
+            ensure_source_matches_session(&meta.source_device_id, session)?;
+            Ok(WireBody::ImageStreamRawStart(meta))
+        }
+        EncodedWireBody::PayloadStreamEnd(end) => {
             end.validate()?;
-            Ok(WireBody::FileStreamEnd(end))
+            Ok(WireBody::PayloadStreamEnd(end))
         }
     }
 }
@@ -568,9 +591,9 @@ impl TryFrom<&ClipboardPayload> for WireClipboardPayload {
     fn try_from(payload: &ClipboardPayload) -> Result<Self, Self::Error> {
         match payload {
             ClipboardPayload::Text { text } => Ok(Self::Text { text: text.clone() }),
-            ClipboardPayload::ImagePng { png_bytes } => Ok(Self::ImagePng {
-                png_bytes: png_bytes.clone(),
-            }),
+            ClipboardPayload::ImagePng { .. } => Err(anyhow::anyhow!(
+                "image payload must use the raw stream transport"
+            )),
             ClipboardPayload::Html { html } => Ok(Self::Html { html: html.clone() }),
             ClipboardPayload::Rtf { rtf } => Ok(Self::Rtf { rtf: rtf.clone() }),
             ClipboardPayload::FileBundleDir { .. } | ClipboardPayload::FileList { .. } => Err(
@@ -584,7 +607,6 @@ impl From<WireClipboardPayload> for ClipboardPayload {
     fn from(payload: WireClipboardPayload) -> Self {
         match payload {
             WireClipboardPayload::Text { text } => Self::Text { text },
-            WireClipboardPayload::ImagePng { png_bytes } => Self::ImagePng { png_bytes },
             WireClipboardPayload::Html { html } => Self::Html { html },
             WireClipboardPayload::Rtf { rtf } => Self::Rtf { rtf },
         }
@@ -595,7 +617,6 @@ impl WireClipboardPayload {
     fn actual_size_bytes(&self) -> u64 {
         match self {
             Self::Text { text } => text.len() as u64,
-            Self::ImagePng { png_bytes } => png_bytes.len() as u64,
             Self::Html { html } => html.len() as u64,
             Self::Rtf { rtf } => rtf.len() as u64,
         }
@@ -624,7 +645,35 @@ impl FileStreamStart {
     }
 }
 
-impl FileStreamEnd {
+impl ImageStreamStart {
+    fn validate(&self, settings: &Settings) -> anyhow::Result<()> {
+        validate_identifier_fields(
+            &self.item_id,
+            &self.source_device_id,
+            &self.content_hash,
+            self.created_at_us,
+        )?;
+        if self.size_bytes == 0 || self.size_bytes > settings.limits.max_item_bytes {
+            return Err(anyhow::anyhow!(
+                "image stream size outside configured limit: {}",
+                self.size_bytes
+            ));
+        }
+        if self.size_bytes > crate::clipboard::MAX_IMAGE_SOURCE_BYTES {
+            return Err(anyhow::anyhow!(
+                "image stream exceeds decode safety limit: {}",
+                crate::clipboard::MAX_IMAGE_SOURCE_BYTES
+            ));
+        }
+        let expected_chunks = self.size_bytes.div_ceil(RAW_PAYLOAD_PLAIN_BYTES as u64);
+        if self.chunk_count == 0 || self.chunk_count != expected_chunks {
+            return Err(anyhow::anyhow!("invalid image stream chunk count"));
+        }
+        Ok(())
+    }
+}
+
+impl PayloadStreamEnd {
     fn validate(&self) -> anyhow::Result<()> {
         parse_uuid(&self.item_id, "file stream end item id")?;
         if self.chunk_count == 0 {
@@ -782,6 +831,60 @@ mod tests {
         );
         let (mut client, _) = test_session_pair(1);
         assert!(encode_wire_message(&item, &test_settings(), &mut client).is_err());
+    }
+
+    #[test]
+    fn images_require_raw_stream_transport() {
+        let item = base_item(
+            ClipboardPayload::ImagePng {
+                png_bytes: vec![7; 32],
+            },
+            32,
+        );
+        let (mut client, _) = test_session_pair(2);
+        assert!(encode_wire_message(&item, &test_settings(), &mut client).is_err());
+    }
+
+    #[test]
+    fn image_stream_start_accepts_configured_total_size() {
+        let settings = test_settings();
+        let size_bytes = 27 * 1024 * 1024 + 1;
+        let start = ImageStreamStart {
+            item_id: Uuid::new_v4().to_string(),
+            content_hash: "b".repeat(64),
+            created_at_us: now_us(),
+            source_device_id: Uuid::from_u128(1).to_string(),
+            size_bytes,
+            chunk_count: size_bytes.div_ceil(RAW_PAYLOAD_PLAIN_BYTES as u64),
+        };
+        let (mut client, mut server) = test_session_pair(3);
+        let frame = encode_wire_body(
+            &WireBody::ImageStreamRawStart(start.clone()),
+            &settings,
+            &mut client,
+        )
+        .unwrap();
+        let decoded = decode_wire_body_bytes(&frame[4..], &settings, &mut server).unwrap();
+        assert!(
+            matches!(decoded, WireBody::ImageStreamRawStart(meta) if meta.size_bytes == size_bytes)
+        );
+        assert!(start.validate(&settings).is_ok());
+    }
+
+    #[test]
+    fn image_stream_start_rejects_decode_unsafe_size() {
+        let mut settings = Settings::default();
+        settings.limits.max_item_bytes = crate::clipboard::MAX_IMAGE_SOURCE_BYTES + 1;
+        let size_bytes = crate::clipboard::MAX_IMAGE_SOURCE_BYTES + 1;
+        let start = ImageStreamStart {
+            item_id: Uuid::new_v4().to_string(),
+            content_hash: "c".repeat(64),
+            created_at_us: now_us(),
+            source_device_id: Uuid::from_u128(1).to_string(),
+            size_bytes,
+            chunk_count: size_bytes.div_ceil(RAW_PAYLOAD_PLAIN_BYTES as u64),
+        };
+        assert!(start.validate(&settings).is_err());
     }
 
     #[test]

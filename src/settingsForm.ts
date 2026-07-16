@@ -68,6 +68,7 @@ export function applyI18nStatic(): void {
   setText("i18n-shared-code-label", "app.settings.shared_code");
   setText("i18n-network-label", "app.settings.network");
   setText("i18n-max-mb-label", "app.settings.max_mb");
+  setText("i18n-max-mb-hint", "app.settings.max_mb_hint");
   setText("i18n-language-label", "app.settings.language");
   setText("i18n-startup-title", "app.settings.startup");
   setText("i18n-launch-at-login-label", "app.settings.launch_at_login");

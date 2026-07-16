@@ -227,7 +227,7 @@ impl Settings {
             return Err(SettingsValidationError::InvalidMaxItemBytes);
         }
 
-        // Protocol v4 treats encryption as a mandatory security boundary.
+        // Protocol v5 treats encryption as a mandatory security boundary.
         self.security.encryption_enabled = true;
 
         self.ui.language = self.ui.language.trim().to_string();
@@ -245,7 +245,7 @@ impl Settings {
         next.ui.language = update.language;
         next.ui.launch_at_login = update.launch_at_login;
 
-        // Sync and encryption are protocol-v4 invariants, not user-editable
+        // Sync and encryption are protocol-v5 invariants, not user-editable
         // preferences. Enforce both before normalization and persistence.
         next.sync.enabled = true;
         next.security.encryption_enabled = true;
