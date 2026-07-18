@@ -11,6 +11,8 @@
 - [done] P0：补充 codec、流式图片和大小边界测试；macOS Rust `99 passed` 与前端生产构建通过。Windows 同版本 smoke 仍待执行。
 - [pending] P1：实机 macOS ↔ Windows 用大于 `8MiB`、小于配置上限的 PNG 做双向复制与粘贴 smoke；两端需同时更新到 v5。
 - [pending] P1：建立 macOS ↔ Windows 的裸 TCP、加密 raw 流、文件流和 PNG 流分阶段吞吐基准；比较 `256KiB` / `1MiB` / `4MiB` 分片后，再决定是否调整分片、调度让出或多流并行。当前唯一历史样本为 v4 文件接收 `3.97MiB/s`，不能视为链路上限。
+- [pending] P1：支持向共享域内指定成员发送文件；需要目标选择器、稳定设备身份目标、单 peer 发送 API、失败重试和 UI 反馈，不能复用当前全域广播语义。
+- [pending] P1：完成文件剪贴板写回互操作排查；分别验证 macOS Finder/桌面、Windows Explorer/桌面和文本输入框，区分“文件目标写回缺陷”与“文本框不支持文件粘贴”。
 
 回退边界：v5 与 v4 不互通。若升级后的验证失败，必须让整个共享域回到同一 v4 构建与同一配对密钥，不能混用版本。
 
